@@ -11,8 +11,6 @@ class FileChunk(object):
     file_size: int      # size of complete file in bytes
     file_mtime: int     # last modified (unix timestamp)
     sha1: str           # SHA1 hex checksum of part
-    urls: List[str]     # list of alternative URLs where to fetch this chunk
-    has_chunk: bool     # has part locally
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)
 
@@ -43,9 +41,7 @@ async def _hash_file(basedir: str, relpath: str, file_progress_func=None) -> Lis
                     size=sz,
                     file_size=st.st_size,
                     file_mtime=int(st.st_mtime+0.5),
-                    sha1=hashlib.sha1(await f.read(sz)).hexdigest(),
-                    urls=[],
-                    has_chunk=True))
+                    sha1=hashlib.sha1(await f.read(sz)).hexdigest()))
             pos += sz
             if file_progress_func:
                 file_progress_func(relpath, sz, pos, st.st_size)

@@ -17,25 +17,28 @@ class FileServer(object):
         self._hash_to_chunk = {}    # Map sha1sum -> FileChunk
         self._basedir = basedir     # Directory to serve/monitor files from
         self._base_url = ''         # URL to access this server
-        self._manifest = '[]'       # JSON list of FileChunks the server sends to clients
         self._manifest_etag = ''    # MD5 sum of manifest
         self._http_cache_time = http_cache_time
+        self._peers_map = {}
+        self._peers_etag = ''
 
-    def _update_manifest(self):
-        # Make sure this server's URL is in all chunks
-        if self._base_url:
-            for c in self._chunks:
-                u = self._base_url + "/chunk/" + c.sha1
-                if c.has_chunk and u not in c.urls:
-                    c.urls.append(u)
-        # Make JSON manifest
-        self._manifest = chunks_to_json(self._chunks)
-        self._manifest_etag = hashlib.md5(self._manifest.encode('utf-8')).hexdigest()
 
     def set_chunks(self, chunks):
         self._chunks = chunks
         self._hash_to_chunk = {c.sha1: c for c in chunks}
-        self._update_manifest()
+
+        manifest = chunks_to_json(self._chunks)
+        self._manifest_etag = hashlib.md5(manifest.encode('utf-8')).hexdigest()
+
+        # Make sure server's URL is in peer list for all local hashes
+        if self._base_url:
+            for c in self._chunks:
+                url = f'{self._base_url}/chunk/{c.sha1}'
+                if c.sha1 not in self._peers_map:
+                    self._peers_map[c.sha1] = []
+                peers = self._peers_map[c.sha1]
+                if url not in peers:
+                    peers.append(url)
 
     def run_server(self, serve_manifest=True, port=14433, https_cert=None, https_key=None):
         base_path = Path(self._basedir)
@@ -56,8 +59,6 @@ class FileServer(object):
             else:
                 # Check if we have the chunk
                 c = self._hash_to_chunk[h]
-                if not c.has_chunk:
-                    return web.Response(status=404, text=f'404 NOT FOUND. This host knows about, but does not (yet) have chunk {h}')
 
                 path = base_path / c.filename
                 if base_path not in path.parents:
@@ -90,55 +91,70 @@ class FileServer(object):
             if request.headers.get('If-None-Match') == self._manifest_etag:
                 return web.HTTPNotModified()
             return web.Response(
-                status=200, body=self._manifest,
+                status=200, body=chunks_to_json(self._chunks),
                 content_type='application/json',
                 headers={'ETag': self._manifest_etag, 'Cache-Control': f'public, max-age: {self._http_cache_time}'})
 
-        async def _update_peer_urls(request, op):
-            """
-            Add or delete hash -> URL mappings (peer URLs)
-            """
+
+        # HTTP HANDLER - Return a list of URLs that hashes can be downloaded from
+        async def handle_get_peers(request):
+            print(f"[{request.remote}] GET peers")
+            if request.headers.get('If-None-Match') == self._peers_etag:
+                return web.HTTPNotModified()
+            res = json.dumps(self._peers_map, indent=4)
+            self._peers_etag = hashlib.md5(res.encode('utf-8')).hexdigest()
+            return web.Response(
+                status=200, body=res,
+                content_type='application/json',
+                headers={'ETag': self._peers_etag, 'Cache-Control': f'public, max-age: 30'})
+
+
+        # HTTP HANDLER - Add/delete hash -> URL mappings (peer list)
+        async def update_peer_urls(request):
             print(f"[{request.remote}] POST {request.path_qs}")
             try:
-                hashes_to_urls = await request.json()
+                ops = await request.json()
             except json.decoder.JSONDecodeError as e:
                 return web.Response(status=400, body='400 BAD REQUEST: JSON / ' + str(e), content_type='text/plain')
-            assert(op in ('add', 'del'))
             bad_hashes = []
-            changed = False
-            for h, url in hashes_to_urls.items():
-                if h in self._hash_to_chunk:
-                    c = self._hash_to_chunk[h]
-                    if op == 'add':
-                        if url not in c.urls:
-                            c.urls.append(url)
-                            changed = True
-                    else:
-                        if url in c.urls:
-                            c.urls.remove(url)
-                            changed = True
+            for line in ops:
+                if not isinstance(line, list) or len(line) != 3 or (line[0] not in ('ADD', 'DEL')):
+                    return web.Response(
+                        status=400, body='400 BAD REQUEST: please send a json list of ["ADD|DEL", "<HASH>", "<URL>"]',
+                        content_type='text/plain')
                 else:
-                    bad_hashes.append(h)
-            if changed:
-                self._update_manifest()
-            errors_str = (' - EXCEPT: Unknown hashes: ' + ', '.join(bad_hashes)) if bad_hashes else ''
-            return web.Response(status=200, body='OK' + errors_str, content_type='text/plain')
+                    op, h, url = line[0], line[1].strip(), line[2]
+                    c = self._hash_to_chunk.get(h)
+                    if c is None:
+                        bad_hashes.append(h)
+                    else:
+                        if h not in self._peers_map:
+                            self._peers_map[h] = []
+                        peers = self._peers_map[h]
+                        if op == 'ADD' and (url not in peers):
+                            peers.append(url)
+                        elif op == 'DEL' and (url in peers):
+                            if not url.startswith(self._base_url):  # don't remove server's own url even if requested
+                                peers.remove(url)
 
-        # HTTP HANDLER - Add list of hash -> peer url mappings
-        async def handle_add_peers(request):
-            return await _update_peer_urls(request, 'add')
+            # Return updated list
+            res = json.dumps(self._peers_map, indent=4)
+            self._peers_etag = hashlib.md5(res.encode('utf-8')).hexdigest()
+            if bad_hashes:
+                res = json.dumps({**self._peers_map, 'ERROR_MISSING_HASHES': bad_hashes}, indent=4)
 
-        # HTTP HANDLER - Delete list of hash -> peer url mappings
-        async def handle_del_peers(request):
-            return await _update_peer_urls(request, 'del')
+            return web.Response(
+                status=200, body=json.dumps(res, indent=4),
+                content_type='application/json',
+                headers={'ETag': self._peers_etag, 'Cache-Control': f'public, max-age: 30'})
 
 
         # Create aiohttp web app
         app = web.Application()
         app.add_routes([
                 web.get('/chunk/{hash}', handle_get_chunk),
-                web.post('/add-peers', handle_add_peers),
-                web.post('/del-peers', handle_del_peers),
+                web.get('/peers', handle_get_peers),
+                web.post('/peers', update_peer_urls),
         ])
         if serve_manifest:
             app.add_routes([web.get('/manifest', handle_get_manifest)])
