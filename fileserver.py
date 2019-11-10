@@ -22,6 +22,8 @@ class FileServer(object):
         self._peers_map = {}
         self._peers_etag = ''
 
+    def base_url(self):
+        return self._base_url
 
     def set_chunks(self, chunks):
         self._chunks = chunks
@@ -85,6 +87,7 @@ class FileServer(object):
                     await response.write_eof()
                     return response
 
+
         # HTTP HANDLER -Return manifest (hash list) to a client
         async def handle_get_manifest(request):
             print(f"[{request.remote}] GET manifest")
@@ -144,20 +147,20 @@ class FileServer(object):
                 res = json.dumps({**self._peers_map, 'ERROR_MISSING_HASHES': bad_hashes}, indent=4)
 
             return web.Response(
-                status=200, body=json.dumps(res, indent=4),
+                status=200, body=json.dumps(self._peers_map, indent=4),
                 content_type='application/json',
                 headers={'ETag': self._peers_etag, 'Cache-Control': f'public, max-age: 30'})
 
 
         # Create aiohttp web app
         app = web.Application()
-        app.add_routes([
-                web.get('/chunk/{hash}', handle_get_chunk),
-                web.get('/peers', handle_get_peers),
-                web.post('/peers', update_peer_urls),
-        ])
+        app.add_routes([web.get('/chunk/{hash}', handle_get_chunk)])
         if serve_manifest:
-            app.add_routes([web.get('/manifest', handle_get_manifest)])
+            app.add_routes([
+                    web.get('/manifest', handle_get_manifest),
+                    web.get('/peers', handle_get_peers),
+                    web.post('/peers', update_peer_urls),
+                ])
 
         # Setup HTTPS if certificate and key are provided (otherwise use plain HTTP):
         context = None
@@ -172,6 +175,7 @@ class FileServer(object):
 
 
 
+# ------------------------
 
 async def async_main():
     BASE_DIR = "test/"
@@ -191,4 +195,5 @@ async def async_main():
     # server.run_server(https_cert='ssl/localhost.crt', https_key='ssl/localhost.key'))
     await asyncio.gather(server.run_server(), dir_scanner())
 
-asyncio.run(async_main())
+if __name__== "__main__":
+    asyncio.run(async_main())

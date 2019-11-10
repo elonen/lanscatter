@@ -2,7 +2,7 @@ from typing import List
 import os, json, hashlib, asyncio
 import aiofiles, aiofiles.os
 
-PART_SIZE = 4*1024*1024
+PART_SIZE = 16*1024*1024
 
 class FileChunk(object):
     filename: str       # path + filename
@@ -87,7 +87,8 @@ async def hash_dir(basedir: str, old_chunks=None, progress_func=None) -> List[Fi
         nonlocal total_remaining
         total_remaining -= just_read
         if progress_func:
-            progress_func(path, total_progress=1-float(total_remaining)/total_size, file_progress=float(pos)/file_size)
+            perc = float(pos)/file_size if file_size>0 else 1.0
+            progress_func(path, total_progress=1-float(total_remaining)/total_size, file_progress=perc)
 
     # Hash files as needed
     res = []
