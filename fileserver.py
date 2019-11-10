@@ -102,7 +102,7 @@ class FileServer(object):
             try:
                 hashes_to_urls = await request.json()
             except json.decoder.JSONDecodeError as e:
-                return web.Response(status=400, body='400 BAD REQUEST: invalid JSON: ' + str(e), content_type='text/plain')
+                return web.Response(status=400, body='400 BAD REQUEST: JSON / ' + str(e), content_type='text/plain')
             assert(op in ('add', 'del'))
             bad_hashes = []
             changed = False
