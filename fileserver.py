@@ -1,7 +1,7 @@
 from aiohttp import web
 from pathlib import Path
-from typing import List, Dict
-import ssl, asyncio, aiofiles, socket, json, hashlib
+from typing import List, Dict, Callable
+import ssl, asyncio, aiofiles, socket, json, hashlib, argparse
 
 from filechunks import FileChunk, monitor_folder_forever, chunks_to_json, json_to_chunks
 
@@ -12,7 +12,7 @@ class FileServer(object):
     _basedir: str
     _manifest: str
 
-    def __init__(self, basedir: str, http_cache_time: int = 60*5):
+    def __init__(self, basedir: str, http_cache_time: int = 60*5, status_func: Callable=None):
         self._chunks = []           # List fo all FileChunks
         self._hash_to_chunk = {}    # Map sha1sum -> FileChunk
         self._basedir = basedir     # Directory to serve/monitor files from
@@ -21,11 +21,23 @@ class FileServer(object):
         self._http_cache_time = http_cache_time
         self._peers_map = {}
         self._peers_etag = ''
+        self._status_func = status_func
+
+        if not Path(basedir).is_dir():
+            raise NotADirectoryError(f'Path "{basedir}" is not a directory. Cannot serve from it.')
+
+        # If no status function is given, make a dummy one
+        if not self._status_func:
+            def dummy_status_func(progress: float=None, cur_status: str=None, log_error: str=None, log_info: str=None):
+                pass
+            self._status_func = dummy_status_func
+
 
     def base_url(self):
         return self._base_url
 
     def set_chunks(self, chunks):
+        self._status_func(log_info='Files changed. Now serving new ones.')
         self._chunks = chunks
         self._hash_to_chunk = {c.sha1: c for c in chunks}
 
@@ -49,13 +61,16 @@ class FileServer(object):
         ip_addr = socket.gethostbyname(hostname)
         self._base_url = ('https://' if (https_cert and https_key) else 'http://') + ip_addr + ':' + str(port)
 
+        self._status_func(log_info=f'Starting file server on {self._base_url}.')
+
         # HTTP HANDLER - Serve requested file chunk to a client
         async def handle_get_chunk(request):
             '''
             HTTP GET handler that serves out a file chunk with given sha1 sum.
             '''
-            h = request.match_info.get('hash', "noname")
-            print(f"[{request.remote}] GET hash {h}")
+            self._status_func(log_info=f"[{request.remote}] GET {request.path_qs}")
+            h = request.match_info.get('hash', 'noname')
+
             if h not in self._hash_to_chunk:
                 return web.Response(status=404, text=f'404 NOT FOUND. Hash not found on this server: {h}')
             else:
@@ -81,16 +96,17 @@ class FileServer(object):
                             buf_size = min(64*1024, size)
                             buf = await f.read(buf_size)
                             if len(buf) != buf_size:
-                                raise Exception('file size mismatch!')
+                                self._status_func(log_error=f'ERROR: File "{str(path)}" changed? Read {len(buf)} but expected {buf_size}.')
+                                return web.Response(status=500, text=f'500 INTERNAL ERROR. Filesize mismatch.')
                             await response.write(buf)
                             size -= buf_size
                     await response.write_eof()
                     return response
 
 
-        # HTTP HANDLER -Return manifest (hash list) to a client
+        # HTTP HANDLER - Return manifest (hash list) to a client
         async def handle_get_manifest(request):
-            print(f"[{request.remote}] GET manifest")
+            self._status_func(log_info=f"[{request.remote}] GET {request.path_qs}")
             if request.headers.get('If-None-Match') == self._manifest_etag:
                 return web.HTTPNotModified()
             return web.Response(
@@ -101,7 +117,7 @@ class FileServer(object):
 
         # HTTP HANDLER - Return a list of URLs that hashes can be downloaded from
         async def handle_get_peers(request):
-            print(f"[{request.remote}] GET peers")
+            self._status_func(log_info=f"[{request.remote}] GET {request.path_qs}")
             if request.headers.get('If-None-Match') == self._peers_etag:
                 return web.HTTPNotModified()
             res = json.dumps(self._peers_map, indent=4)
@@ -114,7 +130,7 @@ class FileServer(object):
 
         # HTTP HANDLER - Add/delete hash -> URL mappings (peer list)
         async def update_peer_urls(request):
-            print(f"[{request.remote}] POST {request.path_qs}")
+            self._status_func(log_info=f"[{request.remote}] POST {request.path_qs}")
             try:
                 ops = await request.json()
             except json.decoder.JSONDecodeError as e:
@@ -145,6 +161,7 @@ class FileServer(object):
             self._peers_etag = hashlib.md5(res.encode('utf-8')).hexdigest()
             if bad_hashes:
                 res = json.dumps({**self._peers_map, 'ERROR_MISSING_HASHES': bad_hashes}, indent=4)
+                self._status_func(log_error=f"WARNING: Client reported URLs for unknown hashes: {str(bad_hashes)}")
 
             return web.Response(
                 status=200, body=json.dumps(self._peers_map, indent=4),
@@ -165,35 +182,57 @@ class FileServer(object):
         # Setup HTTPS if certificate and key are provided (otherwise use plain HTTP):
         context = None
         if https_cert and https_key:
+            self._status_func(log_info=f"SSL: Using {https_cert} and {https_key} for serving HTTPS.")
             context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
             context.load_default_certs()
             context.load_cert_chain(certfile=https_cert, keyfile=https_key)
+        else:
+            self._status_func(log_info=f"SSL cert not provided. Serving plain HTTP.")
 
         # Return async server task
         task = web._run_app(app, ssl_context=context, port=port)
         return task
 
 
+async def run_master_server(base_dir: str, port: int,
+                            dir_scan_interval: float = 20, status_func=None,
+                            https_cert=None, https_key=None ):
+    async def dir_scanner():
+        def progress_func_adapter(cur_filename, file_progress, total_progress):
+            if status_func:
+                status_func(progress=total_progress, cur_status=f'Hashing "{cur_filename}" ({int(file_progress * 100 + 0.5)}% done)')
+        async for new_chunks in monitor_folder_forever(base_dir, dir_scan_interval, progress_func_adapter):
+            server.set_chunks(new_chunks)
+
+    server = FileServer(base_dir, status_func=status_func)
+    await asyncio.gather(
+        dir_scanner(),
+        server.run_server(serve_manifest=True, port=port, https_cert=https_cert, https_key=https_key))
+
 
 # ------------------------
 
-async def async_main():
-    BASE_DIR = "test/"
-    UPDATE_INTERVAL = 5
+async def async_main(basedir: str, port: int, cert: str, key: str):
 
-    def print_progress(cur_filename, file_progress, total_progress):
-        print(cur_filename, int(file_progress * 100 + 0.5), int(total_progress * 100 + 0.5))
+    def test_status_func(progress: float = None, cur_status: str = None, log_error: str = None, log_info: str = None):
+        if progress is not None:
+            print(f" | Progress: {int(progress*100+0.5)}%")
+        if cur_status is not None:
+            print(f" | Cur status: {cur_status}")
+        if log_error is not None:
+            print(f" | ERROR: {log_error}")
+        if log_info is not None:
+            print(f" | INFO: {log_info}")
 
-    server = FileServer(BASE_DIR)
+    await asyncio.gather(run_master_server(basedir, port, https_cert=cert, https_key=key, status_func=test_status_func))
 
-    async def dir_scanner():
-        nonlocal BASE_DIR, server
-        async for new_chunks in monitor_folder_forever(BASE_DIR, UPDATE_INTERVAL, print_progress):
-            print("Folder changed, setting chunks.")
-            server.set_chunks(new_chunks)
-
-    # server.run_server(https_cert='ssl/localhost.crt', https_key='ssl/localhost.key'))
-    await asyncio.gather(server.run_server(), dir_scanner())
 
 if __name__== "__main__":
-    asyncio.run(async_main())
+    parser = argparse.ArgumentParser()
+    parser.add_argument('dir', help='Directory to serve files from.')
+    parser.add_argument('-p', '--port', dest='port', type=int, default=14433, help='HTTP(s) port to server at.')
+    parser.add_argument('--sslcert', type=str, default=None, help='SSL certificate file for HTTPS (optional)')
+    parser.add_argument('--sslkey', type=str, default=None, help='SSL key file for HTTPS (optional)')
+
+    args = parser.parse_args()
+    asyncio.run(async_main(basedir=args.dir, port=args.port, cert=args.sslcert, key=args.sslkey))
