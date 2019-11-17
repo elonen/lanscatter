@@ -28,7 +28,7 @@ class FileServer(object):
 
         # If no status function is given, make a dummy one
         if not self._status_func:
-            def dummy_status_func(progress: float=None, cur_status: str=None, log_error: str=None, log_info: str=None):
+            def dummy_status_func(progress: float=None, cur_status: str=None, log_error: str=None, log_info: str=None, popup: bool = False):
                 pass
             self._status_func = dummy_status_func
 
@@ -37,7 +37,7 @@ class FileServer(object):
         return self._base_url
 
     def set_chunks(self, chunks):
-        self._status_func(log_info='Files changed. Now serving new ones.')
+        self._status_func(log_info='Chunks updated. Now serving new ones.')
         self._chunks = chunks
         self._hash_to_chunk = {c.sha1: c for c in chunks}
 
@@ -47,12 +47,11 @@ class FileServer(object):
         # Make sure server's URL is in peer list for all local hashes
         if self._base_url:
             for c in self._chunks:
-                url = f'{self._base_url}/chunk/{c.sha1}'
                 if c.sha1 not in self._peers_map:
                     self._peers_map[c.sha1] = []
-                peers = self._peers_map[c.sha1]
-                if url not in peers:
-                    peers.append(url)
+                url = f'{self._base_url}/chunk/{c.sha1}'
+                if url not in self._peers_map[c.sha1]:
+                    self._peers_map[c.sha1].append(url)
 
     def run_server(self, serve_manifest=True, port=14433, https_cert=None, https_key=None):
         base_path = Path(self._basedir)
@@ -61,7 +60,8 @@ class FileServer(object):
         ip_addr = socket.gethostbyname(hostname)
         self._base_url = ('https://' if (https_cert and https_key) else 'http://') + ip_addr + ':' + str(port)
 
-        self._status_func(log_info=f'Starting file server on {self._base_url}.')
+        srv_type = 'master' if serve_manifest else 'p2p'
+        self._status_func(log_info=f'Starting {srv_type} file server on {self._base_url}.')
 
         # HTTP HANDLER - Serve requested file chunk to a client
         async def handle_get_chunk(request):
@@ -190,13 +190,20 @@ class FileServer(object):
             self._status_func(log_info=f"SSL cert not provided. Serving plain HTTP.")
 
         # Return async server task
-        task = web._run_app(app, ssl_context=context, port=port)
-        return task
+        #task = web._run_app(app, ssl_context=context, port=port)
+        #return task
+
+        async def wrap_runner():
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, port=port, ssl_context=context, reuse_port=True)
+            await site.start()
+        return wrap_runner()
 
 
 async def run_master_server(base_dir: str, port: int,
                             dir_scan_interval: float = 20, status_func=None,
-                            https_cert=None, https_key=None ):
+                            https_cert=None, https_key=None):
     async def dir_scanner():
         def progress_func_adapter(cur_filename, file_progress, total_progress):
             if status_func:
@@ -214,7 +221,8 @@ async def run_master_server(base_dir: str, port: int,
 
 async def async_main(basedir: str, port: int, cert: str, key: str):
 
-    def test_status_func(progress: float = None, cur_status: str = None, log_error: str = None, log_info: str = None):
+    def test_status_func(progress: float = None, cur_status: str = None,
+                         log_error: str = None, log_info: str = None, popup: bool = False):
         if progress is not None:
             print(f" | Progress: {int(progress*100+0.5)}%")
         if cur_status is not None:

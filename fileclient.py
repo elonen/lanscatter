@@ -2,16 +2,17 @@ from typing import List, Callable
 from filechunks import FileChunk, hash_dir, monitor_folder_forever, chunks_to_json, json_to_chunks
 from datetime import datetime, timedelta
 import asyncio, aiohttp, aiohttp.client_exceptions, aiofiles, aiofiles.os
-import os, hashlib, random
+import os, hashlib, random, traceback
 from pathlib import Path
 from fileserver import FileServer
-
+from contextlib import suppress
 
 class FileClient(object):
 
-    def __init__(self, basedir: str, server_url: str, status_func: Callable=None):
+    def __init__(self, basedir: str, server_url: str, status_func: Callable=None, port: int = 14435):
         self._basedir: str = basedir
         self._local_rescan_interval: float = 60
+        self._next_folder_rescan = datetime.utcnow()
 
         self._local_chunks = []
         self._remote_chunks = []
@@ -21,13 +22,14 @@ class FileClient(object):
         self._peers_expires = datetime.utcnow()
         self._peers_refresh_interval = 30
 
+        self._port = port
         self._server_url: str = server_url
         self._manifest_etag: str = '-'
         self._manifest_expires = datetime.utcnow()
         self._manifest_refresh_interval: float = 30
 
         self._status_func = status_func
-        self._peer_server: FileServer = None
+        self._peer_server = None
 
     async def _refresh_peers(self, http_session):
         if datetime.utcnow() >= self._peers_expires:
@@ -41,7 +43,7 @@ class FileClient(object):
                         self._status_func(log_error=f'HTTP error GET {resp.status} on {url}: {await resp.text()}.')
                     else:
                         try:
-                            self._peers_etag = resp.headers.get('ETag') or '-'
+                            self._peers_etag = resp.headers.get('ETag') or ''
                             self._peers = await resp.json()
                             rnd_time = self._peers_refresh_interval * random.randrange(75, 125)/100.0
                             self._peers_expires = datetime.utcnow() + timedelta(seconds=rnd_time)
@@ -69,7 +71,7 @@ class FileClient(object):
                         # Update peer list while we are at it
                         self._peers = await resp.json()
                         self._peers_etag = resp.headers.get('ETag') or '-'
-                        self._status_func(log_info=f'Posted {len(new_chunks)} new peer URLs for local chunks to server')
+                        self._status_func(log_info=f'Posted {len(new_chunks)} new peer URLs for local chunks to master server')
             except Exception as e:
                 self._status_func(log_error=f'Warning: Failed to report new chunks to server: {str(e)}')
 
@@ -79,8 +81,9 @@ class FileClient(object):
             self._status_func(log_error=f'No download URLs for chunk {str(c.sha1)} of {c.filename}')
             return None
 
+        my_base_url = self._peer_server.base_url()
         for attempt in range(5):
-            url = random.choice(self._peers.get(c.sha1))
+            url = random.choice([u for u in self._peers.get(c.sha1) if not u.startswith(my_base_url)])
             self._status_func(log_info=f'Downloading chunk {str(c.sha1)} from {url}')
             try:
                 async with http_session.get(url) as resp:
@@ -121,7 +124,7 @@ class FileClient(object):
 
         # If no (GUI) status function is given, make a dummy one
         if not self._status_func:
-            def dummy_status_func(progress: float=None, cur_status: str=None, log_error: str=None, log_info: str=None):
+            def dummy_status_func(progress: float=None, cur_status: str=None, log_error: str=None, log_info: str=None, popup: bool = False):
                 pass
             self._status_func = dummy_status_func
 
@@ -131,22 +134,25 @@ class FileClient(object):
         # Scan/hash local destination directory
         self._status_func(log_info='Scanning local folder...')
         self._local_chunks = await hash_dir(self._basedir, self._remote_chunks, progress_func=hash_dir_progress_func)
+        self._status_func(progress=1.0, cur_status=f'Local files hashed.')
+
+        # Start serving local chunks
+        if self._peer_server:
+            self._peer_server.set_chunks(self._local_chunks)
 
         if not self._remote_chunks:
-            self._status_func(log_error=f'WARNING: no remote manifest - skipping sync for now.')
+            self._status_func(log_info=f'NOTE: no remote manifest - skipping sync for now.')
             return
 
         async with aiohttp.ClientSession() as http_session:
-            await self._refresh_peers(http_session)
-
-            # Start serving local chunks and report them server
-            self._peer_server.set_chunks(self._local_chunks)
-            await self._report_local_chunks_to_master(http_session)
+            await self._report_local_chunks_to_master(http_session)  # Report local chunks to server
 
             # Do we need to sync?
             if chunks_to_json(self._local_chunks) == chunks_to_json(self._remote_chunks):
-                self._status_func(progress=1.0, cur_status='Up to date.')
+                self._status_func(progress=-1, cur_status='Up to date.')
             else:
+                await self._refresh_peers(http_session)
+                self._status_func(log_info=f'Downloading new files now...', popup=True)
                 base_path = Path(self._basedir)
                 remote_files_by_name = {c.filename:c for c in self._remote_chunks}
                 local_files_by_name = {c.filename:c for c in self._local_chunks}
@@ -156,7 +162,7 @@ class FileClient(object):
                 for fn, lc in local_files_by_name.items():
                     local_path = base_path / Path(fn)
                     if base_path not in local_path.parents:
-                        self._status_func(log_error=f'FATAL BUG: Local path pointing outside base dir?? ABORTING! "{fn}"')
+                        self._status_func(log_error=f'FATAL BUG: Local path pointing outside base dir?? ABORTING! "{fn}"', popup=True)
                         return
                     else:
                         rc = remote_files_by_name.get(fn)
@@ -190,7 +196,7 @@ class FileClient(object):
 
                     local_path = base_path / Path(fn)
                     if base_path not in local_path.parents:
-                        self._status_func(log_error=f'SECURITY ERROR: Remote path pointing outside base dir?? Skip! "{fn}"')
+                        self._status_func(log_error=f'SECURITY ERROR: Remote path pointing outside base dir?? Skip! "{fn}"', popup=True)
                     else:
                         self._status_func(log_info=f'SYNC: Ready to download "{fn}"')
                         await self._refresh_peers(http_session)
@@ -206,7 +212,7 @@ class FileClient(object):
                                     await f.write(data)
                                     remaining_bytes -= c.size
                                 else:
-                                    self._status_func(log_error=f'SYNC: Failed to get file: {fn}')
+                                    self._status_func(log_error=f'SYNC: Failed to get file: {fn}', cur_status='Sync failed.')
                                     break
 
                         # Set correct modification time if file is now complete
@@ -234,27 +240,24 @@ class FileClient(object):
                     self._status_func(progress=1.0-float(remaining_bytes)/download_total_bytes, cur_status=f'Syncing...')
 
                 if errors:
-                    self._status_func(progress=1.0, cur_status=f'Sync incomplete. Trying again in a bit.')
+                    self._status_func(cur_status=f'Sync incomplete. Trying again in a bit.')
                 else:
-                    self._status_func(progress=1.0, cur_status=f'Sync finished.')
+                    self._status_func(progress=-1, cur_status=f'Sync done.')
 
 
     async def run_syncer(self):
-        next_folder_rescan = datetime.utcnow()
-
+        self._next_folder_rescan = datetime.utcnow()
         # Periodically rescan local folder
         async def folder_monitor():
-            nonlocal next_folder_rescan
             self._status_func(log_info=f'Local folder scanner starting.')
             while True:
                 await asyncio.sleep(1)
-                if datetime.utcnow() >= next_folder_rescan:
+                if datetime.utcnow() >= self._next_folder_rescan:
                     await self.sync_folder()
-                    next_folder_rescan = datetime.utcnow() + timedelta(seconds=self._local_rescan_interval)
+                    self._next_folder_rescan = datetime.utcnow() + timedelta(seconds=self._local_rescan_interval)
 
         # Monitor master server for file manifest changes
         async def server_monitor():
-            nonlocal next_folder_rescan
             self._status_func(log_info=f'Manifest monitor starting.')
             async with aiohttp.ClientSession() as http_session:
                 while True:
@@ -279,7 +282,7 @@ class FileClient(object):
                                         self._manifest_etag = resp.headers.get('ETag') or '-'
                                         self._remote_chunks = json_to_chunks(await resp.text())
                                         # Schedule immediate local folder scan and peer list fetch
-                                        next_folder_rescan = datetime.utcnow()
+                                        self._next_folder_rescan = datetime.utcnow()
                                         self._peers_expires = datetime.utcnow()
                                         self._status_func(log_info=f'Got new file manifest form server: {url}.')
                                     except Exception as e:
@@ -290,18 +293,28 @@ class FileClient(object):
 
         # Serve chunks to peers
         async def peer_server():
-            self._peer_server = FileServer(self._basedir)
-            await self._peer_server.run_server(port=14435, serve_manifest=False)
+            self._peer_server = FileServer(self._basedir, status_func=self._status_func)
+            await self._peer_server.run_server(port=self._port, serve_manifest=False)
 
         # Start all
-        await asyncio.gather(folder_monitor(), server_monitor(), peer_server())
+        try:
+            with suppress(asyncio.CancelledError):
+                await asyncio.gather(folder_monitor(), server_monitor(), peer_server())
+        except GeneratorExit as e:
+            pass
+        except:
+            self._status_func(log_error='FILECLIENT error:\n'+traceback.format_exc(), popup=True)
 
+
+async def run_file_client(base_dir: str, server_url: str, port: int, status_func=None):
+    client = FileClient(basedir=base_dir, server_url=server_url, status_func=status_func, port=port)
+    return await client.run_syncer()
 
 
 async def async_main():
-    BASE_DIR = "test-out/"
-
-    def test_status_func(progress: float = None, cur_status: str = None, log_error: str = None, log_info: str = None):
+    BASE_DIR = "sync-target/"
+    def test_status_func(progress: float = None, cur_status: str = None,
+                         log_error: str = None, log_info: str = None, popup: bool = False):
         if progress is not None:
             print(f" | Progress: {int(progress*100+0.5)}%")
         if cur_status is not None:
@@ -310,9 +323,9 @@ async def async_main():
             print(f" | ERROR: {log_error}")
         if log_info is not None:
             print(f" | INFO: {log_info}")
-
-    client = FileClient(basedir=BASE_DIR, server_url='http://localhost:14433', status_func=test_status_func)
-    await asyncio.gather(client.run_syncer())
+    await run_file_client(BASE_DIR, 'http://localhost:14433', port=14435, status_func=test_status_func)
     print("exiting!")
 
-asyncio.run(async_main())
+
+if __name__== "__main__":
+    asyncio.run(async_main())
