@@ -1,8 +1,8 @@
 from typing import List
-import os, json, hashlib, asyncio
-import aiofiles, aiofiles.os
+import os, json, hashlib, asyncio, zlib
+import aiofiles, aiofiles.os, io
 
-PART_SIZE = 16*1024*1024
+PART_SIZE = 32*1024*1024
 
 class FileChunk(object):
     filename: str       # path + filename
@@ -10,9 +10,11 @@ class FileChunk(object):
     size: int           # part size in bytes
     file_size: int      # size of complete file in bytes
     file_mtime: int     # last modified (unix timestamp)
-    sha1: str           # SHA1 hex checksum of part
+    hash: str           # Hex checksum of data contents (blake2, digest_size=12)
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)
+    def __repr__(self):
+        return str(self.__dict__)
 
 
 async def _hash_file(basedir: str, relpath: str, file_progress_func=None) -> List[FileChunk]:
@@ -35,13 +37,25 @@ async def _hash_file(basedir: str, relpath: str, file_progress_func=None) -> Lis
         while pos < st.st_size:
             assert (pos <= st.st_size)
             sz = min((st.st_size-pos), PART_SIZE)
+
+            remaining = sz
+            buff = bytearray(64*1024)
+            h = hashlib.blake2b(digest_size=12)
+            read = -1
+            while read:
+                if remaining < len(buff):
+                    buff = bytearray(remaining)
+                read = await f.readinto(buff)
+                h.update(buff)
+                remaining -= read
+
             res.append(FileChunk(
                     filename=relpath,
                     pos=pos,
                     size=sz,
                     file_size=st.st_size,
                     file_mtime=int(st.st_mtime+0.5),
-                    sha1=hashlib.sha1(await f.read(sz)).hexdigest()))
+                    hash=h.hexdigest()))
             pos += sz
             if file_progress_func:
                 file_progress_func(relpath, sz, pos, st.st_size)
@@ -62,7 +76,7 @@ async def hash_dir(basedir: str, old_chunks=None, progress_func=None) -> List[Fi
             fnames.append(os.path.relpath(os.path.join(root, f), basedir))
 
     # Map filename -> chunk for faster lookup of current list
-    fn_to_old_chunk = {c.filename:c for c in old_chunks} if old_chunks else {}
+    fn_to_old_chunk = {c.filename: c for c in old_chunks} if old_chunks else {}
 
     async def file_needs_rehash(filename: str):
         try:

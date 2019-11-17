@@ -14,7 +14,7 @@ class FileServer(object):
 
     def __init__(self, basedir: str, http_cache_time: int = 60*5, status_func: Callable=None):
         self._chunks = []           # List fo all FileChunks
-        self._hash_to_chunk = {}    # Map sha1sum -> FileChunk
+        self._hash_to_chunk = {}    # Map hash -> FileChunk
         self._basedir = basedir     # Directory to serve/monitor files from
         self._base_url = ''         # URL to access this server
         self._manifest_etag = ''    # MD5 sum of manifest
@@ -37,9 +37,12 @@ class FileServer(object):
         return self._base_url
 
     def set_chunks(self, chunks):
+        '''
+        Receive new chunks from directory scanner and start serving them.
+        '''
         self._status_func(log_info='Chunks updated. Now serving new ones.')
         self._chunks = chunks
-        self._hash_to_chunk = {c.sha1: c for c in chunks}
+        self._hash_to_chunk = {c.hash: c for c in chunks}
 
         manifest = chunks_to_json(self._chunks)
         self._manifest_etag = hashlib.md5(manifest.encode('utf-8')).hexdigest()
@@ -47,13 +50,25 @@ class FileServer(object):
         # Make sure server's URL is in peer list for all local hashes
         if self._base_url:
             for c in self._chunks:
-                if c.sha1 not in self._peers_map:
-                    self._peers_map[c.sha1] = []
-                url = f'{self._base_url}/chunk/{c.sha1}'
-                if url not in self._peers_map[c.sha1]:
-                    self._peers_map[c.sha1].append(url)
+                if c.hash not in self._peers_map:
+                    self._peers_map[c.hash] = []
+                url = f'{self._base_url}/chunk/{c.hash}'
+                if url not in self._peers_map[c.hash]:
+                    self._peers_map[c.hash].append(url)
+
 
     def run_server(self, serve_manifest=True, port=14433, https_cert=None, https_key=None):
+        '''
+        Create HTTP(S) server loop.
+
+        :param serve_manifest: Should this server serve /manifest and /peers, or only chunk data?
+            True for master server, False for peer2peer servers.
+        :param port: TCP port to listen at.
+        :param https_cert: PEM filename or None
+        :param https_key: PEM filename or None
+
+        :return: Asyncio task
+        '''
         base_path = Path(self._basedir)
 
         hostname = socket.gethostname()
@@ -66,7 +81,7 @@ class FileServer(object):
         # HTTP HANDLER - Serve requested file chunk to a client
         async def handle_get_chunk(request):
             '''
-            HTTP GET handler that serves out a file chunk with given sha1 sum.
+            HTTP GET handler that serves out a file chunk with given hash.
             '''
             self._status_func(log_info=f"[{request.remote}] GET {request.path_qs}")
             h = request.match_info.get('hash', 'noname')
@@ -91,15 +106,17 @@ class FileServer(object):
                     await response.prepare(request)
                     async with aiofiles.open(path, mode='rb') as f:
                         await f.seek(c.pos)
-                        size = c.size
-                        while size > 0:
-                            buf_size = min(64*1024, size)
-                            buf = await f.read(buf_size)
-                            if len(buf) != buf_size:
-                                self._status_func(log_error=f'ERROR: File "{str(path)}" changed? Read {len(buf)} but expected {buf_size}.')
+                        remaining = c.size
+                        buff = bytearray(64*1024)
+                        while remaining > 0:
+                            if remaining < len(buff):
+                                buff = bytearray(remaining)
+                            cnt = await f.readinto(buff)
+                            if cnt != len(buff) != cnt:
+                                self._status_func(log_error=f'ERROR: File "{str(path)}" changed? Read {cnt} but expected {len(buff)}.')
                                 return web.Response(status=500, text=f'500 INTERNAL ERROR. Filesize mismatch.')
-                            await response.write(buf)
-                            size -= buf_size
+                            await response.write(buff)
+                            remaining -= cnt
                     await response.write_eof()
                     return response
 
