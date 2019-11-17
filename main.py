@@ -80,7 +80,7 @@ def gui_status_callback(
         popup: bool = False):
 
     global tray, gui_cur_progress, gui_cur_status, gui_log, gui_log, gui_last_error, menu_def_changed
-    dt = datetime.now().strftime('%m-%d-%y %H:%M:%S')
+    dt = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     if progress is not None:
         gui_cur_progress = progress

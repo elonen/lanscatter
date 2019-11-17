@@ -2,11 +2,11 @@ from typing import List, Callable
 from filechunks import FileChunk, hash_dir, monitor_folder_forever, chunks_to_json, json_to_chunks
 from datetime import datetime, timedelta
 import asyncio, aiohttp, aiohttp.client_exceptions, aiofiles, aiofiles.os
-import os, hashlib, random, traceback, json, io, time
+import os, hashlib, random, traceback, json, io, time, argparse
 from pathlib import Path
 from fileserver import FileServer
 from contextlib import suppress
-
+from common import *
 
 class CachedHttpObject(object):
     '''
@@ -45,7 +45,7 @@ class CachedHttpObject(object):
                     if resp.status == 200:  # HTTP OK
                         try:
                             self.ingest_data(data=await resp.json(), etag=(resp.headers.get('ETag') or ''))
-                            self._status_func(log_info=f'Got new {self._data_name} from server.')
+                            self._status_func(log_info=f'Got new {self._data_name} from server ({self._url}).')
                             return True
                         except Exception as e:
                             self._status_func(log_error=f'Error parsing GET {url}: {str(e)}')
@@ -327,26 +327,25 @@ class FileClient(object):
         self._status_func(log_info='fileclient run_syncer() exiting.')
 
 
-async def run_file_client(base_dir: str, server_url: str, port: int, status_func=None):
-    client = FileClient(basedir=base_dir, server_url=server_url, status_func=status_func, port=port)
+async def run_file_client(base_dir: str, server_url: str, port: int, status_func=None,
+                          cache_interval: float = 45, rescan_interval: float = 60):
+    client = FileClient(
+        basedir=base_dir, server_url=server_url, status_func=status_func, port=port,
+        manifest_cache_time=cache_interval, peer_list_cache_time=cache_interval, file_rescan_interval=rescan_interval)
     return await client.run_syncer()
 
 
-async def async_main():
-    BASE_DIR = "sync-target/"
-    def test_status_func(progress: float = None, cur_status: str = None,
-                         log_error: str = None, log_info: str = None, popup: bool = False):
-        if progress is not None:
-            print(f" | Progress: {int(progress*100+0.5)}%")
-        if cur_status is not None:
-            print(f" | Cur status: {cur_status}")
-        if log_error is not None:
-            print(f" | ERROR: {log_error}")
-        if log_info is not None:
-            print(f" | INFO: {log_info}")
-    await run_file_client(BASE_DIR, 'http://localhost:14433', port=14435, status_func=test_status_func)
-    print("exiting!")
-
-
 if __name__ == "__main__":
-    asyncio.run(async_main())
+    parser = argparse.ArgumentParser()
+    parser.add_argument('dir', help='Sync directory')
+    parser.add_argument('--url', default='http://localhost:14433', help='Master server URL')
+    parser.add_argument('-p', '--port', dest='port', type=int, default=14435, help='HTTP(s) port for P2P transfers')
+    parser.add_argument('--rescan-interval', dest='rescan_interval', type=float, default=60, help='How often rescan files')
+    parser.add_argument('--cache-time', dest='cache_time', type=float, default=45, help='HTTP cache expiration time')
+    parser.add_argument('--json', dest='json', action='store_true', default=False, help='Show status as JSON (for GUI usage)')
+    args = parser.parse_args()
+    status_func = json_status_func if args.json else human_cli_status_func
+    with suppress(KeyboardInterrupt):
+        asyncio.run(run_file_client(base_dir=args.dir, server_url=args.url, port=args.port,
+                                    cache_interval=args.cache_time, rescan_interval=args.rescan_interval,
+                                    status_func=status_func))

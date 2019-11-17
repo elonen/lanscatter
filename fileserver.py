@@ -2,9 +2,9 @@ from aiohttp import web
 from pathlib import Path
 from typing import List, Dict, Callable
 import ssl, asyncio, aiofiles, socket, json, hashlib, argparse
-
-from filechunks import FileChunk, monitor_folder_forever, chunks_to_json, json_to_chunks
-
+from filechunks import FileChunk, monitor_folder_forever, chunks_to_json
+from contextlib import suppress
+from common import *
 
 class FileServer(object):
     _chunks: List[FileChunk]
@@ -12,7 +12,7 @@ class FileServer(object):
     _basedir: str
     _manifest: str
 
-    def __init__(self, basedir: str, http_cache_time: int = 60*5, status_func: Callable=None):
+    def __init__(self, basedir: str, status_func: Callable, http_cache_time: int = 60*5):
         self._chunks = []           # List fo all FileChunks
         self._hash_to_chunk = {}    # Map hash -> FileChunk
         self._basedir = basedir     # Directory to serve/monitor files from
@@ -234,30 +234,15 @@ async def run_master_server(base_dir: str, port: int,
         server.run_server(serve_manifest=True, port=port, https_cert=https_cert, https_key=https_key))
 
 
-# ------------------------
-
-async def async_main(basedir: str, port: int, cert: str, key: str):
-
-    def test_status_func(progress: float = None, cur_status: str = None,
-                         log_error: str = None, log_info: str = None, popup: bool = False):
-        if progress is not None:
-            print(f" | Progress: {int(progress*100+0.5)}%")
-        if cur_status is not None:
-            print(f" | Cur status: {cur_status}")
-        if log_error is not None:
-            print(f" | ERROR: {log_error}")
-        if log_info is not None:
-            print(f" | INFO: {log_info}")
-
-    await asyncio.gather(run_master_server(basedir, port, https_cert=cert, https_key=key, status_func=test_status_func))
-
-
-if __name__== "__main__":
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('dir', help='Directory to serve files from.')
-    parser.add_argument('-p', '--port', dest='port', type=int, default=14433, help='HTTP(s) port to server at.')
+    parser.add_argument('dir', help='Directory to serve files from')
+    parser.add_argument('-p', '--port', dest='port', type=int, default=14433, help='HTTP(s) server port')
     parser.add_argument('--sslcert', type=str, default=None, help='SSL certificate file for HTTPS (optional)')
     parser.add_argument('--sslkey', type=str, default=None, help='SSL key file for HTTPS (optional)')
-
+    parser.add_argument('--json', dest='json', action='store_true', default=False, help='Show status as JSON (for GUI usage)')
     args = parser.parse_args()
-    asyncio.run(async_main(basedir=args.dir, port=args.port, cert=args.sslcert, key=args.sslkey))
+    status_func = json_status_func if args.json else human_cli_status_func
+    with suppress(KeyboardInterrupt):
+        asyncio.run(run_master_server(
+            base_dir=args.dir, port=args.port, https_cert=args.sslcert, https_key=args.sslkey, status_func=status_func))
