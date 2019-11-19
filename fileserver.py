@@ -213,7 +213,7 @@ class FileServer(object):
         async def wrap_runner():
             runner = web.AppRunner(app)
             await runner.setup()
-            site = web.TCPSite(runner, port=port, ssl_context=context, reuse_port=True)
+            site = web.TCPSite(runner, port=port, ssl_context=context)
             await site.start()
         return wrap_runner()
 

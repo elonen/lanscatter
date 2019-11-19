@@ -1,6 +1,5 @@
 PySimpleGUIQt
 PySimpleGUI
 PyInstaller
-PySide2
 aiohttp
 aiofiles
