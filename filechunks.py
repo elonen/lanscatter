@@ -2,12 +2,15 @@ from typing import List
 import os, json, hashlib, asyncio, zlib
 import aiofiles, aiofiles.os, io
 
-PART_SIZE = 32*1024*1024
+# Tools for scanning files in a directory and splitting them into hashed chunks.
+# FileServer and FileClient both use this for maintaining and syncing their state.
+
+CHUNK_SIZE = 64 * 1024 * 1024
 
 class FileChunk(object):
     filename: str       # path + filename
     pos: int            # chunk start position in bytes
-    size: int           # part size in bytes
+    size: int           # chunk size in bytes
     file_size: int      # size of complete file in bytes
     file_mtime: int     # last modified (unix timestamp)
     hash: str           # Hex checksum of data contents (blake2, digest_size=12)
@@ -36,7 +39,7 @@ async def _hash_file(basedir: str, relpath: str, file_progress_func=None) -> Lis
     async with aiofiles.open(path, 'rb') as f:
         while pos < st.st_size:
             assert (pos <= st.st_size)
-            sz = min((st.st_size-pos), PART_SIZE)
+            sz = min((st.st_size-pos), CHUNK_SIZE)
 
             remaining = sz
             buff = bytearray(64*1024)

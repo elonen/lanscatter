@@ -8,6 +8,9 @@ from fileserver import FileServer
 from contextlib import suppress
 from common import *
 
+# Client that keeps given directory synced with a master server,
+# and laos serves downloaded chunks to peers for network load distribution.
+
 class CachedHttpObject(object):
     '''
     Cached container for (JSON) object from a remote HTTP(s) server.

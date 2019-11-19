@@ -5,6 +5,10 @@ from datetime import datetime
 from fileserver import run_master_server
 from fileclient import run_file_client
 
+#
+# System tray GUI for both FileClient and FileServer.
+#
+
 # Kill app on ctrl-c
 import signal
 signal.signal(signal.SIGINT, signal.SIG_DFL)
@@ -13,9 +17,7 @@ sg.change_look_and_feel('Reddit')
 
 menu_def = ['BLANK', ['!(no status)', '!(no progress)', '---', 'View &log', '&Settings', 'E&xit']]
 menu_def_changed = True
-#icon_data=b'''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'''
 tray = sg.SystemTray(menu=menu_def, filename='icon.ico')  # Alternative: filename=r'default_icon.ico'
-
 
 sync_dir = 'sync-target/'
 server_url = 'http://localhost:14433'

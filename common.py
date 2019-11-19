@@ -1,6 +1,8 @@
 from datetime import datetime
 import json
 
+# Common functions for FileServer and FileClient.
+
 
 def human_cli_status_func(progress: float = None, cur_status: str = None,
                      log_error: str = None, log_info: str = None, popup: bool = False):

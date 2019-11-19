@@ -6,6 +6,10 @@ from filechunks import FileChunk, monitor_folder_forever, chunks_to_json
 from contextlib import suppress
 from common import *
 
+# HTTP file server that continuously auto-scans given directory,
+# serves file chunks to clients, and maintains a list of P2P URLs so network load get distributed
+# like a semi-centralized bittorrent.
+
 class FileServer(object):
     _chunks: List[FileChunk]
     _hash_to_chunk: Dict[str, FileChunk]
@@ -205,10 +209,6 @@ class FileServer(object):
             context.load_cert_chain(certfile=https_cert, keyfile=https_key)
         else:
             self._status_func(log_info=f"SSL cert not provided. Serving plain HTTP.")
-
-        # Return async server task
-        #task = web._run_app(app, ssl_context=context, port=port)
-        #return task
 
         async def wrap_runner():
             runner = web.AppRunner(app)
