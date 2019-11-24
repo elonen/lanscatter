@@ -1,5 +1,7 @@
-PySimpleGUIQt
-PySimpleGUI
-PyInstaller
+#PyInstaller
 aiohttp
 aiofiles
+wxPython
+
+win10toast; sys_platform == 'windows'
+pyobjc-core; sys_platform == 'darwin'

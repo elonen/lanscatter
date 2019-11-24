@@ -1,7 +1,7 @@
 from aiohttp import web
 from pathlib import Path
 from typing import List, Dict, Callable
-import ssl, asyncio, aiofiles, socket, json, hashlib, argparse
+import sys, ssl, asyncio, aiofiles, socket, hashlib, argparse
 from filechunks import FileChunk, monitor_folder_forever, chunks_to_json
 from contextlib import suppress
 from common import *
@@ -234,7 +234,7 @@ async def run_master_server(base_dir: str, port: int,
         server.run_server(serve_manifest=True, port=port, https_cert=https_cert, https_key=https_key))
 
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('dir', help='Directory to serve files from')
     parser.add_argument('-p', '--port', dest='port', type=int, default=14433, help='HTTP(s) server port')
@@ -246,3 +246,7 @@ if __name__ == "__main__":
     with suppress(KeyboardInterrupt):
         asyncio.run(run_master_server(
             base_dir=args.dir, port=args.port, https_cert=args.sslcert, https_key=args.sslkey, status_func=status_func))
+
+
+if __name__ == "__main__":
+    main()

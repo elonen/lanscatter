@@ -1,8 +1,8 @@
 from typing import List, Callable
 from filechunks import FileChunk, hash_dir, monitor_folder_forever, chunks_to_json, json_to_chunks
 from datetime import datetime, timedelta
-import asyncio, aiohttp, aiohttp.client_exceptions, aiofiles, aiofiles.os
-import os, hashlib, random, traceback, json, io, time, argparse
+import asyncio, aiohttp, aiofiles, aiofiles.os
+import sys, os, hashlib, random, traceback, io, time, argparse
 from pathlib import Path
 from fileserver import FileServer
 from contextlib import suppress
@@ -173,14 +173,16 @@ class FileClient(object):
         def hash_dir_progress_func(cur_filename, file_progress, total_progress):
             self._status_func(progress=total_progress, cur_status=f'Hashing ({cur_filename} / {int(file_progress*100+0.5)}%)')
         self._local_chunks = await hash_dir(self._basedir, self._remote_chunks, progress_func=hash_dir_progress_func)
-        self._status_func(progress=1.0, cur_status=f'Files hashed.')
+        self._status_func(progress=-1, cur_status=f'Local files hashed')
 
         # Start serving local chunks to peers
         if self._peer_server:
             self._peer_server.set_chunks(self._local_chunks)
 
         if not self._remote_chunks:
-            self._status_func(log_info=f'NOTE: no remote manifest - skipping sync for now.')
+            self._status_func(
+                log_info=f'NOTE: no remote manifest - skipping sync for now.',
+                cur_status='Waiting for manifest...')
             return
 
         async with aiohttp.ClientSession() as http_session:
@@ -338,7 +340,7 @@ async def run_file_client(base_dir: str, server_url: str, port: int, status_func
     return await client.run_syncer()
 
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('dir', help='Sync directory')
     parser.add_argument('--url', default='http://localhost:14433', help='Master server URL')
@@ -352,3 +354,7 @@ if __name__ == "__main__":
         asyncio.run(run_file_client(base_dir=args.dir, server_url=args.url, port=args.port,
                                     cache_interval=args.cache_time, rescan_interval=args.rescan_interval,
                                     status_func=status_func))
+
+
+if __name__ == "__main__":
+    main()
