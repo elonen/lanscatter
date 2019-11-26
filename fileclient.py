@@ -7,6 +7,7 @@ from pathlib import Path
 from fileserver import FileServer
 from contextlib import suppress
 from common import *
+from ratelimiter import RateLimiter
 
 # Client that keeps given directory synced with a master server,
 # and laos serves downloaded chunks to peers for network load distribution.
@@ -66,19 +67,23 @@ class FileClient(object):
     '''
     Process that scans sync directory, hashes it, and keeps it synced with a "manifest" (file list) master server.
     '''
-
     def __init__(self,
                  basedir: str,                          # Sync directory path
                  server_url: str,                       # URL of master server
                  status_func: Callable,                 # Callback for status reporting
-                 port: int = 14435,                     # TCP port for listening to peers
-                 manifest_cache_time: float = 45,       # How often to recheck server for file changes
-                 peer_list_cache_time: float = 45,      # How often to recheck server for new peer URL list
-                 file_rescan_interval: float = 60):     # How often to rescan sync directory (seconds)
+                 port: int,                             # TCP port for listening to peers
+                 manifest_cache_time: float,            # How often to recheck server for file changes
+                 peer_list_cache_time: float,           # How often to recheck server for new peer URL list
+                 file_rescan_interval: float,           # How often to rescan sync directory (seconds)
+                 dl_limit: float,                       # Download limit, Mbits/s
+                 ul_limit: float):                      # Upload limit, Mbits/s
 
         self._basedir: str = basedir
         self._local_rescan_interval = file_rescan_interval
         self._next_folder_rescan = datetime.utcnow()
+
+        self._dl_limiter = RateLimiter(dl_limit*1024*1024/8, 1.0, burst_factor=2.0)
+        self._ul_limit = ul_limit
 
         self._port = port
         self._server_url: str = server_url
@@ -138,7 +143,9 @@ class FileClient(object):
                             data, read = io.BytesIO(), b'-'
                             h = hashlib.blake2b(digest_size=12)
                             while read:
-                                read = await resp.content.read(16*1024)
+                                limited_n = int(await self._dl_limiter.acquire(64*1024, 4*1024))
+                                read = await resp.content.read(limited_n)
+                                self._dl_limiter.return_unused(limited_n - len(read))
                                 h.update(read)
                                 data.write(read)
                             if h.hexdigest() == c.hash:
@@ -321,7 +328,7 @@ class FileClient(object):
         # Serve chunks to peers over HTTP
         async def peer_server():
             self._peer_server = FileServer(self._basedir, status_func=self._status_func)
-            await self._peer_server.run_server(port=self._port, serve_manifest=False)
+            await self._peer_server.run_server(port=self._port, serve_manifest=False, ul_limit=self._ul_limit)
 
         # Run all
         try:
@@ -333,10 +340,12 @@ class FileClient(object):
 
 
 async def run_file_client(base_dir: str, server_url: str, port: int, status_func=None,
-                          cache_interval: float = 45, rescan_interval: float = 60):
+                          cache_interval: float = 45, rescan_interval: float = 60,
+                          dl_limit: float = 10000, ul_limit: float = 10000):
     client = FileClient(
         basedir=base_dir, server_url=server_url, status_func=status_func, port=port,
-        manifest_cache_time=cache_interval, peer_list_cache_time=cache_interval, file_rescan_interval=rescan_interval)
+        manifest_cache_time=cache_interval, peer_list_cache_time=cache_interval, file_rescan_interval=rescan_interval,
+        dl_limit=dl_limit, ul_limit=ul_limit)
     return await client.run_syncer()
 
 
@@ -346,6 +355,8 @@ def main():
     parser.add_argument('--url', default='http://localhost:14433', help='Master server URL')
     parser.add_argument('-p', '--port', dest='port', type=int, default=14435, help='HTTP(s) port for P2P transfers')
     parser.add_argument('--rescan-interval', dest='rescan_interval', type=float, default=60, help='How often rescan files')
+    parser.add_argument('--dl-rate', dest='dl_limit', type=float, default=10000, help='Rate limit downloads, Mb/s')
+    parser.add_argument('--ul-rate', dest='ul_limit', type=float, default=10000, help='Rate limit uploads, Mb/s')
     parser.add_argument('--cache-time', dest='cache_time', type=float, default=45, help='HTTP cache expiration time')
     parser.add_argument('--json', dest='json', action='store_true', default=False, help='Show status as JSON (for GUI usage)')
     args = parser.parse_args()
@@ -353,6 +364,7 @@ def main():
     with suppress(KeyboardInterrupt):
         asyncio.run(run_file_client(base_dir=args.dir, server_url=args.url, port=args.port,
                                     cache_interval=args.cache_time, rescan_interval=args.rescan_interval,
+                                    dl_limit=args.dl_limit, ul_limit=args.ul_limit,
                                     status_func=status_func))
 
 

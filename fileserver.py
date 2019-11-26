@@ -4,6 +4,7 @@ from typing import List, Dict, Callable
 import sys, ssl, asyncio, aiofiles, socket, hashlib, argparse
 from filechunks import FileChunk, monitor_folder_forever, chunks_to_json
 from contextlib import suppress
+from ratelimiter import RateLimiter
 from common import *
 
 # HTTP file server that continuously auto-scans given directory,
@@ -61,7 +62,7 @@ class FileServer(object):
                     self._peers_map[c.hash].append(url)
 
 
-    def run_server(self, serve_manifest=True, port=14433, https_cert=None, https_key=None):
+    def run_server(self, serve_manifest=True, port=14433, https_cert=None, https_key=None, ul_limit: float = 10000):
         '''
         Create HTTP(S) server loop.
 
@@ -81,6 +82,8 @@ class FileServer(object):
 
         srv_type = 'master' if serve_manifest else 'p2p'
         self._status_func(log_info=f'Starting {srv_type} file server on {self._base_url}.')
+
+        ul_limiter = RateLimiter(ul_limit*1024*1024/8, 1.0, burst_factor=2.0)
 
         # HTTP HANDLER - Serve requested file chunk to a client
         async def handle_get_chunk(request):
@@ -111,16 +114,26 @@ class FileServer(object):
                     async with aiofiles.open(path, mode='rb') as f:
                         await f.seek(c.pos)
                         remaining = c.size
-                        buff = bytearray(64*1024)
+                        buff = bytearray(256*1024)
                         while remaining > 0:
+
+                            # Read file
                             if remaining < len(buff):
                                 buff = bytearray(remaining)
                             cnt = await f.readinto(buff)
-                            if cnt != len(buff) != cnt:
+                            if cnt != len(buff):
                                 self._status_func(log_error=f'ERROR: File "{str(path)}" changed? Read {cnt} but expected {len(buff)}.')
                                 return web.Response(status=500, text=f'500 INTERNAL ERROR. Filesize mismatch.')
-                            await response.write(buff)
                             remaining -= cnt
+
+                            # Upload (in several blocks if limiter hits)
+                            i = 0
+                            while cnt > 0:
+                                limited_n = int(await ul_limiter.acquire(cnt, 4096))
+                                await response.write(buff[i:(i+limited_n)])
+                                i += limited_n
+                                cnt -= limited_n
+
                     await response.write_eof()
                     return response
 
@@ -219,7 +232,7 @@ class FileServer(object):
 
 
 async def run_master_server(base_dir: str, port: int,
-                            dir_scan_interval: float = 20, status_func=None,
+                            dir_scan_interval: float = 20, status_func=None, ul_limit: float = 10000,
                             https_cert=None, https_key=None):
     async def dir_scanner():
         def progress_func_adapter(cur_filename, file_progress, total_progress):
@@ -231,13 +244,14 @@ async def run_master_server(base_dir: str, port: int,
     server = FileServer(base_dir, status_func=status_func)
     await asyncio.gather(
         dir_scanner(),
-        server.run_server(serve_manifest=True, port=port, https_cert=https_cert, https_key=https_key))
+        server.run_server(serve_manifest=True, port=port, ul_limit=ul_limit, https_cert=https_cert, https_key=https_key))
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('dir', help='Directory to serve files from')
     parser.add_argument('-p', '--port', dest='port', type=int, default=14433, help='HTTP(s) server port')
+    parser.add_argument('--ul-rate', dest='ul_limit', type=float, default=10000, help='Rate limit uploads, Mb/s')
     parser.add_argument('--sslcert', type=str, default=None, help='SSL certificate file for HTTPS (optional)')
     parser.add_argument('--sslkey', type=str, default=None, help='SSL key file for HTTPS (optional)')
     parser.add_argument('--json', dest='json', action='store_true', default=False, help='Show status as JSON (for GUI usage)')
@@ -245,7 +259,9 @@ def main():
     status_func = json_status_func if args.json else human_cli_status_func
     with suppress(KeyboardInterrupt):
         asyncio.run(run_master_server(
-            base_dir=args.dir, port=args.port, https_cert=args.sslcert, https_key=args.sslkey, status_func=status_func))
+            base_dir=args.dir, port=args.port, ul_limit=args.ul_limit,
+            https_cert=args.sslcert, https_key=args.sslkey,
+            status_func=status_func))
 
 
 if __name__ == "__main__":
