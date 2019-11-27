@@ -43,6 +43,8 @@ class FileClient(object):
         self._local_chunks = []                     # Hashed file parts that exist here, locally
         self._remote_chunks = []                    # Hashed file parts that exist on server (copy of "manifest")
 
+        self._chunk_size = None                      # Read from server
+
         self._peer_server = None                    # FileServer instance for serving chunks to peers
 
         # Cached HTTP data from server
@@ -77,6 +79,20 @@ class FileClient(object):
 
 
     async def _fetch_chunk(self, c: FileChunk, http_session):
+        # Got it locally already? Reuse:
+        for lc in self._local_chunks:
+            if lc.hash == c.hash:
+                self._status_func(log_info=f'Reusing local copy, chunk {c.hash}')
+                async with aiofiles.open(Path(self._basedir)/c.filename, mode='rb') as f:
+                    await f.seek(lc.pos)
+                    buff = bytearray(lc.size)
+                    cnt = await f.readinto(buff)
+                    if cnt == c.size:
+                        return buff
+                    else:
+                        self._status_func(log_error=f'Failed to read chunk {str(c.hash)} locally from disk.')
+                        break
+        # Need to download
         if not self._peers.data.get(c.hash):
             self._status_func(log_error=f'No download URLs for chunk {str(c.hash)} of {c.filename}')
             return None
@@ -126,28 +142,33 @@ class FileClient(object):
         '''
         Scan local folder, compare it to remote_chunks from server, and sync if not identical.
         '''
-        # Scan/hash local sync dir
-        self._status_func(log_info='Scanning local folder...')
-        def hash_dir_progress_func(cur_filename, file_progress, total_progress):
-            self._status_func(progress=total_progress, cur_status=f'Hashing ({cur_filename} / {int(file_progress*100+0.5)}%)')
-        self._local_chunks = await hash_dir(self._basedir, self._remote_chunks, progress_func=hash_dir_progress_func)
-        self._status_func(progress=-1, cur_status=f'Local files hashed')
-
-        # Start serving local chunks to peers
-        if self._peer_server:
-            self._peer_server.set_chunks(self._local_chunks)
-
+        if not self._chunk_size:
+            self._status_func(
+                log_info=f'Chunk size not known yet. Cannot sync_folder().',
+                cur_status='Waiting for manifest...')
+            return
         if not self._remote_chunks:
             self._status_func(
                 log_info=f'NOTE: no remote manifest - skipping sync for now.',
                 cur_status='Waiting for manifest...')
             return
 
+        # Scan/hash local sync dir
+        self._status_func(log_info='Scanning local folder...')
+        def hash_dir_progress_func(cur_filename, file_progress, total_progress):
+            self._status_func(progress=total_progress, cur_status=f'Hashing ({cur_filename} / {int(file_progress*100+0.5)}%)')
+        self._local_chunks = await hash_dir(self._basedir, chunk_size=self._chunk_size, old_chunks=self._remote_chunks, progress_func=hash_dir_progress_func)
+        self._status_func(progress=-1, cur_status=f'Local files hashed')
+
+        # Start serving local chunks to peers
+        if self._peer_server:
+            self._peer_server.set_chunks(self._local_chunks)
+
         async with aiohttp.ClientSession() as http_session:
             await self._report_new_local_chunks_to_server(http_session)
 
             # Do we need to sync?
-            if chunks_to_json(self._local_chunks) == chunks_to_json(self._remote_chunks):
+            if chunks_to_json(self._local_chunks, self._chunk_size) == chunks_to_json(self._remote_chunks, self._chunk_size):
                 self._status_func(progress=-1, cur_status='Up to date.')
             else:
                 await self._peers.refresh(http_session)
@@ -216,6 +237,7 @@ class FileClient(object):
                                     progress=1.0 - float(remaining_bytes) / download_total_bytes,
                                     cur_status=f'Downloading {round(megabytes_per_sec,1)} MB/s, "{fn}" chunk {i}/{len(file_chunks)}')
                                 data = await self._fetch_chunk(c, http_session)
+                                self._local_chunks.append(c)
                                 end_time = time.perf_counter()
                                 megabytes_per_sec = (c.size/1024/1024) / (end_time-start_time)
                                 if data:
@@ -225,20 +247,17 @@ class FileClient(object):
                                     self._status_func(log_error=f'SYNC: Failed to get file: {fn}', cur_status='Sync failed.')
                                     break
 
+                        self._local_chunks = sorted(self._local_chunks, key=lambda c: c.filename + f'{c.pos:016}')
+
                         # Set correct modification time if file is now complete
                         st = await aiofiles.os.stat(abs_path)
                         if st.st_size == rc.file_size:
                             os.utime(abs_path, (rc.file_mtime, rc.file_mtime))
-
-                            # Remember new local chunks
-                            new_chunks = [c for c in self._remote_chunks if c.filename == fn]
-                            self._local_chunks.extend(new_chunks)
-                            self._local_chunks = sorted(self._local_chunks, key=lambda c: c.filename + f'{c.pos:016}')
-
                             self._peer_server.set_chunks(self._local_chunks)
                             await self._report_new_local_chunks_to_server(http_session)
                         else:
-                            # Otherwise delete the stub
+                            # Otherwise delete the incomplete file
+                            self._local_chunks = [c for c in self._local_chunks if c.filename != fn]
                             self._status_func(log_info=f'Deleting incompletely downloaded file: {fn}')
                             os.remove(abs_path)
                             errors = True
@@ -265,12 +284,12 @@ class FileClient(object):
                 while True:
                     # Get new manifest?
                     if await self._manifest.refresh(http_session):
-                        self._remote_chunks = json_to_chunks(json.dumps(self._manifest.data))
+                        self._remote_chunks, self._chunk_size = json_to_chunks(json.dumps(self._manifest.data))
                         self._next_folder_rescan = datetime.utcnow()
                         self._peers_expires = datetime.utcnow()
 
                     # Rescan / resync?
-                    if datetime.utcnow() >= self._next_folder_rescan:
+                    if datetime.utcnow() >= self._next_folder_rescan and self._chunk_size:
                         await self.sync_folder()
                         self._next_folder_rescan = datetime.utcnow() + timedelta(seconds=self._local_rescan_interval)
 
@@ -305,7 +324,7 @@ def main():
     parser.add_argument('dir', help='Sync directory')
     parser.add_argument('--url', default='http://localhost:14433', help='Master server URL')
     parser.add_argument('-p', '--port', dest='port', type=int, default=14435, help='HTTP(s) port for P2P transfers')
-    parser.add_argument('--rescan-interval', dest='rescan_interval', type=float, default=60, help='How often rescan files')
+    parser.add_argument('--rescan-interval', dest='rescan_interval', type=float, default=60, help='How often to rescan files')
     parser.add_argument('--dl-rate', dest='dl_limit', type=float, default=10000, help='Rate limit downloads, Mb/s')
     parser.add_argument('--ul-rate', dest='ul_limit', type=float, default=10000, help='Rate limit uploads, Mb/s')
     parser.add_argument('--cache-time', dest='cache_time', type=float, default=45, help='HTTP cache expiration time')

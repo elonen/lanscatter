@@ -5,8 +5,6 @@ import aiofiles, aiofiles.os, io
 # Tools for scanning files in a directory and splitting them into hashed chunks.
 # FileServer and FileClient both use this for maintaining and syncing their state.
 
-CHUNK_SIZE = 64 * 1024 * 1024
-
 class FileChunk(object):
     filename: str       # path + filename
     pos: int            # chunk start position in bytes
@@ -20,7 +18,8 @@ class FileChunk(object):
         return str(self.__dict__)
 
 
-async def _hash_file(basedir: str, relpath: str, file_progress_func=None) -> List[FileChunk]:
+async def _hash_file(basedir: str, relpath: str, chunk_size: int,
+                     file_progress_func=None) -> List[FileChunk]:
     '''
     Split given file into chunks and hash them
     :param: basedir: Base directory to search for files
@@ -39,7 +38,7 @@ async def _hash_file(basedir: str, relpath: str, file_progress_func=None) -> Lis
     async with aiofiles.open(path, 'rb') as f:
         while pos < st.st_size:
             assert (pos <= st.st_size)
-            sz = min((st.st_size-pos), CHUNK_SIZE)
+            sz = min((st.st_size-pos), chunk_size)
 
             remaining = sz
             buff = bytearray(64*1024)
@@ -66,7 +65,7 @@ async def _hash_file(basedir: str, relpath: str, file_progress_func=None) -> Lis
     return res
 
 
-async def hash_dir(basedir: str, old_chunks=None, progress_func=None) -> List[FileChunk]:
+async def hash_dir(basedir: str, chunk_size: int, old_chunks=None, progress_func=None) -> List[FileChunk]:
     '''
     Scan given directory and generate a list of FileChunks of its contents.
     :param basedir: Folders to scan
@@ -114,14 +113,15 @@ async def hash_dir(basedir: str, old_chunks=None, progress_func=None) -> List[Fi
             res.extend([c for c in old_chunks if c.filename == fn])
             total_remaining -= res[-1].file_size
         else:
-            res.extend(await _hash_file(basedir, fn, file_progress_func=file_progress))
+            res.extend(await _hash_file(basedir, fn, chunk_size, file_progress_func=file_progress))
 
     # Sort results by filename and then by chunk position
     return sorted(res, key=lambda c: c.filename+f'{c.pos:016}')
 
 
 
-async def monitor_folder_forever(basedir: str, update_interval: float, progress_func=None):
+async def monitor_folder_forever(basedir: str, update_interval: float, progress_func=None,
+                                 chunk_size: int = 64*1024*1024):
     '''
     Test 'basedir' for changes every 'update_interval_secs' and yield a new list of FileChunks when it happens.
     (This is an async generator, intended to be used with "async for" syntax.)
@@ -132,7 +132,7 @@ async def monitor_folder_forever(basedir: str, update_interval: float, progress_
     '''
     chunks = []
     while True:
-        new_chunks = await hash_dir(basedir, chunks, progress_func=progress_func)
+        new_chunks = await hash_dir(basedir, chunk_size=chunk_size, old_chunks=chunks, progress_func=progress_func)
         if not (new_chunks is chunks):
             chunks = new_chunks
             yield chunks
@@ -140,9 +140,13 @@ async def monitor_folder_forever(basedir: str, update_interval: float, progress_
             await asyncio.sleep(update_interval)
 
 
-def chunks_to_json(chunks):
-    return json.dumps([c.__dict__ for c in chunks], indent=4)
+def chunks_to_json(chunks, chunk_size):
+    data = {'chunks': [c.__dict__ for c in chunks], 'chunk_size': chunk_size}
+    return json.dumps(data, indent=4)
 
 
 def json_to_chunks(json_str):
-    return [FileChunk(**d) for d in json.loads(json_str)]
+    data = json.loads(json_str)
+    chunk_size = data['chunk_size']
+    chunks = [FileChunk(**d) for d in data['chunks']]
+    return chunks, chunk_size

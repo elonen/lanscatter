@@ -1,6 +1,5 @@
 from typing import Callable
-from datetime import datetime, timedelta
-import random, aiohttp
+import random, aiohttp, time
 
 class CachedHttpObject(object):
     '''
@@ -14,14 +13,13 @@ class CachedHttpObject(object):
         self._cache_time = cache_time
         self._cache_jitter = min(cache_jitter, cache_time/3)
         self._status_func = status_func
-        self._cache_expires = datetime.utcnow()
+        self._cache_expires = time.time()-1
         self._etag = ''
 
     def ingest_data(self, data, etag):
         self.data = data
         self._etag = etag
-        self._cache_expires = datetime.utcnow() + timedelta(
-            seconds=self._cache_time + self._cache_jitter * random.uniform(-1, 1))
+        self._cache_expires = time.time() + (self._cache_time + self._cache_jitter * random.uniform(-1, 1))
 
     async def refresh(self, http_session, force_expire: bool = False):
         '''
@@ -32,8 +30,8 @@ class CachedHttpObject(object):
         :return: True if got new data, false if cache stays
         '''
         if force_expire:
-            self._cache_expires = datetime.utcnow()
-        if datetime.utcnow() >= self._cache_expires:
+            self._cache_expires = time.time()-1
+        if time.time() >= self._cache_expires:
             headers = {'If-None-Match': self._etag}
             try:
                 async with http_session.get(self._url, headers=headers) as resp:
