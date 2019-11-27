@@ -1,67 +1,18 @@
-from typing import List, Callable
-from filechunks import FileChunk, hash_dir, monitor_folder_forever, chunks_to_json, json_to_chunks
-from datetime import datetime, timedelta
+from typing import Callable
+from filechunks import FileChunk, hash_dir, chunks_to_json, json_to_chunks
+from datetime import timedelta
 import asyncio, aiohttp, aiofiles, aiofiles.os
-import sys, os, hashlib, random, traceback, io, time, argparse
+import os, hashlib, random, traceback, io, time, argparse
 from pathlib import Path
 from fileserver import FileServer
 from contextlib import suppress
 from common import *
-from ratelimiter import RateLimiter
+
+from util.ratelimiter import RateLimiter
+from util.cachedhttp import CachedHttpObject
 
 # Client that keeps given directory synced with a master server,
-# and laos serves downloaded chunks to peers for network load distribution.
-
-class CachedHttpObject(object):
-    '''
-    Cached container for (JSON) object from a remote HTTP(s) server.
-    '''
-
-    def __init__(self, url: str, status_func: Callable, name: str, cache_time: float = 50, cache_jitter: float = 10):
-        self.data = {}
-        self._data_name = name
-        self._url = url
-        self._cache_time = cache_time
-        self._cache_jitter = min(cache_jitter, cache_time/3)
-        self._status_func = status_func
-        self._cache_expires = datetime.utcnow()
-        self._etag = ''
-
-    def ingest_data(self, data, etag):
-        self.data = data
-        self._etag = etag
-        self._cache_expires = datetime.utcnow() + timedelta(
-            seconds=self._cache_time + self._cache_jitter * random.uniform(-1, 1))
-
-    async def refresh(self, http_session, force_expire: bool = False):
-        '''
-        Query object from URL or return a cached one if possible.
-
-        :param http_session: aiohttp session to use for HTTP requests
-        :return: True if got new data, false if cache stays
-        '''
-        if force_expire:
-            self._cache_expires = datetime.utcnow()
-        if datetime.utcnow() >= self._cache_expires:
-            headers = {'If-None-Match': self._etag}
-            try:
-                async with http_session.get(self._url, headers=headers) as resp:
-                    if resp.status == 200:  # HTTP OK
-                        try:
-                            self.ingest_data(data=await resp.json(), etag=(resp.headers.get('ETag') or ''))
-                            self._status_func(log_info=f'Got new {self._data_name} from server ({self._url}).')
-                            return True
-                        except Exception as e:
-                            self._status_func(log_error=f'Error parsing GET {url}: {str(e)}')
-                    elif resp.status == 304:  # etag match
-                        self.ingest_data(self.data, self._etag)  # Touch cache time
-                    else:
-                        self._status_func(log_error=f'HTTP error GET {resp.status} on {self._url}: {await resp.text()}')
-            except aiohttp.client_exceptions.ClientConnectorError as e:
-                self._status_func(log_error=f'WARNING: failed refresh {self._data_name} from server: {str(e)}.')
-            return False
-
-
+# and then serves downloaded chunks to peers for network load distribution.
 
 class FileClient(object):
     '''
