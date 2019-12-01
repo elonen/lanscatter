@@ -16,17 +16,17 @@ from util.cachedhttp import CachedHttpObject
 
 class FileClient(object):
     '''
-    Process that scans sync directory, hashes it, and keeps it synced with a "manifest" (file list) master server.
+    Process that scans sync directory, hashes it, and keeps it synced with a file list from master server.
     '''
     def __init__(self,
-                 basedir: str,                          # Sync directory path
-                 server_url: str,                       # URL of master server
-                 status_func: Callable,                 # Callback for status reporting
-                 port: int,                             # TCP port for listening to peers
-                 manifest_cache_time: float,            # How often to recheck server for file changes
-                 peer_list_cache_time: float,           # How often to recheck server for new peer URL list
-                 file_rescan_interval: float,           # How often to rescan sync directory (seconds)
-                 dl_limit: float,                       # Download limit, Mbits/s
+                 basedir: str,  # Sync directory path
+                 server_url: str,  # URL of master server
+                 status_func: Callable,  # Callback for status reporting
+                 port: int,  # TCP port for listening to peers
+                 filelist_cache_time: float,  # How often to recheck server for file changes
+                 peer_list_cache_time: float,  # How often to recheck server for new peer URL list
+                 file_rescan_interval: float,  # How often to rescan sync directory (seconds)
+                 dl_limit: float,  # Download limit, Mbits/s
                  ul_limit: float):                      # Upload limit, Mbits/s
 
         self._basedir: str = basedir
@@ -41,7 +41,7 @@ class FileClient(object):
         self._status_func = status_func
 
         self._local_chunks = []                     # Hashed file parts that exist here, locally
-        self._remote_chunks = []                    # Hashed file parts that exist on server (copy of "manifest")
+        self._remote_chunks = []                    # Hashed file parts that exist on server (copy of filelist)
 
         self._chunk_size = None                      # Read from server
 
@@ -50,8 +50,8 @@ class FileClient(object):
         # Cached HTTP data from server
         self._peers = CachedHttpObject(             # Map of hash -> URL (p2p data sources)
                 url=server_url+'/peers', status_func=status_func, name='peer list', cache_time=peer_list_cache_time)
-        self._manifest = CachedHttpObject(          # _remote_chunks as plain JSON table
-                url=server_url+'/manifest', status_func=status_func, name='manifest', cache_time=manifest_cache_time)
+        self._filelist = CachedHttpObject(          # _remote_chunks as plain JSON table
+                url=server_url+'/filelist', status_func=status_func, name='filelist', cache_time=filelist_cache_time)
 
 
     async def _report_new_local_chunks_to_server(self, http_session):
@@ -145,12 +145,12 @@ class FileClient(object):
         if not self._chunk_size:
             self._status_func(
                 log_info=f'Chunk size not known yet. Cannot sync_folder().',
-                cur_status='Waiting for manifest...')
+                cur_status='Waiting for filelist...')
             return
         if not self._remote_chunks:
             self._status_func(
-                log_info=f'NOTE: no remote manifest - skipping sync for now.',
-                cur_status='Waiting for manifest...')
+                log_info=f'NOTE: no remote filelist - skipping sync for now.',
+                cur_status='Waiting for filelist...')
             return
 
         # Scan/hash local sync dir
@@ -282,9 +282,9 @@ class FileClient(object):
 
             async with aiohttp.ClientSession() as http_session:
                 while True:
-                    # Get new manifest?
-                    if await self._manifest.refresh(http_session):
-                        self._remote_chunks, self._chunk_size = json_to_chunks(json.dumps(self._manifest.data))
+                    # Get new filelist?
+                    if await self._filelist.refresh(http_session):
+                        self._remote_chunks, self._chunk_size = json_to_chunks(json.dumps(self._filelist.data))
                         self._next_folder_rescan = datetime.utcnow()
                         self._peers_expires = datetime.utcnow()
 
@@ -298,7 +298,7 @@ class FileClient(object):
         # Serve chunks to peers over HTTP
         async def peer_server():
             self._peer_server = FileServer(self._basedir, status_func=self._status_func)
-            await self._peer_server.run_server(port=self._port, serve_manifest=False, ul_limit=self._ul_limit)
+            await self._peer_server.run_server(port=self._port, serve_filelist=False, ul_limit=self._ul_limit)
 
         # Run all
         try:
@@ -314,7 +314,7 @@ async def run_file_client(base_dir: str, server_url: str, port: int, status_func
                           dl_limit: float = 10000, ul_limit: float = 10000):
     client = FileClient(
         basedir=base_dir, server_url=server_url, status_func=status_func, port=port,
-        manifest_cache_time=cache_interval, peer_list_cache_time=cache_interval, file_rescan_interval=rescan_interval,
+        filelist_cache_time=cache_interval, peer_list_cache_time=cache_interval, file_rescan_interval=rescan_interval,
         dl_limit=dl_limit, ul_limit=ul_limit)
     return await client.run_syncer()
 

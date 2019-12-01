@@ -15,14 +15,14 @@ class FileServer(object):
     _chunks: List[FileChunk]
     _hash_to_chunk: Dict[str, FileChunk]
     _basedir: str
-    _manifest: str
+    _filelist: str
 
     def __init__(self, basedir: str, status_func: Callable, chunk_size: int = -1, http_cache_time: int = 60*5):
         self._chunks = []           # List fo all FileChunks
         self._hash_to_chunk = {}    # Map hash -> FileChunk
         self._basedir = basedir     # Directory to serve/monitor files from
         self._base_url = ''         # URL to access this server
-        self._manifest_etag = ''    # MD5 sum of manifest
+        self._filelist_etag = ''    # MD5 sum of file/chunk list
         self._http_cache_time = http_cache_time
         self._peers_map = {}
         self._peers_etag = ''
@@ -50,8 +50,8 @@ class FileServer(object):
         self._chunks = chunks
         self._hash_to_chunk = {c.hash: c for c in chunks}
 
-        manifest = chunks_to_json(self._chunks, self._chunk_size)
-        self._manifest_etag = hashlib.md5(manifest.encode('utf-8')).hexdigest()
+        filelist = chunks_to_json(self._chunks, self._chunk_size)
+        self._filelist_etag = hashlib.md5(filelist.encode('utf-8')).hexdigest()
 
         # Make sure server's URL is in peer list for all local hashes
         if self._base_url:
@@ -63,11 +63,11 @@ class FileServer(object):
                     self._peers_map[c.hash].append(url)
 
 
-    def run_server(self, serve_manifest=True, port=14433, https_cert=None, https_key=None, ul_limit: float = 10000):
+    def run_server(self, serve_filelist=True, port=14433, https_cert=None, https_key=None, ul_limit: float = 10000):
         '''
         Create HTTP(S) server loop.
 
-        :param serve_manifest: Should this server serve /manifest and /peers, or only chunk data?
+        :param serve_filelist: Should this server serve /filelist and /peers, or only chunk data?
             True for master server, False for peer2peer servers.
         :param port: TCP port to listen at.
         :param https_cert: PEM filename or None
@@ -81,8 +81,7 @@ class FileServer(object):
         ip_addr = socket.gethostbyname(hostname)
         self._base_url = ('https://' if (https_cert and https_key) else 'http://') + ip_addr + ':' + str(port)
 
-        srv_type = 'master' if serve_manifest else 'p2p'
-        self._status_func(log_info=f'Starting {srv_type} file server on {self._base_url}.')
+        self._status_func(log_info=f'Starting {"master" if serve_filelist else "p2p"} file server on {self._base_url}.')
 
         ul_limiter = RateLimiter(ul_limit*1024*1024/8, 1.0, burst_factor=2.0)
 
@@ -127,7 +126,7 @@ class FileServer(object):
                                 return web.Response(status=500, text=f'500 INTERNAL ERROR. Filesize mismatch.')
                             remaining -= cnt
 
-                            # Upload (in several blocks if limiter hits)
+                            # Throttle response bandwidth
                             i = 0
                             while cnt > 0:
                                 limited_n = int(await ul_limiter.acquire(cnt, 4096))
@@ -139,15 +138,15 @@ class FileServer(object):
                     return response
 
 
-        # HTTP HANDLER - Return manifest (hash list) to a client
-        async def handle_get_manifest(request):
+        # HTTP HANDLER - Return filelist (hash list) to a client
+        async def handle_get_filelist(request):
             self._status_func(log_info=f"[{request.remote}] GET {request.path_qs}")
-            if self._manifest_etag and request.headers.get('If-None-Match') == self._manifest_etag:
+            if self._filelist_etag and request.headers.get('If-None-Match') == self._filelist_etag:
                 return web.HTTPNotModified()
             return web.Response(
                 status=200, body=chunks_to_json(self._chunks, self._chunk_size),
                 content_type='application/json',
-                headers={'ETag': self._manifest_etag, 'Cache-Control': f'public, max-age: {self._http_cache_time}'})
+                headers={'ETag': self._filelist_etag, 'Cache-Control': f'public, max-age: {self._http_cache_time}'})
 
 
         # HTTP HANDLER - Return a list of URLs that hashes can be downloaded from
@@ -207,9 +206,9 @@ class FileServer(object):
         # Create aiohttp web app
         app = web.Application()
         app.add_routes([web.get('/chunk/{hash}', handle_get_chunk)])
-        if serve_manifest:
+        if serve_filelist:
             app.add_routes([
-                    web.get('/manifest', handle_get_manifest),
+                    web.get('/filelist', handle_get_filelist),
                     web.get('/peers', handle_get_peers),
                     web.post('/peers', update_peer_urls),
                 ])
@@ -246,7 +245,7 @@ async def run_master_server(base_dir: str, port: int,
     server = FileServer(base_dir, chunk_size=chunk_size, status_func=status_func)
     await asyncio.gather(
         dir_scanner(),
-        server.run_server(serve_manifest=True, port=port, ul_limit=ul_limit, https_cert=https_cert, https_key=https_key))
+        server.run_server(serve_filelist=True, port=port, ul_limit=ul_limit, https_cert=https_cert, https_key=https_key))
 
 
 def main():
