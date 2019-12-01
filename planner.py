@@ -1,4 +1,4 @@
-from typing import Iterable, MutableSequence, Optional, Dict, List
+from typing import Iterable, MutableSequence, Optional, Dict, List, Set
 from types import SimpleNamespace
 import asyncio, random, time
 from contextlib import suppress
@@ -58,12 +58,24 @@ class ChunkDistributionPlanner(object):
         self.chunk_popularity = {c: 0 for c in chunks}  # Approximately: how many copies of chunks there are in swarm
         self.all_done = False  # optimization, turns True when everyone's gat everything
 
-    def on_node_join(self, node_id, chunks: Iterable, concurrent_dls: int, concurrent_uls: int) -> None:
-        """Node joins the swarm"""
+        self._next_node_id: int = 0
+        self._master_nodes: Set[int] = set()
+
+    def on_node_join(self, chunks: Iterable, concurrent_dls: int, concurrent_uls: int, master_node=False) -> int:
+        """
+        Node joins the swarm.
+        :param: master_node  If true, clients will never be instructed to timeout downloads from this node
+        :return: ID for the newly joined node
+        """ 
+        node_id = self._next_node_id
+        self._next_node_id += 1
         self.nodes[node_id] = Node(node_id=node_id, chunks=set(chunks),
                                    concurrent_dls=concurrent_dls, concurrent_uls=concurrent_uls)
         self.all_done = False
         self.on_node_got_chunks(node_id, chunks)
+        if master_node:
+            self._master_nodes.add(node_id)
+        return node_id
 
     def on_node_leave(self, node_id: int) -> None:
         """Node leaves the swarm"""
@@ -77,7 +89,7 @@ class ChunkDistributionPlanner(object):
     def on_node_got_chunks(self, node_id: int, new_chunks: Iterable) -> None:
         """# Node reports new chunks it has"""
         node = self.nodes.get(node_id)
-        if node:
+        if node is not None:
             node.chunks.update(new_chunks)
             for c in new_chunks:
                 self.chunk_popularity[c] += 1
@@ -93,7 +105,7 @@ class ChunkDistributionPlanner(object):
         :param last_ul_time: How long latest upload from node took, in seconds. Used for avoiding slow nodes.
         """
         node = self.nodes.get(node_id)
-        if node:
+        if node is not None:
             node.downloads = [t for t in transfers if t.to_node == node_id]
             node.uploads = [t for t in transfers if t.from_node == node_id]
             if last_ul_time:
@@ -122,7 +134,7 @@ class ChunkDistributionPlanner(object):
         median_time = statistics.median(ul_times) if ul_times else 1
 
         # Avoid slow peers but not completely (proportional to their speed)
-        free_uploaders = (n for n in free_uploaders if n.node_id == 0 or
+        free_uploaders = (n for n in free_uploaders if n.node_id in self._master_nodes or
                           not n.avg_ul_time or random.random() < (median_time/n.avg_ul_time))
 
         # Match uploaders and downloaders to transfer rarest chunks first:
@@ -135,7 +147,7 @@ class ChunkDistributionPlanner(object):
                         if new_chunks:
                             # Pick the rarest chunk first for best distribution
                             chunk = min(new_chunks, key=lambda c: self.chunk_popularity[c])
-                            timeout = median_time*4 if (ul.node_id != 0) else 9999999  # wait forever for server
+                            timeout = median_time*4 if (ul.node_id not in self._master_nodes) else 9999999
                             t = Transfer(from_node=ul.node_id, to_node=dl.node_id, chunk=chunk, timeout=timeout)
                             proposed_transfers.append(t)
                             # To prevent overbooking and to help picking different chunks, assume transfer will succeed
@@ -174,27 +186,25 @@ def simulate() -> None:
     SLOWDOWN_PROBABILITY = 1/8  # every N't node will be very slow uploader
     SLOWDOWN_FACTOR = 100  # transfer time multiplier for "very slow" nodes
 
-    # Create test chunks
     test_chunks = tuple(range(N_CHUNKS))
     planner = ChunkDistributionPlanner(test_chunks)
-    planner.on_node_join(0, test_chunks, 0, SEEDER_UL_SLOTS)  # initial seed node
 
     plan_now = asyncio.Event()  # asyncio event to wake planner
     joins_left = N_NODES
     ext_nodes: Dict[int, SimpleNamespace] = {}
 
+    # Create seeder node
+    seeder_id = planner.on_node_join(test_chunks, 0, SEEDER_UL_SLOTS, master_node=True)  # initial seed node
+    ext_nodes[seeder_id] = SimpleNamespace(id=seeder_id, chunks=set(test_chunks), tfers=set(), speed_fact=1)
+
     def add_node():
         nonlocal ext_nodes, joins_left
         joins_left -= 1
-        i = 0 if not ext_nodes else max(ext_nodes.keys())+1
-        speed_fact = SLOWDOWN_FACTOR if (random.random() < SLOWDOWN_PROBABILITY) else random.uniform(1, SPEED_VARIABILITY_PER_NODE)
-        speed_fact = 1 if i == 0 else speed_fact
+        speed_fact = SLOWDOWN_FACTOR if (random.random() < SLOWDOWN_PROBABILITY) else \
+            random.uniform(1, SPEED_VARIABILITY_PER_NODE)
         assert (speed_fact >= 1)
-        ext_nodes[i] = SimpleNamespace(id=i, chunks=(set() if i else set(test_chunks)), tfers=set(), speed_fact=speed_fact)
-        if i:
-            planner.on_node_join(i, ext_nodes[i].chunks, NODE_UL_SLOT, NODE_UL_SLOT)
-        else:
-            planner.on_node_join(0, ext_nodes[0].chunks, 0, SEEDER_UL_SLOTS)  # Special values for master node
+        i = planner.on_node_join((), NODE_UL_SLOT, NODE_UL_SLOT)
+        ext_nodes[i] = SimpleNamespace(id=i, chunks=set(), tfers=set(), speed_fact=speed_fact)
 
     for _ in range(int(N_NODES/2)):
         add_node()
