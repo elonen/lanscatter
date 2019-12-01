@@ -97,3 +97,24 @@ class RateLimiter(object):
         """
         self.report_total_consumed = 0
         self.report_start_time = time.time()
+
+
+# --------------------------------------------
+
+def main():
+    async def test():
+        print("Printing 0-9, two times in a second")
+        limiter = RateLimiter(2.0)
+        cnt = 0
+        while cnt < 10:
+            await limiter.acquire(1)
+            print(cnt)
+            cnt += 1
+            if cnt == 4:
+                print("Short pause to test accumulation...")
+                await asyncio.sleep(6)
+    asyncio.run(test())
+
+
+if __name__ == "__main__":
+    main()
