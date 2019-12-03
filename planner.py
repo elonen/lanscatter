@@ -23,6 +23,7 @@ efficiency compared to ideal, error-free
 multicast to all nodes.
 """
 
+
 class Transfer(object):
     def __init__(self, to_node: int, from_node: int, chunk, timeout: float):
         self.from_node = from_node
@@ -34,20 +35,29 @@ class Transfer(object):
     def __eq__(self, b):
         return self.chunk == b.chunk and self.from_node == b.from_node and self.to_node == b.to_node
 
+
 class Node(object):
     def __init__(self, node_id: int, chunks: Iterable, concurrent_dls: int, concurrent_uls: int):
         self.node_id = node_id
         self.chunks: set = set(chunks)
         self.max_concurrent_dls: int = concurrent_dls
         self.max_concurrent_uls: int = concurrent_uls
-        self.downloads: MutableSequence[Transfer] = []
-        self.uploads: MutableSequence[Transfer] = []
+
+        self.active_downloads: int = 0
+        self.active_uploads: int = 0
+        self.incoming_chunks: set = set()
+
         self.avg_ul_time = None
     def __hash__(self):
         return hash(self.node_id)
     def __eq__(self, b):
         return self.node_id == b.chunk
 
+
+class NoSuchNodeException(LookupError):
+    def __init__(self, node_id):
+        super(LookupError, self).__init__(f"unknown node {node_id}")
+        self.node_id = node_id
 
 
 class ChunkDistributionPlanner(object):
@@ -66,7 +76,7 @@ class ChunkDistributionPlanner(object):
         Node joins the swarm.
         :param: master_node  If true, clients will never be instructed to timeout downloads from this node
         :return: ID for the newly joined node
-        """ 
+        """
         node_id = self._next_node_id
         self._next_node_id += 1
         self.nodes[node_id] = Node(node_id=node_id, chunks=set(chunks),
@@ -79,42 +89,57 @@ class ChunkDistributionPlanner(object):
 
     def on_node_leave(self, node_id: int) -> None:
         """Node leaves the swarm"""
-        if node_id in self.nodes:
-            del self.nodes[node_id]
-        # Cleanup stale transfers from removed node
-        for ni in self.nodes.keys():
-            n = self.nodes[ni]
-            n.downloads = [d for d in n.downloads if d.from_node != node_id]
+        if node_id not in self.nodes:
+            raise NoSuchNodeException(node_id)
+        del self.nodes[node_id]
 
-    def on_node_got_chunks(self, node_id: int, new_chunks: Iterable) -> None:
+    def on_node_got_chunks(self, node_id: int, new_chunks: Iterable, clear_first=False) -> None:
         """# Node reports new chunks it has"""
-        node = self.nodes.get(node_id)
-        if node is not None:
-            node.chunks.update(new_chunks)
-            for c in new_chunks:
-                self.chunk_popularity[c] += 1
-            # Sanity check
-            if node.chunks - self.all_chunks:
-                raise UserWarning(f'Bug? Node {node_id} has unknown chunks.')
-            # If current node's got all chunks, check if others have too
-            if len(node.chunks) == len(self.all_chunks):
-                self.all_done = all(len(n.chunks) == len(self.all_chunks) for n in self.nodes.values())
+        if node_id not in self.nodes:
+            raise NoSuchNodeException(node_id)
+        node = self.nodes[node_id]
+        if clear_first:
+            node.chunks.clear()
+        node.chunks.update(new_chunks)
+        for c in new_chunks:
+            self.chunk_popularity[c] += 1
+        # Sanity check
+        if node.chunks - self.all_chunks:
+            raise UserWarning(f'Bug? Node {node_id} has unknown chunks.')
+        # If current node's got all chunks, check if others have too
+        if len(node.chunks) == len(self.all_chunks):
+            self.all_done = all(len(n.chunks) == len(self.all_chunks) for n in self.nodes.values())
 
-    def on_node_report_transfers(self, node_id: int, transfers: Iterable[Transfer], last_ul_time=None) -> None:
+    def on_report_active_transfers(self, node_id: int, incoming_chunks: Iterable,
+                                   n_downloads: int, n_uploads: int) -> None:
         """Node reports its currently ongoing transfers
-        :param last_ul_time: How long latest upload from node took, in seconds. Used for avoiding slow nodes.
+        :param node_id: ID of node reporting node
+        :param incoming_chunks: List of chunks the node is currently downloading
+        :param n_downloads: Number of currently active downloads
+        :param n_uploads: Number of currently active uploads
         """
-        node = self.nodes.get(node_id)
-        if node is not None:
-            node.downloads = [t for t in transfers if t.to_node == node_id]
-            node.uploads = [t for t in transfers if t.from_node == node_id]
-            if last_ul_time:
-                node.avg_ul_time = (node.avg_ul_time or last_ul_time) * 0.8 + last_ul_time * 0.2
-            if any(t.to_node != node_id and t.from_node != node_id for t in transfers):
-                raise UserWarning(f"Bug? Node {node_id} reported transfers it's not part of.")
+        if node_id not in self.nodes:
+            raise NoSuchNodeException(node_id)
+        node = self.nodes[node_id]
+        node.incoming_chunks = set(incoming_chunks)
+        node.active_downloads, node.active_uploads = n_downloads, n_uploads
+
+    def on_report_upload_speed(self, node_id: int, last_ul_time) -> None:
+        """Update upload speed average for smart scheduling.
+        :param node_id: ID of node reporting node
+        :param last_ul_time: Duration of latest upload from this node
+        """
+        # update Exponential Moving Average (EMA) of upload time
+        if node_id not in self.nodes:
+            raise NoSuchNodeException(node_id)
+        node = self.nodes[node_id]
+        node.avg_ul_time = (node.avg_ul_time or last_ul_time) * 0.8 + last_ul_time * 0.2
+
 
     def avg_ul_time(self, node_id: int) -> Optional[float]:
         """Return average upload time of given node"""
+        if node_id not in self.nodes:
+            raise NoSuchNodeException(node_id)
         return self.nodes[node_id].avg_ul_time
 
     def plan(self) -> Iterable[Transfer]:
@@ -123,9 +148,10 @@ class ChunkDistributionPlanner(object):
         :return: List of Transfers to initiate
         """
         # Consider nodes with least chunks first for both DL and UL, for optimal speed and network load distribution
-        free_downloaders = sorted((n for n in self.nodes.values() if len(n.downloads) < n.max_concurrent_dls),
-                                  key=lambda n: len(n.chunks))
-        free_uploaders = sorted((n for n in self.nodes.values() if len(n.uploads) < n.max_concurrent_uls),
+        free_downloaders = sorted((n for n in self.nodes.values() if n.active_downloads < n.max_concurrent_dls and
+                                   len(n.chunks) < len(self.all_chunks)),
+                           key=lambda n: len(n.chunks))
+        free_uploaders = sorted((n for n in self.nodes.values() if n.active_uploads < n.max_concurrent_uls),
                                 key=lambda n: len(n.chunks) * (n.avg_ul_time or 999))  # favor fast uploaders
         if not free_uploaders or not free_downloaders: return ()
 
@@ -140,10 +166,10 @@ class ChunkDistributionPlanner(object):
         # Match uploaders and downloaders to transfer rarest chunks first:
         proposed_transfers = []
         for ul in free_uploaders:
-            for _ in range(ul.max_concurrent_uls - len(ul.uploads)):
+            for _ in range(ul.max_concurrent_uls - ul.active_uploads):
                 for dl in free_downloaders:
-                    if len(dl.downloads) < dl.max_concurrent_dls:  # need to recheck every iteration
-                        new_chunks = ul.chunks - dl.chunks - set(t.chunk for t in dl.downloads)
+                    if dl.active_downloads < dl.max_concurrent_dls:  # need to recheck every iteration
+                        new_chunks = ul.chunks - dl.chunks - dl.incoming_chunks
                         if new_chunks:
                             # Pick the rarest chunk first for best distribution
                             chunk = min(new_chunks, key=lambda c: self.chunk_popularity[c])
@@ -152,8 +178,12 @@ class ChunkDistributionPlanner(object):
                             proposed_transfers.append(t)
                             # To prevent overbooking and to help picking different chunks, assume transfer will succeed
                             self.chunk_popularity[chunk] += 1
-                            dl.downloads.append(t)  # Replaced later by on_node_report_transfers(), but
-                            ul.uploads.append(t)  # setting it optimistically helps in planning.
+                            # These are replaced later by client's own report of actual transfers
+                            # (on_node_report_transfers()) but we'll assume the transfers start ok (to aid planning):
+                            assert(chunk not in dl.incoming_chunks)
+                            dl.incoming_chunks.add(chunk)
+                            dl.active_downloads += 1
+                            ul.active_uploads += 1
                             break
 
         assert (all(t.to_node != t.from_node for t in proposed_transfers))
@@ -209,6 +239,11 @@ def simulate() -> None:
     for _ in range(int(N_NODES/2)):
         add_node()
 
+    def report_transfers(node):
+        dls = [t for t in node.tfers if t.to_node == node.id]
+        uls = [t for t in node.tfers if t.from_node == node.id]
+        planner.on_report_active_transfers(node.id, (t.chunk for t in dls), len(dls), len(uls))
+
     async def simulate_transfer(t: Transfer):
         from_n, to_n = ext_nodes.get(t.from_node), ext_nodes.get(t.to_node)
         if not from_n or not to_n: return  # node left swarm
@@ -218,7 +253,7 @@ def simulate() -> None:
             # Mark transfer as ongoing
             for n in (to_n, from_n):
                 n.tfers.add(t)
-                planner.on_node_report_transfers(n.id, n.tfers)
+                report_transfers(n)
             # Wait = simulate transfer
             if rnd_time < t.timeout_secs:
                 await asyncio.sleep(rnd_time)
@@ -230,12 +265,18 @@ def simulate() -> None:
             # Mark chunk as received
             to_n.chunks.add(t.chunk)
             planner.on_node_got_chunks(to_n.id, (t.chunk,))
+        except NoSuchNodeException as e:
+            print(f'Transfer aborted - node "{e.node_id}" has left swarm.')
         finally:
+            with suppress(NoSuchNodeException):
+                if rnd_time is not None:
+                    planner.on_report_upload_speed(from_n.id, rnd_time)
             # Cleanup
             for n in (to_n, from_n):
                 with suppress(KeyError):
                     n.tfers.remove(t)
-                planner.on_node_report_transfers(n.id, n.tfers, last_ul_time=(rnd_time if n == from_n else None))
+                with suppress(NoSuchNodeException):
+                    report_transfers(n)
                 plan_now.set()
 
     async def planner_loop():
