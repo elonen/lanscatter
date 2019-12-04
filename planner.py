@@ -3,12 +3,13 @@ from types import SimpleNamespace
 import asyncio, random, time
 from contextlib import suppress
 import statistics
+from abc import ABC, abstractmethod
 
 """
 HIGH LEVEL DISTRIBUTION STRATEGY PLANNER
 
-This takes chunk and node (peer) IDs and
-calculates efficient transfer plans to
+This keeps track of which nodes have which chunks
+and  calculates efficient transfer plans to
 minimize total transfer speed, maximize
 network load distribution and resilience
 against errors and slowdowns.
@@ -23,144 +24,129 @@ efficiency compared to ideal, error-free
 multicast to all nodes.
 """
 
+# Abstract base class for a p2p swarm node, used by the coordinator
+class Node(ABC):
+    chunks: set                     # Set of chunks the node has
+    max_concurrent_dls: int         # How many concurrent downloads the node allows
+    max_concurrent_uls: int         # --||-- uploads --||--
+    active_downloads: int           # Number of currently actually ongoing downloads
+    active_uploads: int             # --||-- uploads --||--
+    incoming_chunks: set            # Which chunks the node is currently downloading
+    avg_ul_time: Optional[float]    # (Rolling) average time it has taken for the node upload one chunk
+    impl_data = None                # Reserved for implementing classes
 
-class Transfer(object):
-    def __init__(self, to_node: int, from_node: int, chunk, timeout: float):
-        self.from_node = from_node
-        self.to_node = to_node
-        self.chunk = chunk
-        self.timeout_secs = timeout
-    def __hash__(self):
-        return hash(str(self.chunk) + str(self.from_node) + str(self.to_node))
-    def __eq__(self, b):
-        return self.chunk == b.chunk and self.from_node == b.from_node and self.to_node == b.to_node
+    @abstractmethod
+    def destroy(self) -> None:
+        """Remove node from the swarm"""
+        pass
 
-
-class Node(object):
-    def __init__(self, node_id: int, chunks: Iterable, concurrent_dls: int, concurrent_uls: int):
-        self.node_id = node_id
-        self.chunks: set = set(chunks)
-        self.max_concurrent_dls: int = concurrent_dls
-        self.max_concurrent_uls: int = concurrent_uls
-
-        self.active_downloads: int = 0
-        self.active_uploads: int = 0
-        self.incoming_chunks: set = set()
-
-        self.avg_ul_time = None
-    def __hash__(self):
-        return hash(self.node_id)
-    def __eq__(self, b):
-        return self.node_id == b.chunk
-
-
-class NoSuchNodeException(LookupError):
-    def __init__(self, node_id):
-        super(LookupError, self).__init__(f"unknown node {node_id}")
-        self.node_id = node_id
-
-
-class ChunkDistributionPlanner(object):
-
-    def __init__(self, chunks: Iterable):
-        self.all_chunks = frozenset(chunks)
-        self.nodes: Dict[int, Node] = {}
-        self.chunk_popularity = {c: 0 for c in chunks}  # Approximately: how many copies of chunks there are in swarm
-        self.all_done = False  # optimization, turns True when everyone's gat everything
-
-        self._next_node_id: int = 0
-        self._master_nodes: Set[int] = set()
-
-    def on_node_join(self, chunks: Iterable, concurrent_dls: int, concurrent_uls: int, master_node=False) -> int:
+    @abstractmethod
+    def add_chunks(self, new_chunks: Iterable, clear_first=False) -> None:
         """
-        Node joins the swarm.
-        :param: master_node  If true, clients will never be instructed to timeout downloads from this node
-        :return: ID for the newly joined node
+        Mark node as having given (new) chunks
+        :param new_chunks: Chunks to add
+        :param clear_first: If False, add given chunks to old ones, otherwise clear old and then add.
         """
-        node_id = self._next_node_id
-        self._next_node_id += 1
-        self.nodes[node_id] = Node(node_id=node_id, chunks=set(chunks),
-                                   concurrent_dls=concurrent_dls, concurrent_uls=concurrent_uls)
-        self.all_done = False
-        self.on_node_got_chunks(node_id, chunks)
-        if master_node:
-            self._master_nodes.add(node_id)
-        return node_id
-
-    def on_node_leave(self, node_id: int) -> None:
-        """Node leaves the swarm"""
-        if node_id not in self.nodes:
-            raise NoSuchNodeException(node_id)
-        del self.nodes[node_id]
-
-    def on_node_got_chunks(self, node_id: int, new_chunks: Iterable, clear_first=False) -> None:
-        """# Node reports new chunks it has"""
-        if node_id not in self.nodes:
-            raise NoSuchNodeException(node_id)
-        node = self.nodes[node_id]
         if clear_first:
-            node.chunks.clear()
-        node.chunks.update(new_chunks)
-        for c in new_chunks:
-            self.chunk_popularity[c] += 1
-        # Sanity check
-        if node.chunks - self.all_chunks:
-            raise UserWarning(f'Bug? Node {node_id} has unknown chunks.')
-        # If current node's got all chunks, check if others have too
-        if len(node.chunks) == len(self.all_chunks):
-            self.all_done = all(len(n.chunks) == len(self.all_chunks) for n in self.nodes.values())
+            self.chunks.clear()
+        self.chunks.update(new_chunks)
 
-    def on_report_active_transfers(self, node_id: int, incoming_chunks: Iterable,
-                                   n_downloads: int, n_uploads: int) -> None:
-        """Node reports its currently ongoing transfers
-        :param node_id: ID of node reporting node
+    def set_active_transfers(self, incoming_chunks: Iterable, n_downloads: int, n_uploads: int) -> None:
+        """Set currently ongoing transfers on the node
         :param incoming_chunks: List of chunks the node is currently downloading
         :param n_downloads: Number of currently active downloads
         :param n_uploads: Number of currently active uploads
         """
-        if node_id not in self.nodes:
-            raise NoSuchNodeException(node_id)
-        node = self.nodes[node_id]
-        node.incoming_chunks = set(incoming_chunks)
-        node.active_downloads, node.active_uploads = n_downloads, n_uploads
+        self.incoming_chunks = set(incoming_chunks)
+        self.active_downloads, self.active_uploads = n_downloads, n_uploads
 
-    def on_report_upload_speed(self, node_id: int, last_ul_time) -> None:
+    def update_transfer_speed(self, last_ul_time: float) -> None:
         """Update upload speed average for smart scheduling.
-        :param node_id: ID of node reporting node
         :param last_ul_time: Duration of latest upload from this node
         """
         # update Exponential Moving Average (EMA) of upload time
-        if node_id not in self.nodes:
-            raise NoSuchNodeException(node_id)
-        node = self.nodes[node_id]
-        node.avg_ul_time = (node.avg_ul_time or last_ul_time) * 0.8 + last_ul_time * 0.2
+        self.avg_ul_time = (self.avg_ul_time or last_ul_time) * 0.8 + last_ul_time * 0.2
 
 
-    def avg_ul_time(self, node_id: int) -> Optional[float]:
-        """Return average upload time of given node"""
-        if node_id not in self.nodes:
-            raise NoSuchNodeException(node_id)
-        return self.nodes[node_id].avg_ul_time
+class Transfer(object):
+    def __init__(self, to_node: Node, from_node: Node, chunk, timeout: float):
+        self.from_node = from_node
+        self.to_node = to_node
+        self.chunk = chunk
+        self.timeout_secs = timeout
 
-    def plan(self) -> Iterable[Transfer]:
+
+class SwarmCoordinator(object):
+
+    def __init__(self, chunks: Iterable):
+        self.all_chunks = frozenset(chunks)
+        self.nodes = []
+        self.chunk_popularity = {c: 0 for c in chunks}  # Approximately: how many copies of chunks there are in swarm
+        self.all_done = False  # optimization, turns True when everyone's gat everything
+        self._master_nodes: Set[Node] = set()
+
+    def node_join(self, chunks: Iterable, concurrent_dls: int, concurrent_uls: int, master_node=False) -> Node:
+        """
+        Node joins the swarm.
+        :param: master_node  If true, clients will never be instructed to timeout downloads from this node
+        :return: Newly joined node
+        """
+        swarm = self
+
+        class _NodeImpl(Node):
+
+            def __init__(self):
+                self.chunks = set()
+                self.max_concurrent_dls = concurrent_dls
+                self.max_concurrent_uls = concurrent_uls
+                self.active_downloads = 0
+                self.active_uploads = 0
+                self.incoming_chunks = set()
+                self.avg_ul_time = None
+                self.add_chunks(chunks)
+
+            def destroy(self) -> None:
+                """Remove node from the swarm"""
+                swarm.nodes.remove(self)
+
+            def add_chunks(self, new_chunks: Iterable, clear_first=False) -> None:
+                super().add_chunks(new_chunks, clear_first)
+                for c in new_chunks:
+                    swarm.chunk_popularity[c] += 1
+                # Sanity check
+                if self.chunks - swarm.all_chunks:
+                    raise UserWarning(f'Bug? Node has unknown chunks.')
+                # If current node's got all chunks, check if others have too
+                if len(self.chunks) == len(swarm.all_chunks):
+                    swarm.all_done = all(len(n.chunks) == len(swarm.all_chunks) for n in swarm.nodes)
+
+        n = _NodeImpl()
+        self.nodes.append(n)
+        self.all_done &= (len(n.chunks) == self.all_chunks)
+        if master_node:
+            self._master_nodes.add(n)
+        return n
+
+
+    def plan_transfers(self) -> Iterable[Transfer]:
         """
         Calculates a transfer plan by pairing up nodes with free download and upload slots.
         :return: List of Transfers to initiate
         """
         # Consider nodes with least chunks first for both DL and UL, for optimal speed and network load distribution
-        free_downloaders = sorted((n for n in self.nodes.values() if n.active_downloads < n.max_concurrent_dls and
+        free_downloaders = sorted((n for n in self.nodes if n.active_downloads < n.max_concurrent_dls and
                                    len(n.chunks) < len(self.all_chunks)),
                            key=lambda n: len(n.chunks))
-        free_uploaders = sorted((n for n in self.nodes.values() if n.active_uploads < n.max_concurrent_uls),
+        free_uploaders = sorted((n for n in self.nodes if n.active_uploads < n.max_concurrent_uls),
                                 key=lambda n: len(n.chunks) * (n.avg_ul_time or 999))  # favor fast uploaders
         if not free_uploaders or not free_downloaders: return ()
 
         # Timeout P2P downloads quickly at first, then use actual statistics as we get
-        ul_times = [float(n.avg_ul_time or 0) for n in self.nodes.values() if n.avg_ul_time]
+        ul_times = [float(n.avg_ul_time or 0) for n in self.nodes if n.avg_ul_time]
         median_time = statistics.median(ul_times) if ul_times else 1
 
         # Avoid slow peers but not completely (proportional to their speed)
-        free_uploaders = (n for n in free_uploaders if n.node_id in self._master_nodes or
+        free_uploaders = (n for n in free_uploaders if n in self._master_nodes or
                           not n.avg_ul_time or random.random() < (median_time/n.avg_ul_time))
 
         # Match uploaders and downloaders to transfer rarest chunks first:
@@ -173,8 +159,8 @@ class ChunkDistributionPlanner(object):
                         if new_chunks:
                             # Pick the rarest chunk first for best distribution
                             chunk = min(new_chunks, key=lambda c: self.chunk_popularity[c])
-                            timeout = median_time*4 if (ul.node_id not in self._master_nodes) else 9999999
-                            t = Transfer(from_node=ul.node_id, to_node=dl.node_id, chunk=chunk, timeout=timeout)
+                            timeout = median_time*4 if (ul not in self._master_nodes) else 9999999
+                            t = Transfer(from_node=ul, to_node=dl, chunk=chunk, timeout=timeout)
                             proposed_transfers.append(t)
                             # To prevent overbooking and to help picking different chunks, assume transfer will succeed
                             self.chunk_popularity[chunk] += 1
@@ -197,7 +183,7 @@ class ChunkDistributionPlanner(object):
 
 def simulate() -> None:
     '''
-    Simulate file swarm, controlled by ChunkDistributionPlanner.
+    Simulate file swarm, controlled by SwarmCoordinator.
     Prints a block diagram to stdout until all blocks are done.
     '''
     N_CHUNKS = 72
@@ -217,43 +203,43 @@ def simulate() -> None:
     SLOWDOWN_FACTOR = 100  # transfer time multiplier for "very slow" nodes
 
     test_chunks = tuple(range(N_CHUNKS))
-    planner = ChunkDistributionPlanner(test_chunks)
+    swarm = SwarmCoordinator(test_chunks)
 
-    plan_now = asyncio.Event()  # asyncio event to wake planner
-    joins_left = N_NODES
-    ext_nodes: Dict[int, SimpleNamespace] = {}
+    plan_now_trigger = asyncio.Event()  # asyncio event to wake planner
+    joins_left, next_node_num = N_NODES, 0
 
-    # Create seeder node
-    seeder_id = planner.on_node_join(test_chunks, 0, SEEDER_UL_SLOTS, master_node=True)  # initial seed node
-    ext_nodes[seeder_id] = SimpleNamespace(id=seeder_id, chunks=set(test_chunks), tfers=set(), speed_fact=1)
-
-    def add_node():
-        nonlocal ext_nodes, joins_left
+    def new_simu_node(master=False):
+        nonlocal joins_left, next_node_num
         joins_left -= 1
-        speed_fact = SLOWDOWN_FACTOR if (random.random() < SLOWDOWN_PROBABILITY) else \
-            random.uniform(1, SPEED_VARIABILITY_PER_NODE)
-        assert (speed_fact >= 1)
-        i = planner.on_node_join((), NODE_UL_SLOT, NODE_UL_SLOT)
-        ext_nodes[i] = SimpleNamespace(id=i, chunks=set(), tfers=set(), speed_fact=speed_fact)
+        n = swarm.node_join((), NODE_UL_SLOT, NODE_UL_SLOT) if not master else \
+            swarm.node_join(test_chunks, 0, SEEDER_UL_SLOTS, master_node=True)
+        speed_fact = 1.0 if master else (SLOWDOWN_FACTOR if (random.random() < SLOWDOWN_PROBABILITY) else
+                                         random.uniform(1, SPEED_VARIABILITY_PER_NODE))
+        n.impl_data = SimpleNamespace(simu_tfers=set(), simu_speed_fact=speed_fact, nick='%02d' % next_node_num)
+        next_node_num += 1
+        assert n.impl_data.simu_speed_fact >= 1
+        if master:
+            n.add_chunks(test_chunks)
+        return n
 
+    seeder = new_simu_node(master=True)
     for _ in range(int(N_NODES/2)):
-        add_node()
+        new_simu_node()
 
     def report_transfers(node):
-        dls = [t for t in node.tfers if t.to_node == node.id]
-        uls = [t for t in node.tfers if t.from_node == node.id]
-        planner.on_report_active_transfers(node.id, (t.chunk for t in dls), len(dls), len(uls))
+        dls = [t for t in node.impl_data.simu_tfers if t.to_node is node]
+        uls = [t for t in node.impl_data.simu_tfers if t.from_node is node]
+        node.set_active_transfers((t.chunk for t in dls), len(dls), len(uls))
 
     async def simulate_transfer(t: Transfer):
-        from_n, to_n = ext_nodes.get(t.from_node), ext_nodes.get(t.to_node)
-        if not from_n or not to_n: return  # node left swarm
-        rnd_time = random.uniform(TRANSFER_TIME_MIN, TRANSFER_TIME_MAX) * from_n.speed_fact
+        rnd_time = random.uniform(TRANSFER_TIME_MIN, TRANSFER_TIME_MAX) * t.from_node.impl_data.simu_speed_fact
         try:
             if random.random() < ERROR_PROBABILITY/2: return  # simulate initialization failure sometimes
             # Mark transfer as ongoing
-            for n in (to_n, from_n):
-                n.tfers.add(t)
+            for n in (t.to_node, t.from_node):
+                n.impl_data.simu_tfers.add(t)
                 report_transfers(n)
+
             # Wait = simulate transfer
             if rnd_time < t.timeout_secs:
                 await asyncio.sleep(rnd_time)
@@ -261,60 +247,57 @@ def simulate() -> None:
                 await asyncio.sleep(t.timeout_secs)
                 print("Slow download. Giving up.")
                 return
+
             if random.random() < ERROR_PROBABILITY / 2: return  # simulate transfer failure sometimes
+
             # Mark chunk as received
-            to_n.chunks.add(t.chunk)
-            planner.on_node_got_chunks(to_n.id, (t.chunk,))
-        except NoSuchNodeException as e:
-            print(f'Transfer aborted - node "{e.node_id}" has left swarm.')
+            t.to_node.add_chunks([t.chunk])
         finally:
-            with suppress(NoSuchNodeException):
-                if rnd_time is not None:
-                    planner.on_report_upload_speed(from_n.id, rnd_time)
+            if rnd_time is not None:
+                t.from_node.update_transfer_speed(rnd_time)
             # Cleanup
-            for n in (to_n, from_n):
+            for n in (t.to_node, t.from_node):
                 with suppress(KeyError):
-                    n.tfers.remove(t)
-                with suppress(NoSuchNodeException):
-                    report_transfers(n)
-                plan_now.set()
+                    n.impl_data.simu_tfers.remove(t)
+                report_transfers(n)
+                plan_now_trigger.set()
+
 
     async def planner_loop():
-        while not planner.all_done:
+        while not swarm.all_done:
             with suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(plan_now.wait(), timeout=1)
-            plan_now.clear()
+                await asyncio.wait_for(plan_now_trigger.wait(), timeout=1)
+            plan_now_trigger.clear()
 
             if random.random() < JOIN_PROBABILITY and joins_left > 0:
                 print("Node join")
-                add_node()
+                new_simu_node()
 
-            for t in planner.plan():
+            for t in swarm.plan_transfers():
                 # Simulate node dropout
                 if random.random() < DROPOUT_PROBABILITY:
-                    print("DROPOUT " + str(t.to_node))
-                    del (ext_nodes[t.to_node])
-                    planner.on_node_leave(t.to_node)
+                    print("DROPOUT " + str(t.to_node.impl_data.nick))
+                    t.to_node.destroy()
                 else:
-                    # Start "transfer":
+                    # Run simulated transfer
                     asyncio.create_task(simulate_transfer(t))
 
     async def runner():
-        nonlocal plan_now
-        plan_now = asyncio.Event()
-        plan_now.set()
+        nonlocal plan_now_trigger
+        plan_now_trigger = asyncio.Event()
+        plan_now_trigger.set()
 
         def print_status():
             print("")
-            for n in ext_nodes.values():
-                dls = [t for t in n.tfers if t.to_node == n.id]
-                uls = [t for t in n.tfers if t.from_node == n.id]
-                print('%02d' % n.id, ''.join(('#' if c in n.chunks else '.') for c in test_chunks), len(dls),
-                      len(uls), '  %.1f' % (planner.avg_ul_time(n.id) or -1))
+            for n in swarm.nodes:
+                dls = [t for t in n.impl_data.simu_tfers if t.to_node == n]
+                uls = [t for t in n.impl_data.simu_tfers if t.from_node == n]
+                print(n.impl_data.nick, ''.join(('#' if c in n.chunks else '.') for c in test_chunks), len(dls),
+                      len(uls), '  %.1f' % (n.avg_ul_time or -1))
 
         start_t = time.time()
         asyncio.create_task(planner_loop())
-        while not planner.all_done:
+        while not swarm.all_done:
             print_status()
             await asyncio.sleep(0.5)
         print_status()
