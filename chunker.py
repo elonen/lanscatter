@@ -140,10 +140,11 @@ async def monitor_folder_forever(basedir: str, update_interval: float, progress_
             await asyncio.sleep(update_interval)
 
 
-def chunks_to_json(chunks, chunk_size):
-    data = {'chunks': [c.__dict__ for c in chunks], 'chunk_size': chunk_size}
-    return json.dumps(data, indent=4)
+def chunks_to_dict(chunks, chunk_size):
+    return {'chunks': [c.__dict__ for c in chunks], 'chunk_size': chunk_size}
 
+def chunks_to_json(chunks, chunk_size):
+    return json.dumps(chunks_to_dict(chunks, chunk_size), indent=4)
 
 def json_to_chunks(json_str):
     data = json.loads(json_str)

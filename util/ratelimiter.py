@@ -21,7 +21,7 @@ class RateLimiter(object):
         :param burst_factor: Allow bursts of max 'burst_factor' x 'rate_limit'.
         """
         assert(period > 0)
-        assert(rate_limit > 0)
+        assert(rate_limit >= 0)
 
         self.permits_per_sec = rate_limit / period
         self.period = period

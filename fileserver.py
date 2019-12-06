@@ -1,33 +1,47 @@
-from aiohttp import web
+from aiohttp import web, WSMsgType
 from pathlib import Path
-from typing import List, Dict, Callable
-import ssl, asyncio, aiofiles, socket, hashlib, argparse
-from filechunks import FileChunk, monitor_folder_forever, chunks_to_json
+from typing import List, Dict, Callable, Optional
+import ssl, asyncio, aiofiles, socket, hashlib, argparse, traceback
+from chunker import FileChunk, monitor_folder_forever, chunks_to_json, chunks_to_dict
+from types import SimpleNamespace
 from contextlib import suppress
 from util.ratelimiter import RateLimiter
 from common import *
+import planner
+from fileio import FileIO
 
 # HTTP file server that continuously auto-scans given directory,
 # serves file chunks to clients, and maintains a list of P2P URLs so network load get distributed
 # like a semi-centralized bittorrent.
 
+
 class FileServer(object):
-    _chunks: List[FileChunk]
+    _filelist: List[FileChunk]
     _hash_to_chunk: Dict[str, FileChunk]
     _basedir: str
     _filelist: str
 
+    class ClientInfo(object):
+        def __init__(self, address: str):
+            self.address = address
+            self.port = None
+            self.nick = None
+
+        @property
+        def url(self):
+            return f'http://{self.address}:{self.port}/'
+
+
     def __init__(self, basedir: str, status_func: Callable, chunk_size: int = -1, http_cache_time: int = 60*5):
-        self._chunks = []           # List fo all FileChunks
+        self._filelist = []          # List fo all FileChunks
         self._hash_to_chunk = {}    # Map hash -> FileChunk
-        self._basedir = basedir     # Directory to serve/monitor files from
-        self._base_url = ''         # URL to access this server
         self._filelist_etag = ''    # MD5 sum of file/chunk list
+        self._basedir = basedir     # Directory to serve/monitor files from
         self._http_cache_time = http_cache_time
-        self._peers_map = {}
-        self._peers_etag = ''
         self._chunk_size = chunk_size   # Only required on master server
         self._status_func = status_func
+
+        self._planner = planner.SwarmCoordinator()
 
         if not Path(basedir).is_dir():
             raise NotADirectoryError(f'Path "{basedir}" is not a directory. Cannot serve from it.')
@@ -39,28 +53,23 @@ class FileServer(object):
             self._status_func = dummy_status_func
 
 
-    def base_url(self):
-        return self._base_url
-
-    def set_chunks(self, chunks):
+    def replace_filelist(self, new_filelist):
         '''
         Receive new chunks from directory scanner and start serving them.
         '''
         self._status_func(log_info='Chunks updated. Now serving new ones.')
-        self._chunks = chunks
-        self._hash_to_chunk = {c.hash: c for c in chunks}
+        self._filelist = new_filelist
+        self._hash_to_chunk = {c.hash: c for c in self._filelist}
 
-        filelist = chunks_to_json(self._chunks, self._chunk_size)
-        self._filelist_etag = hashlib.md5(filelist.encode('utf-8')).hexdigest()
+        fl_json = chunks_to_json(self._filelist, self._chunk_size)
+        new_etag = hashlib.md5(fl_json.encode('utf-8')).hexdigest()
 
-        # Make sure server's URL is in peer list for all local hashes
-        if self._base_url:
-            for c in self._chunks:
-                if c.hash not in self._peers_map:
-                    self._peers_map[c.hash] = []
-                url = f'{self._base_url}/chunk/{c.hash}'
-                if url not in self._peers_map[c.hash]:
-                    self._peers_map[c.hash].append(url)
+        if self._filelist_etag != new_etag:  # filelist changed
+            self._filelist_etag = new_etag
+            self._planner.reset_chunks((c.hash for c in new_filelist))
+            fl_msg = {'action': 'new_filelist', 'data': chunks_to_dict(self._filelist or (), self._chunk_size)}
+            for n in self._planner.nodes:
+                n.client.send(fl_msg)
 
 
     def run_server(self, serve_filelist=True, port=14433, https_cert=None, https_key=None, ul_limit: float = 10000):
@@ -75,143 +84,166 @@ class FileServer(object):
 
         :return: Asyncio task
         '''
-        base_path = Path(self._basedir)
+        fileio = FileIO(Path(self._basedir), 0, ul_limit)
 
         hostname = socket.gethostname()
         ip_addr = socket.gethostbyname(hostname)
         self._base_url = ('https://' if (https_cert and https_key) else 'http://') + ip_addr + ':' + str(port)
-
         self._status_func(log_info=f'Starting {"master" if serve_filelist else "p2p"} file server on {self._base_url}.')
 
-        ul_limiter = RateLimiter(ul_limit*1024*1024/8, 1.0, burst_factor=2.0)
+
+        async def on_websocket_msg_from_client(address, send_queue, node: Optional[planner.Node], msg) -> Optional[planner.Node]:
+            '''
+            :param address: IP address of originating client
+            :param send_queue: Asyncio Queue for outgoing messages
+            :param node: planner.Node object, or None if not yet joined a swarm
+            :param msg: Message from client in a dict
+            :return: New Node handle if messages caused a swarm join, otherwise None
+            '''
+            client_name = (node.client.nick if node else 'new_node') + "@" + str(address)
+            self._status_func(log_info=f'Msg from {client_name}: {str(msg)}')
+
+            async def error(txt):
+                self._status_func(log_error=f'Sending error to client {client_name}: {txt}')
+                await send_queue.put({'action': 'error', 'orig_msg': msg, 'message': txt})
+            async def ok(txt):
+                await send_queue.put({'action': 'ok', 'message': txt})
+
+            try:
+                action = msg.get('action')
+
+                # ---------------------------------------------------
+                # Client wants to join swarm
+                # ---------------------------------------------------
+                if action == 'join_swarm':
+                    dl_url = msg.get('dl_url')
+                    if not dl_url or 'http' not in dl_url:
+                        return await error("'dl_url' argument missing or invalid.")
+                    if node:  # rejoin = destroy old and create new
+                        node.destroy()
+                        self._status_func(log_info=f'Rejoining "{client_name}".')
+                    slots = msg.get('concurrent_transfers') or 2
+                    node = self._planner.node_join((), slots, slots)
+                    node.client = SimpleNamespace(
+                        dl_url=dl_url,
+                        nick=msg.get('nick') or 'anonymous',
+                        send=lambda m: send_queue.put_nowait(m))
+                    self._status_func(log_info=f'Client "{client_name}" joined swarm as "{node.client.nick}".'
+                                               f' URL: {node.client.dl_url}')
+                    await ok('Join ok. Sending filelist.')
+                    await send_queue.put({'action': 'new_filelist',
+                                          'data': chunks_to_dict(self._filelist or (), self._chunk_size)})
+                    return node
+                else:
+                    if not node:
+                        return await error("Join the swarm first.")
+
+                # ---------------------------------------------------
+                # Client's got (new) chunks
+                # ---------------------------------------------------
+                if action == 'set_chunks' or action == 'add_chunks':
+                    if not isinstance(msg.get('chunks'), list):
+                        return await error("Must have list in arg 'chunks'")
+                    if not node:
+                        return await error("Join the swarm first.")
+                    unknown_chunks = node.add_chunks(msg.get('chunks'), clear_first=(action == 'set_chunks'))
+                    await ok('Chunks updated')
+                    if unknown_chunks:
+                        self._status_func(log_info=f'Client "{client_name}" had unknown chunks: {str(unknown_chunks)}')
+                        await send_queue.put({
+                            'action': 'rehash',
+                            'message': 'You reported chunks not belonging to the swarm. You need to rehash files.',
+                            'unknown_chunks': tuple(unknown_chunks)})
+
+                # ---------------------------------------------------
+                # Client reports current downloads, uploads and speed
+                # ---------------------------------------------------
+                elif action == 'report_transfers':
+                    if not node:
+                        return await error("Join the swarm first.")
+                    dl_count, ul_count = msg.get('downloads'), msg.get('uploads')
+                    incoming_chunks = msg.get('incoming_chunks')
+                    last_upload_secs = msg.get('last_upload_secs')
+                    if None in (dl_count, ul_count, incoming_chunks):
+                        return await error(f"Missing args.")
+                    node.set_active_transfers(incoming_chunks, dl_count, ul_count)
+                    node.update_transfer_speed(last_upload_secs)
+                    await ok('Transfer status updated')
+
+
+                elif action is None:
+                    return await error("Missing parameter 'action")
+                else:
+                    return await error(f"Unknown 'action': {str(action)}")
+
+            except Exception as e:
+                await error('Exception raised: '+str(e))
+                self._status_func(log_error=f'Error while handling client ({client_name}) message "{str(msg)}": \n'+
+                                            traceback.format_exc(), popup=True)
+
+
+        async def http_handler__start_websocket(request):
+            self._status_func(log_info=f"[{request.remote}] GET {request.path_qs}. Converting to websocket.")
+
+            # Turn request to websocket and start listening
+            ws = web.WebSocketResponse(heartbeat=30)
+            await ws.prepare(request)
+
+            address = str(request.remote)
+            send_queue = asyncio.Queue()
+            node = None
+
+            async def send_loop():
+                while not ws.closed:
+                    with suppress(asyncio.TimeoutError):
+                        msg = await asyncio.wait_for(send_queue.get(), timeout=1.0)
+                        if msg and not ws.closed:
+                            await ws.send_json(msg)
+            send_task = asyncio.create_task(send_loop())
+
+            try:
+                async for msg in ws:
+                    if msg.type == WSMsgType.TEXT:
+                        try:
+                            new_node = await on_websocket_msg_from_client(address, send_queue, node, msg.json())
+                            if new_node:
+                                node = new_node
+                        except Exception as e:
+                            self._status_func(log_error=f'Error ("{str(e)}") handing client msg: {msg.data}')
+                            send_queue.put_nowait({'command': 'error', 'orig_msg': msg.data,
+                                                   'message': 'Exception: ' + str(e)})
+                    elif msg.type == WSMsgType.ERROR:
+                        self._status_func(log_error=f'Connection for client "{node.client.nick if node else address}" '
+                                                    'closed with err: %s' % ws.exception())
+
+                self._status_func(log_info=f'Connection closed from "{node.client.nick if node else address}"')
+
+            finally:
+                if node:
+                    node.destroy()
+
+            send_task.cancel()
+            return ws
+
 
         # HTTP HANDLER - Serve requested file chunk to a client
-        async def handle_get_chunk(request):
+        async def http_handler__get_chunk(request):
             '''
             HTTP GET handler that serves out a file chunk with given hash.
             '''
             self._status_func(log_info=f"[{request.remote}] GET {request.path_qs}")
-            h = request.match_info.get('hash', 'noname')
-
-            if h not in self._hash_to_chunk:
-                return web.Response(status=404, text=f'404 NOT FOUND. Hash not found on this server: {h}')
-            else:
-                # Check if we have the chunk
-                c = self._hash_to_chunk[h]
-
-                path = base_path / c.filename
-                if base_path not in path.parents:
-                    return web.Response(status=403, text=f'403 FORBIDDEN. Filename points outside basedir?? {str(path)}')
-                elif not path.is_file():
-                    return web.Response(status=404, text=f'404 NOT FOUND. Host should have chunk, but file is missing! {str(path)}')
-                else:
-                    # Ok, read chunk from file and stream it out
-                    response = web.StreamResponse(
-                        status=200,
-                        reason='OK',
-                        headers={'Content-Type': 'application/octet-stream', 'Content-Disposition': 'inline'})
-                    await response.prepare(request)
-                    async with aiofiles.open(path, mode='rb') as f:
-                        await f.seek(c.pos)
-                        remaining = c.size
-                        buff = bytearray(256*1024)
-                        while remaining > 0:
-
-                            # Read file
-                            if remaining < len(buff):
-                                buff = bytearray(remaining)
-                            cnt = await f.readinto(buff)
-                            if cnt != len(buff):
-                                self._status_func(log_error=f'ERROR: File "{str(path)}" changed? Read {cnt} but expected {len(buff)}.')
-                                return web.Response(status=500, text=f'500 INTERNAL ERROR. Filesize mismatch.')
-                            remaining -= cnt
-
-                            # Throttle response bandwidth
-                            i = 0
-                            while cnt > 0:
-                                limited_n = int(await ul_limiter.acquire(cnt, 4096))
-                                await response.write(buff[i:(i+limited_n)])
-                                i += limited_n
-                                cnt -= limited_n
-
-                    await response.write_eof()
-                    return response
+            h = request.match_info.get('hash')
+            chunk = self._hash_to_chunk.get(h or '-')
+            if chunk is None:
+                raise web.HTTPNotFound(reson=f'Chunk not on this host: {h}')
+            return await fileio.upload_chunk(chunk, request)
 
 
-        # HTTP HANDLER - Return filelist (hash list) to a client
-        async def handle_get_filelist(request):
-            self._status_func(log_info=f"[{request.remote}] GET {request.path_qs}")
-            if self._filelist_etag and request.headers.get('If-None-Match') == self._filelist_etag:
-                return web.HTTPNotModified()
-            return web.Response(
-                status=200, body=chunks_to_json(self._chunks, self._chunk_size),
-                content_type='application/json',
-                headers={'ETag': self._filelist_etag, 'Cache-Control': f'public, max-age: {self._http_cache_time}'})
-
-
-        # HTTP HANDLER - Return a list of URLs that hashes can be downloaded from
-        async def handle_get_peers(request):
-            self._status_func(log_info=f"[{request.remote}] GET {request.path_qs}")
-            if self._peers_etag and request.headers.get('If-None-Match') == self._peers_etag:
-                return web.HTTPNotModified()
-            res = json.dumps(self._peers_map, indent=4)
-            self._peers_etag = hashlib.md5(res.encode('utf-8')).hexdigest()
-            return web.Response(
-                status=200, body=res,
-                content_type='application/json',
-                headers={'ETag': self._peers_etag, 'Cache-Control': f'public, max-age: 30'})
-
-
-        # HTTP HANDLER - Add/delete hash -> URL mappings (peer list)
-        async def update_peer_urls(request):
-            self._status_func(log_info=f"[{request.remote}] POST {request.path_qs}")
-            try:
-                ops = await request.json()
-            except json.decoder.JSONDecodeError as e:
-                return web.Response(status=400, body='400 BAD REQUEST: JSON / ' + str(e), content_type='text/plain')
-            bad_hashes = []
-            for line in ops:
-                if not isinstance(line, list) or len(line) != 3 or (line[0] not in ('ADD', 'DEL')):
-                    return web.Response(
-                        status=400, body='400 BAD REQUEST: please send a json list of ["ADD|DEL", "<HASH>", "<URL>"]',
-                        content_type='text/plain')
-                else:
-                    op, h, url = line[0], line[1].strip(), line[2]
-                    c = self._hash_to_chunk.get(h)
-                    if c is None:
-                        bad_hashes.append(h)
-                    else:
-                        if h not in self._peers_map:
-                            self._peers_map[h] = []
-                        peers = self._peers_map[h]
-                        if op == 'ADD' and (url not in peers):
-                            peers.append(url)
-                        elif op == 'DEL' and (url in peers):
-                            if not url.startswith(self._base_url):  # don't remove server's own url even if requested
-                                peers.remove(url)
-
-            # Return updated list
-            res = json.dumps(self._peers_map, indent=4)
-            self._peers_etag = hashlib.md5(res.encode('utf-8')).hexdigest()
-            if bad_hashes:
-                res = json.dumps({**self._peers_map, 'ERROR_MISSING_HASHES': bad_hashes}, indent=4)
-                self._status_func(log_error=f"WARNING: Client reported URLs for unknown hashes: {str(bad_hashes)}")
-
-            return web.Response(
-                status=200, body=json.dumps(self._peers_map, indent=4),
-                content_type='application/json',
-                headers={'ETag': self._peers_etag, 'Cache-Control': f'public, max-age: 30'})
-
-
-        # Create aiohttp web app
+        # Create HTTP server
         app = web.Application()
-        app.add_routes([web.get('/chunk/{hash}', handle_get_chunk)])
+        app.add_routes([web.get('/chunk/{hash}', http_handler__get_chunk)])
         if serve_filelist:
-            app.add_routes([
-                    web.get('/filelist', handle_get_filelist),
-                    web.get('/peers', handle_get_peers),
-                    web.post('/peers', update_peer_urls),
-                ])
+            app.add_routes([web.get('/ws', http_handler__start_websocket)])
 
         # Setup HTTPS if certificate and key are provided (otherwise use plain HTTP):
         context = None
@@ -230,6 +262,7 @@ class FileServer(object):
             await site.start()
         return wrap_runner()
 
+# ---------------------------------------------------------------------------------------------------
 
 async def run_master_server(base_dir: str, port: int,
                             dir_scan_interval: float = 20, status_func=None, ul_limit: float = 10000,
@@ -240,7 +273,7 @@ async def run_master_server(base_dir: str, port: int,
             if status_func:
                 status_func(progress=total_progress, cur_status=f'Hashing "{cur_filename}" ({int(file_progress * 100 + 0.5)}% done)')
         async for new_chunks in monitor_folder_forever(base_dir, dir_scan_interval, progress_func_adapter, chunk_size=chunk_size):
-            server.set_chunks(new_chunks)
+            server.replace_filelist(new_chunks)
 
     server = FileServer(base_dir, chunk_size=chunk_size, status_func=status_func)
     await asyncio.gather(
