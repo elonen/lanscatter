@@ -102,10 +102,14 @@ class SwarmCoordinator(object):
             n.chunks.intersection_update(new_chunks)  # forget obsolete chunks on nodes
         self.chunk_popularity = {c: (self.chunk_popularity.get(c) or 0) for c in new_chunks}
 
-    def node_join(self, chunks: Iterable[ChunkId], concurrent_dls: int, concurrent_uls: int, master_node=False) -> Node:
+    def node_join(self, initial_chunks: Iterable[ChunkId],
+                  concurrent_dls: int, concurrent_uls: int, master_node=False) -> Node:
         """
-        Node joins the swarm.
-        :param: master_node  If true, clients will never be instructed to timeout downloads from this node
+        Join node to swarm, ready to sync.
+        :param initial_chunks: Chunks that node has already.
+        :param concurrent_dls: Number of simultaneous downloads allowed.
+        :param concurrent_uls: Number of simultaneous uploads allowed.
+        :param master_node:  If true, clients will never be instructed to timeout downloads from this node
         :return: Newly joined node
         """
         swarm = self
@@ -120,7 +124,7 @@ class SwarmCoordinator(object):
                 self.active_uploads = 0
                 self.incoming_chunks = set()
                 self.avg_ul_time = None
-                self.add_chunks(chunks)
+                self.add_chunks(initial_chunks)
 
             def destroy(self) -> None:
                 """Remove node from the swarm"""

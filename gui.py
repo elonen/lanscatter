@@ -3,7 +3,7 @@ from pathlib import Path
 import asyncio, threading, sys
 from datetime import datetime
 from fileserver import run_master_server
-from fileclient import run_file_client
+from peernode import run_file_client
 
 #
 # System tray GUI for both FileClient and FileServer.

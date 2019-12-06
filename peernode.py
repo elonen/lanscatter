@@ -1,5 +1,5 @@
 from typing import Callable
-from filechunks import FileChunk, hash_dir, chunks_to_json, json_to_chunks
+from chunker import FileChunk, hash_dir, chunks_to_json, json_to_chunks
 from datetime import timedelta
 import asyncio, aiohttp, aiofiles, aiofiles.os
 import os, hashlib, random, traceback, io, time, argparse
@@ -7,14 +7,12 @@ from pathlib import Path
 from fileserver import FileServer
 from contextlib import suppress
 from common import *
-
-from util.ratelimiter import RateLimiter
-from util.cachedhttp import CachedHttpObject
+from fileio import FileIO
 
 # Client that keeps given directory synced with a master server,
 # and then serves downloaded chunks to peers for network load distribution.
 
-class FileClient(object):
+class PeerNode:
     '''
     Process that scans sync directory, hashes it, and keeps it synced with a file list from master server.
     '''
@@ -23,8 +21,6 @@ class FileClient(object):
                  server_url: str,  # URL of master server
                  status_func: Callable,  # Callback for status reporting
                  port: int,  # TCP port for listening to peers
-                 filelist_cache_time: float,  # How often to recheck server for file changes
-                 peer_list_cache_time: float,  # How often to recheck server for new peer URL list
                  file_rescan_interval: float,  # How often to rescan sync directory (seconds)
                  dl_limit: float,  # Download limit, Mbits/s
                  ul_limit: float):                      # Upload limit, Mbits/s
@@ -33,8 +29,9 @@ class FileClient(object):
         self._local_rescan_interval = file_rescan_interval
         self._next_folder_rescan = datetime.utcnow()
 
-        self._dl_limiter = RateLimiter(dl_limit*1024*1024/8, 1.0, burst_factor=2.0)
-        self._ul_limit = ul_limit
+        if not Path(base_dir).is_dir():
+            raise NotADirectoryError(f'Path "{basedir}" is not a directory. Cannot read/write files in it.')
+        self._file_io = FileIO(Path(basedir), dl_limit, ul_limit)
 
         self._port = port
         self._server_url: str = server_url
@@ -112,7 +109,7 @@ class FileClient(object):
                             while read:
                                 limited_n = int(await self._dl_limiter.acquire(64*1024, 4*1024))
                                 read = await resp.content.read(limited_n)
-                                self._dl_limiter.return_unused(limited_n - len(read))
+                                self._dl_limiter.unspend(limited_n - len(read))
                                 h.update(read)
                                 data.write(read)
                             if h.hexdigest() == c.hash:
@@ -162,7 +159,7 @@ class FileClient(object):
 
         # Start serving local chunks to peers
         if self._peer_server:
-            self._peer_server.set_chunks(self._local_chunks)
+            self._peer_server.replace_filelist(self._local_chunks)
 
         async with aiohttp.ClientSession() as http_session:
             await self._report_new_local_chunks_to_server(http_session)
@@ -253,7 +250,7 @@ class FileClient(object):
                         st = await aiofiles.os.stat(abs_path)
                         if st.st_size == rc.file_size:
                             os.utime(abs_path, (rc.file_mtime, rc.file_mtime))
-                            self._peer_server.set_chunks(self._local_chunks)
+                            self._peer_server.replace_filelist(self._local_chunks)
                             await self._report_new_local_chunks_to_server(http_session)
                         else:
                             # Otherwise delete the incomplete file
@@ -312,7 +309,7 @@ class FileClient(object):
 async def run_file_client(base_dir: str, server_url: str, port: int, status_func=None,
                           cache_interval: float = 45, rescan_interval: float = 60,
                           dl_limit: float = 10000, ul_limit: float = 10000):
-    client = FileClient(
+    client = PeerNode(
         basedir=base_dir, server_url=server_url, status_func=status_func, port=port,
         filelist_cache_time=cache_interval, peer_list_cache_time=cache_interval, file_rescan_interval=rescan_interval,
         dl_limit=dl_limit, ul_limit=ul_limit)

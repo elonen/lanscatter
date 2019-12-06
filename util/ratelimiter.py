@@ -75,10 +75,10 @@ class RateLimiter(object):
         return used
 
 
-    def return_unused(self, n_permits: float):
+    def unspend(self, n_permits: float):
         """
         Return unused permits.
-        :param n_permits:
+        :param n_permits: Number of permits to add back
         :return:
         """
         self.cur_permits = min(self.cur_permits + n_permits, self.permit_cap)

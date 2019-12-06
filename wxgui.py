@@ -29,8 +29,8 @@ def sync_proc(conn, is_master, argv):
             import fileserver
             fileserver.main()
         else:
-            import fileclient
-            fileclient.main()
+            import peernode
+            peernode.main()
         conn.send((None, None))
     except Exception as e:
         conn.send((e, traceback.format_exc()))
@@ -277,7 +277,7 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
 
         conn_recv, conn_send = mp.Pipe(duplex=False)  # Multi-CPU safe conn_send -> conn_recv pipe
         argv = ['fileserver.py', sync_dir, '--port', str(port), '--json'] if is_master else \
-            ['fileclient.py', sync_dir, '--port', str(port), '--url', master_url, '--json']
+            ['peernode.py', sync_dir, '--port', str(port), '--url', master_url, '--json']
         syncer = mp.Process(target=sync_proc, name='sync-worker', args=(conn_send, is_master, argv))
         threading.Thread(target=comm_thread, args=(conn_recv,)).start()
         syncer.start()

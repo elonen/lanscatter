@@ -2,7 +2,7 @@ from util.ratelimiter import RateLimiter
 from pathlib import Path
 from chunker import FileChunk
 from aiohttp import web, ClientSession
-import aiofiles, io, hashlib
+import aiofiles, os, hashlib
 
 class FileIO(object):
     '''
@@ -30,18 +30,25 @@ class FileIO(object):
         self._dl_limiter = RateLimiter(dl_rate_limit*1024*1024/8, period=1.0, burst_factor=2.0)
         self._ul_limiter = RateLimiter(ul_rate_limit*1024*1024/8, period=1.0, burst_factor=2.0)
 
+    def resolve_and_sanitize(self, relative_path, must_exist=False):
+        '''
+        Check that given relative path stays inside basedir and return an absolute path string.
+        :return: Absolute Path() object
+        '''
+        p = (self._basedir / Path(relative_path)).resolve()
+        if self._basedir not in p.parents:
+            raise PermissionError(f'Filename points outside basedir: {str(relative_path)}')
+        return p
 
-    def _open_and_seek(self, path_str: str, pos: int, for_write: bool):
+    def open_and_seek(self, path: str, pos: int, for_write: bool = False):
         '''
         Helper. Open file for read or write and seek/grow to given size.
-        :param path_str: File to open
+        :param path: File to open
         :param pos: File position to seek/grow into
         :param for_write: If true, open for write, otherwise for read
         :return: Aiofiles file handle
         '''
-        path = self._basedir / Path(path_str)
-        if self._basedir not in path.parents:
-            raise PermissionError(f'Filename points outside basedir: {str(path)}')
+        path = self.resolve_and_sanitize(path)
         if for_write:
             mode = ('r+b' if path.is_file() else 'wb')
         else:
@@ -49,6 +56,7 @@ class FileIO(object):
                 raise FileNotFoundError(f'Cannot read, no such file: "{str(path)}"')
             mode = 'rb'
 
+        # Return an "async with" compatible object that opens file and seeks
         class _TempAsyncMgr:
             async def __aenter__(self):
                 self.f = await aiofiles.open(path, mode=mode)
@@ -67,7 +75,7 @@ class FileIO(object):
         :return: Aiohttp response object
         '''
         try:
-            async with self._open_and_seek(chunk.filename, chunk.pos, for_write=False) as f:
+            async with self.open_and_seek(chunk.filename, chunk.pos, for_write=False) as f:
                 # Ok, read chunk from file and stream it out
                 response = web.StreamResponse(
                     status=200,
@@ -120,10 +128,10 @@ class FileIO(object):
         if copy_from.filename == copy_to.filename and copy_from.pos == copy_to.pos:
             return  # Nothing to do
 
-        async with self._open_and_seek(copy_from.filename, copy_from.pos, for_write=False) as inf:
+        async with self.open_and_seek(copy_from.filename, copy_from.pos, for_write=False) as inf:
             if not inf:
                 raise FileNotFoundError(f'Local copy failed, no such file: {str(copy_from.filename)}')
-            async with self._open_and_seek(copy_to.filename, copy_to.pos, for_write=True) as outf:
+            async with self.open_and_seek(copy_to.filename, copy_to.pos, for_write=True) as outf:
                 remaining = copy_from.size
                 buff = bytearray(self._FILE_BUFFER_SIZE)
                 while remaining > 0:
@@ -144,7 +152,7 @@ class FileIO(object):
         :param url: URL to download from
         :param http_session: AioHTTP session to use for GET.
         '''
-        async with self._open_and_seek(chunk.filename, chunk.pos, for_write=True) as outf:
+        async with self.open_and_seek(chunk.filename, chunk.pos, for_write=True) as outf:
             async with http_session.get(url, raise_for_status=True) as resp:
                 if resp.status != 200:  # some error
                     raise Exception(f'Unknown/unsupported HTTP status: {resp.status}')
@@ -154,8 +162,22 @@ class FileIO(object):
                     while read_bytes:
                         limited_n = int(await self._dl_limiter.acquire(self._DOWNLOAD_BUFFER_MAX, self._NETWORK_BUFFER_MIN))
                         read_bytes = await resp.content.read(limited_n)
-                        self._dl_limiter.return_unused(limited_n - len(read_bytes))
+                        self._dl_limiter.unspend(limited_n - len(read_bytes))
                         csum.update(read_bytes)
                         await outf.write(read_bytes)
                     if csum.hexdigest() != chunk.hash:
-                        raise Exception(f'Checksum error verifying {chunk.hash} from {url}')
+                        raise IOError(f'Checksum error verifying {chunk.hash} from {url}')
+
+
+    async def change_mtime(self, path, mtime):
+        path = self.resolve_and_sanitize(path)
+        os.utime(str(path), (mtime, mtime))
+
+    async def create_folders(self, path):
+        path = self.resolve_and_sanitize(path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    async def size_and_mtime(self, path):
+        path = self.resolve_and_sanitize(path)
+        s = await aiofiles.os.stat(str(path))
+        return s.st_size, s.st_mtime

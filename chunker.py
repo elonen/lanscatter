@@ -5,17 +5,23 @@ import aiofiles, aiofiles.os, io
 # Tools for scanning files in a directory and splitting them into hashed chunks.
 # FileServer and FileClient both use this for maintaining and syncing their state.
 
-class FileChunk(object):
+
+class FileChunk:
     filename: str       # path + filename
     pos: int            # chunk start position in bytes
     size: int           # chunk size in bytes
     file_size: int      # size of complete file in bytes
     file_mtime: int     # last modified (unix timestamp)
     hash: str           # Hex checksum of data contents (blake2, digest_size=12)
+
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)
     def __repr__(self):
-        return str(self.__dict__)
+        return 'FileChunk('+str(self.__dict__)+')'
+    def __hash__(self):
+        return hash(self.__repr__())
+    def __eq__(self, other):
+        return self.__repr__() == other.__repr__()
 
 
 async def _hash_file(basedir: str, relpath: str, chunk_size: int,
@@ -141,10 +147,11 @@ async def monitor_folder_forever(basedir: str, update_interval: float, progress_
 
 
 def chunks_to_dict(chunks, chunk_size):
-    return {'chunks': [c.__dict__ for c in chunks], 'chunk_size': chunk_size}
+    return {'chunks': [c.__dict__ for c in sorted(list(chunks), key=lambda c: c.filename + f'{c.pos:016}')],
+            'chunk_size': chunk_size}
 
 def chunks_to_json(chunks, chunk_size):
-    return json.dumps(chunks_to_dict(chunks, chunk_size), indent=4)
+    return json.dumps(chunks_to_dict(chunks, chunk_size), indent=2)
 
 def json_to_chunks(json_str):
     data = json.loads(json_str)
