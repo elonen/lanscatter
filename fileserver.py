@@ -1,6 +1,6 @@
 from aiohttp import web, WSMsgType
 from typing import Callable, Iterable
-import ssl, aiofiles, socket, time
+import ssl, aiofiles, socket
 from chunker import FileChunk
 from fileio import FileIO
 
@@ -59,7 +59,7 @@ class FileServer:
             '''
             self._status_func(log_info=f"[{request.remote}] GET {request.path_qs}")
             h = request.match_info.get('hash')
-            self.active_uploads += -1
+            self.active_uploads += 1
             await self._upload_callback(finished=False)
             try:
                 chunk = self.hash_to_chunk.get(h or '-')
@@ -74,7 +74,7 @@ class FileServer:
                     raise e
                 return res
             finally:
-                self.active_uploads -= -1
+                self.active_uploads -= 1
                 await self._upload_callback(finished=True)
 
         app = web.Application()

@@ -5,7 +5,6 @@ import asyncio, aiofiles, argparse, traceback, html
 from chunker import monitor_folder_forever, chunks_to_dict, chunks_to_json
 from types import SimpleNamespace
 from contextlib import suppress
-from datetime import datetime
 from common import *
 
 import planner
@@ -14,53 +13,48 @@ from fileserver import FileServer
 
 # HTTP file server that continuously auto-scans given directory,
 # serves file chunks to clients, and maintains a list of P2P URLs so network load get distributed
-# like a semi-centralized bittorrent.
+# like a centrally controlled bittorrent.
 
 
 class MasterNode:
 
     def __init__(self, status_func: Callable, chunk_size: int):
-        self._chunk_size = chunk_size
-        self._planner = planner.SwarmCoordinator()
-        self._seed_node = None
-        self._status_func = status_func
-        self._replan_trigger = asyncio.Event()
+        self.chunk_size = chunk_size
+        self.swarm = planner.SwarmCoordinator()
+        self.seed_node = None
+        self.status_func = status_func
+        self.replan_trigger = asyncio.Event()
 
-        async def __on_upload(finished: bool):
+        async def __on_upload_callback(finished: bool):
             if finished:
-                self._seed_node.set_active_transfers((), 0, self._fileserver.active_uploads)
-                self._seed_node.update_transfer_speed(self._fileserver.upload_times)
+                self.seed_node.set_active_transfers((), 0, self._fileserver.active_uploads)
+                self.seed_node.update_transfer_speed(self._fileserver.upload_times)
                 self._fileserver.upload_times.clear()
 
-        self._fileserver = FileServer(status_func, upload_callback=__on_upload)
+        self._fileserver = FileServer(status_func, upload_callback=__on_upload_callback)
 
 
     def __make_filelist_msg(self):
-        return {'action': 'new_filelist', 'data': chunks_to_dict(self._fileserver.filelist or (), self._chunk_size)}
+        return {'action': 'new_filelist', 'data': chunks_to_dict(self._fileserver.filelist or (), self.chunk_size)}
 
     async def replace_filelist(self, new_filelist):
-        old = chunks_to_json(self._fileserver.filelist, self._chunk_size)
-        new = chunks_to_json(new_filelist, self._chunk_size)
+        old = chunks_to_json(self._fileserver.filelist, self.chunk_size)
+        new = chunks_to_json(new_filelist, self.chunk_size)
         if old != new:
-            self._status_func(log_info='Filelist changed. Updating planner and notifying clients.')
+            self.status_func(log_info='Filelist changed. Updating planner and notifying clients.')
             self._fileserver.clear_chunks()
             self._fileserver.add_chunks(new_filelist)
 
             # Update planner and send new list to clients
-            self._planner.reset_chunks((c.hash for c in self._fileserver.filelist))
-            print(self._fileserver.filelist)
-            print('---')
-            print(self._planner.all_chunks)
-            print('====')
-
-            self._seed_node.add_chunks(self._planner.all_chunks, clear_first=True)
+            self.swarm.reset_chunks((c.hash for c in self._fileserver.filelist))
+            self.seed_node.add_chunks(self.swarm.all_chunks, clear_first=True)
             fl_msg = self.__make_filelist_msg()
-            for n in self._planner.nodes:
-                if n != self._seed_node:
+            for n in self.swarm.nodes:
+                if n != self.seed_node:
                     await n.client.send_queue.put(fl_msg)
-            self._replan_trigger.set()
+            self.replan_trigger.set()
         else:
-            self._status_func(log_info='New filelist identical to old one. No action.')
+            self.status_func(log_info='New filelist identical to old one. No action.')
 
 
     def server_loop(self, base_dir: str,
@@ -83,10 +77,10 @@ class MasterNode:
             :return: New Node handle if messages caused a swarm join, otherwise None
             '''
             client_name = (node.name if node else self._fileserver.hostname)
-            self._status_func(log_info=f'[{address}] Msg from {client_name}: {str(msg)}')
+            self.status_func(log_info=f'[{address}] Msg from {client_name}: {str(msg)}')
 
             async def error(txt):
-                self._status_func(log_error=f'[{address}] Sending error to {client_name}: {txt}')
+                self.status_func(log_error=f'[{address}] Sending error to {client_name}: {txt}')
                 await send_queue.put({'action': 'error', 'orig_msg': msg, 'message': txt})
 
             async def ok(txt):
@@ -113,19 +107,19 @@ class MasterNode:
 
                     if node:  # rejoin = destroy old and create new
                         node.destroy()
-                        self._status_func(log_info=f'[{address}] Rejoining "{client_name}".')
+                        self.status_func(log_info=f'[{address}] Rejoining "{client_name}".')
 
-                    node = self._planner.node_join(initial_chunks, dl_slots, dl_slots)
+                    node = self.swarm.node_join(initial_chunks, dl_slots, dl_slots)
                     node.name = msg.get('nick') or self._fileserver.hostname
                     node.client = SimpleNamespace(
                         dl_url=dl_url,
                         send_queue=send_queue)
 
-                    self._status_func(log_info=f'[{address}] Client "{client_name}" joined swarm as "{node.name}".'
+                    self.status_func(log_info=f'[{address}] Client "{client_name}" joined swarm as "{node.name}".'
                                                f' URL: {node.client.dl_url}')
                     await ok('Joined swarm.')
                     await send_queue.put(self.__make_filelist_msg())
-                    self._replan_trigger.set()
+                    self.replan_trigger.set()
                     return node
 
                 # ---------------------------------------------------
@@ -139,11 +133,11 @@ class MasterNode:
 
                     unknown_chunks = node.add_chunks(msg.get('chunks'), clear_first=(action == 'set_chunks'))
 
-                    self._replan_trigger.set()
+                    self.replan_trigger.set()
                     await ok('Chunks updated')
 
                     if unknown_chunks:
-                        self._status_func(log_info=f'Client "{client_name}" had unknown chunks: {str(unknown_chunks)}')
+                        self.status_func(log_info=f'Client "{client_name}" had unknown chunks: {str(unknown_chunks)}')
                         await send_queue.put({
                             'action': 'rehash',
                             'message': 'You reported chunks not belonging to the swarm. You need to rehash files.',
@@ -165,22 +159,19 @@ class MasterNode:
                     node.update_transfer_speed(upload_times)
 
                     if ul_count < node.max_concurrent_uls or dl_count < node.max_concurrent_dls:
-                        self._replan_trigger.set()
+                        self.replan_trigger.set()
 
                     await ok('Transfer status updated')
 
                 elif action == 'error':
-                    self._status_func(log_info=f'Error msg from client ({client_name}): {str(msg)}')
-
-                elif action is None:
-                    return await error("Missing parameter 'action")
+                    self.status_func(log_info=f'Error msg from client ({client_name}): {str(msg)}')
                 else:
                     return await error(f"Unknown action '{str(action)}'")
 
             except Exception as e:
                 await error('Exception raised: '+str(e))
-                self._status_func(log_error=f'Error while handling client ({client_name}) message "{str(msg)}": \n'+
-                                            traceback.format_exc(), popup=True)
+                self.status_func(log_error=f'Error while handling client ({client_name}) message "{str(msg)}": \n' +
+                                           traceback.format_exc(), popup=True)
 
         async def http_handler__status(request):
             '''
@@ -188,7 +179,7 @@ class MasterNode:
             '''
             #self._status_func(log_info=f"[{request.remote}] GET {request.path_qs}")
             colors = {1: 'black', 0.5: 'green', 0: 'lightgray'}
-            st = self._planner.get_status_table()
+            st = self.swarm.get_status_table()
             th = '<th colspan="{colspan}" style="text-align: left;">{txt}</th>'
             res = '<html><head><meta http-equiv="refresh" content="3"></head><body>'\
                   f"<h1>Swarm status</h1><p>{str(datetime.now().isoformat(' ', 'seconds'))}</p>"
@@ -211,7 +202,7 @@ class MasterNode:
 
 
         async def http_handler__start_websocket(request):
-            self._status_func(log_info=f"[{request.remote}] GET {request.path_qs}. Converting to websocket.")
+            self.status_func(log_info=f"[{request.remote}] GET {request.path_qs}. Converting to websocket.")
             ws = web.WebSocketResponse(heartbeat=30)
             await ws.prepare(request)
 
@@ -242,14 +233,14 @@ class MasterNode:
                             if new_node:
                                 node = new_node
                         except Exception as e:
-                            self._status_func(log_error=f'Error ("{str(e)}") handling client msg: {msg.data}'
+                            self.status_func(log_error=f'Error ("{str(e)}") handling client msg: {msg.data}'
                                               'traceback: ' + traceback.format_exc())
                             await send_queue.put({'command': 'error', 'orig_msg': msg.data,
                                                   'message': 'Exception: ' + str(e)})
                     elif msg.type == WSMsgType.ERROR:
-                        self._status_func(log_error=f'Connection for client "{node.name if node else address}" '
+                        self.status_func(log_error=f'Connection for client "{node.name if node else address}" '
                                                     'closed with err: %s' % ws.exception())
-                self._status_func(log_info=f'Connection closed from "{node.name if node else address}"')
+                self.status_func(log_info=f'Connection closed from "{node.name if node else address}"')
             finally:
                 if node:
                     node.destroy()
@@ -267,9 +258,9 @@ class MasterNode:
             ])
 
         # Register this server as seed node
-        self._seed_node = self._planner.node_join(self._planner.all_chunks, 0, concurrent_uploads, master_node=True)
-        self._seed_node.name = 'MASTER'
-        self._seed_node.client = SimpleNamespace(
+        self.seed_node = self.swarm.node_join(self.swarm.all_chunks, 0, 1, master_node=True)
+        self.seed_node.name = 'MASTER'
+        self.seed_node.client = SimpleNamespace(
             dl_url=self._fileserver.base_url + '/chunk/{chunk}',
             send_queue=None)
 
@@ -280,15 +271,15 @@ class MasterNode:
         print("planner_loop starting...")
         while True:
             with suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(self._replan_trigger.wait(), timeout=2)
-            self._replan_trigger.clear()
+                await asyncio.wait_for(self.replan_trigger.wait(), timeout=2)
+            self.replan_trigger.clear()
 
             # Track seed file server upload performance
-            self._seed_node.update_transfer_speed(self._fileserver.upload_times)
+            self.seed_node.update_transfer_speed(self._fileserver.upload_times)
             self._fileserver.upload_times.clear()
 
-            for t in self._planner.plan_transfers():
-                self._status_func(log_info=f'Scheduling dl of {t.chunk} from {t.from_node.name} to '
+            for t in self.swarm.plan_transfers():
+                self.status_func(log_info=f'Scheduling dl of {t.chunk} from {t.from_node.name} to '
                                            f'{t.to_node.name}, timeout {t.timeout_secs}')
                 await t.to_node.client.send_queue.put({
                     'action': 'download',

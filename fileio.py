@@ -4,14 +4,13 @@ from chunker import FileChunk, HashFunc
 from aiohttp import web, ClientSession
 from typing import Tuple, Optional
 from contextlib import suppress
-import aiofiles, os, time, asyncio
+import aiofiles, os, time, asyncio, aiohttp
 
 class FileIO:
     '''
     Helper for reading and writing chunks from/to files + downloading / uploading them over network.
     Supports rate limiting and checks that file operations stay inside given base directory.
     '''
-
     basedir: Path
     dl_limiter: RateLimiter
     ul_limiter: RateLimiter
@@ -126,7 +125,7 @@ class FileIO:
                 await response.write_eof()
                 return response, (time.time() - start_t)
 
-        except aiohttp.DisconnectedError as e:
+        except asyncio.exceptions.CancelledError as e:
             # If client disconnected, predict how long upload would have taken
             try:
                 predicted_time = (time.time() - start_t) / (1-remaining/chunk.size)
