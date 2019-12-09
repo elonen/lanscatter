@@ -1,18 +1,21 @@
 from aiohttp import web, WSMsgType
 from typing import Callable, Iterable
-import ssl, aiofiles, socket
+import ssl, aiofiles, socket, time
 from chunker import FileChunk
 from fileio import FileIO
 
 
 class FileServer:
 
-    def __init__(self, status_func: Callable):
+    def __init__(self, status_func: Callable, upload_callback=None):
         self.filelist = set()          # List fo all FileChunks
         self.hash_to_chunk = {}        # Map hash -> FileChunk (NOT a bijection! Same chunk may be in several files.)
         self.base_url: str = '(server not running)'
         self.hostname = socket.gethostname()
+        self.upload_times = []              # List of how long each upload took (for tracking speed)
         self._status_func = status_func
+        self._upload_callback = upload_callback  # async def(finished=bool)
+        self.active_uploads = 0
 
     def add_chunks(self, chunks: Iterable[FileChunk]) -> None:
         '''
@@ -25,6 +28,14 @@ class FileServer:
     def clear_chunks(self) -> None:
         self.filelist.clear()
         self.hash_to_chunk.clear()
+
+    def change_mtime(self, filename: str, new_mtime: float):
+        new_list = [c for c in self.filelist]
+        for c in new_list:
+            if c.filename == filename:
+                c.file_mtime = new_mtime
+        self.clear_chunks()
+        self.add_chunks(new_list)
 
     def create_http_server(self, port, fileio: FileIO, https_cert=None, https_key=None, extra_routes=()):
         '''
@@ -48,10 +59,23 @@ class FileServer:
             '''
             self._status_func(log_info=f"[{request.remote}] GET {request.path_qs}")
             h = request.match_info.get('hash')
-            chunk = self.hash_to_chunk.get(h or '-')
-            if chunk is None:
-                raise web.HTTPNotFound(reson=f'Chunk not on this host: {h}')
-            return await fileio.upload_chunk(chunk, request)
+            self.active_uploads += -1
+            await self._upload_callback(finished=False)
+            try:
+                chunk = self.hash_to_chunk.get(h or '-')
+                if chunk is None:
+                    raise web.HTTPNotFound(reson=f'Chunk not on this host: {h}')
+                try:
+                    res, ul_time = await fileio.upload_chunk(chunk, request)
+                    if ul_time:
+                        self.upload_times.append(ul_time)
+                except Exception as e:
+                    print('hdl__get_chunk error ('+str(type(e))+'): '+str(e))
+                    raise e
+                return res
+            finally:
+                self.active_uploads -= -1
+                await self._upload_callback(finished=True)
 
         app = web.Application()
         app.add_routes([web.get('/chunk/{hash}', hdl__get_chunk)])

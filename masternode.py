@@ -1,10 +1,11 @@
 from aiohttp import web, WSMsgType
 from pathlib import Path
 from typing import Callable, Optional
-import asyncio, aiofiles, argparse, traceback
+import asyncio, aiofiles, argparse, traceback, html
 from chunker import monitor_folder_forever, chunks_to_dict, chunks_to_json
 from types import SimpleNamespace
 from contextlib import suppress
+from datetime import datetime
 from common import *
 
 import planner
@@ -21,8 +22,18 @@ class MasterNode:
     def __init__(self, status_func: Callable, chunk_size: int):
         self._chunk_size = chunk_size
         self._planner = planner.SwarmCoordinator()
-        self._fileserver = FileServer(status_func)
+        self._seed_node = None
         self._status_func = status_func
+        self._replan_trigger = asyncio.Event()
+
+        async def __on_upload(finished: bool):
+            if finished:
+                self._seed_node.set_active_transfers((), 0, self._fileserver.active_uploads)
+                self._seed_node.update_transfer_speed(self._fileserver.upload_times)
+                self._fileserver.upload_times.clear()
+
+        self._fileserver = FileServer(status_func, upload_callback=__on_upload)
+
 
     def __make_filelist_msg(self):
         return {'action': 'new_filelist', 'data': chunks_to_dict(self._fileserver.filelist or (), self._chunk_size)}
@@ -37,19 +48,29 @@ class MasterNode:
 
             # Update planner and send new list to clients
             self._planner.reset_chunks((c.hash for c in self._fileserver.filelist))
+            print(self._fileserver.filelist)
+            print('---')
+            print(self._planner.all_chunks)
+            print('====')
+
+            self._seed_node.add_chunks(self._planner.all_chunks, clear_first=True)
             fl_msg = self.__make_filelist_msg()
             for n in self._planner.nodes:
-                await n.client.send_queue.put(fl_msg)
+                if n != self._seed_node:
+                    await n.client.send_queue.put(fl_msg)
+            self._replan_trigger.set()
         else:
             self._status_func(log_info='New filelist identical to old one. No action.')
 
 
-    def run_master_server(self, base_dir: str, port=14433, https_cert=None, https_key=None, ul_limit: float = 10000):
+    def server_loop(self, base_dir: str,
+                    port=14433, https_cert=None, https_key=None,
+                    ul_limit: float = 10000, concurrent_uploads: int = 4):
 
         if not Path(base_dir).is_dir():
             raise NotADirectoryError(f'Path "{base_dir}" is not a directory. Cannot serve from it.')
 
-        async def __on_websocket_msg_from_client(
+        async def handle_client_msg(
                 address: str, send_queue: asyncio.Queue,
                 node: Optional[planner.Node], msg) -> Optional[planner.Node]:
             '''
@@ -61,11 +82,11 @@ class MasterNode:
             :param msg: Message from client in a dict
             :return: New Node handle if messages caused a swarm join, otherwise None
             '''
-            client_name = (node.client.nick if node else self._fileserver.hostname) + "@" + str(address)
-            self._status_func(log_info=f'Msg from {client_name}: {str(msg)}')
+            client_name = (node.name if node else self._fileserver.hostname)
+            self._status_func(log_info=f'[{address}] Msg from {client_name}: {str(msg)}')
 
             async def error(txt):
-                self._status_func(log_error=f'Sending error to client {client_name}: {txt}')
+                self._status_func(log_error=f'[{address}] Sending error to {client_name}: {txt}')
                 await send_queue.put({'action': 'error', 'orig_msg': msg, 'message': txt})
 
             async def ok(txt):
@@ -87,25 +108,25 @@ class MasterNode:
                     dl_url = msg.get('dl_url')
                     if not dl_url or 'http' not in dl_url:
                         return await error("'dl_url' argument missing or invalid.")
+                    if not '{chunk}' in dl_url:
+                        return await error("'dl_url' must contain placeholder '{chunks}'.")
 
                     if node:  # rejoin = destroy old and create new
                         node.destroy()
-                        self._status_func(log_info=f'Rejoining "{client_name}".')
+                        self._status_func(log_info=f'[{address}] Rejoining "{client_name}".')
 
                     node = self._planner.node_join(initial_chunks, dl_slots, dl_slots)
+                    node.name = msg.get('nick') or self._fileserver.hostname
                     node.client = SimpleNamespace(
                         dl_url=dl_url,
-                        nick=msg.get('nick') or self._fileserver.hostname,
                         send_queue=send_queue)
 
-                    self._status_func(log_info=f'Client "{client_name}" joined swarm as "{node.client.nick}".'
+                    self._status_func(log_info=f'[{address}] Client "{client_name}" joined swarm as "{node.name}".'
                                                f' URL: {node.client.dl_url}')
                     await ok('Joined swarm.')
                     await send_queue.put(self.__make_filelist_msg())
+                    self._replan_trigger.set()
                     return node
-                else:
-                    if not node:
-                        return await error("Join the swarm first.")
 
                 # ---------------------------------------------------
                 # Client's got (new) chunks
@@ -115,8 +136,12 @@ class MasterNode:
                         return await error("Must have list in arg 'chunks'")
                     if not node:
                         return await error("Join the swarm first.")
+
                     unknown_chunks = node.add_chunks(msg.get('chunks'), clear_first=(action == 'set_chunks'))
+
+                    self._replan_trigger.set()
                     await ok('Chunks updated')
+
                     if unknown_chunks:
                         self._status_func(log_info=f'Client "{client_name}" had unknown chunks: {str(unknown_chunks)}')
                         await send_queue.put({
@@ -128,27 +153,61 @@ class MasterNode:
                 # Client reports current downloads, uploads and speed
                 # ---------------------------------------------------
                 elif action == 'report_transfers':
+                    dl_count, ul_count = msg.get('dls'), msg.get('uls')
+                    busy_chunks = msg.get('busy')
+                    upload_times = msg.get('ul_times')
+                    if None in (dl_count, ul_count, busy_chunks, upload_times):
+                        return await error(f"Missing args.")
                     if not node:
                         return await error("Join the swarm first.")
-                    dl_count, ul_count = msg.get('downloads'), msg.get('uploads')
-                    incoming_chunks = msg.get('incoming_chunks')
-                    last_upload_secs = msg.get('last_upload_secs')
-                    if None in (dl_count, ul_count, incoming_chunks):
-                        return await error(f"Missing args.")
-                    node.set_active_transfers(incoming_chunks, dl_count, ul_count)
-                    node.update_transfer_speed(last_upload_secs)
+
+                    node.set_active_transfers(busy_chunks, dl_count, ul_count)
+                    node.update_transfer_speed(upload_times)
+
+                    if ul_count < node.max_concurrent_uls or dl_count < node.max_concurrent_dls:
+                        self._replan_trigger.set()
+
                     await ok('Transfer status updated')
 
+                elif action == 'error':
+                    self._status_func(log_info=f'Error msg from client ({client_name}): {str(msg)}')
 
                 elif action is None:
                     return await error("Missing parameter 'action")
                 else:
-                    return await error(f"Unknown 'action': {str(action)}")
+                    return await error(f"Unknown action '{str(action)}'")
 
             except Exception as e:
                 await error('Exception raised: '+str(e))
                 self._status_func(log_error=f'Error while handling client ({client_name}) message "{str(msg)}": \n'+
                                             traceback.format_exc(), popup=True)
+
+        async def http_handler__status(request):
+            '''
+            Show a HTML formatted status report.
+            '''
+            #self._status_func(log_info=f"[{request.remote}] GET {request.path_qs}")
+            colors = {1: 'black', 0.5: 'green', 0: 'lightgray'}
+            st = self._planner.get_status_table()
+            th = '<th colspan="{colspan}" style="text-align: left;">{txt}</th>'
+            res = '<html><head><meta http-equiv="refresh" content="3"></head><body>'\
+                  f"<h1>Swarm status</h1><p>{str(datetime.now().isoformat(' ', 'seconds'))}</p>"
+
+            if st['all_chunks']:
+                res += '<table><tr>' + th.format(txt='Node', colspan=1) + th.format(txt='Chunks', colspan=len(st["all_chunks"])) +\
+                       th.format(txt='↓', colspan=1) + th.format(txt='↑', colspan=1) +\
+                       th.format(txt='⧖', colspan=1) + '</tr>\n'
+                for n in st['nodes']:
+                    res += f'<tr><td>{html.escape(n["name"])}</td>'
+                    res += ''.join(['<td style="padding: 1px; background: {color}">&nbsp;</td>'.format(
+                        color=colors[c]) for c in n['chunks']])
+                    res += ''.join(f'<td>{v}</td>' for v in (int(n['dls']), int(n['uls']), '%.1f s'%n['avg_ul_time']))
+                    res += "</tr>\n"
+                res += '</table><p>↓ = active downloads, ↑ = active uploads, ⧖ = average upload time</p>\n'
+            else:
+                res += "(No chunks. Probably still hashing. Try again later.)"
+            res += '</body></html>'
+            return web.Response(text=res, content_type='text/html')
 
 
         async def http_handler__start_websocket(request):
@@ -160,7 +219,7 @@ class MasterNode:
             send_queue = asyncio.Queue()
             node = None
 
-            # Infinite async loop reading from send_queue and writing to websocket
+            # Read send_queue and pass them to websocket
             async def send_loop():
                 while not ws.closed:
                     with suppress(asyncio.TimeoutError):
@@ -175,11 +234,11 @@ class MasterNode:
             await send_queue.put(welcome)
 
             try:
-                # Infinite loop reading messages from client and handling them
+                # Read messages from websocket and handle them
                 async for msg in ws:
                     if msg.type == WSMsgType.TEXT:
                         try:
-                            new_node = await __on_websocket_msg_from_client(address, send_queue, node, msg.json())
+                            new_node = await handle_client_msg(address, send_queue, node, msg.json())
                             if new_node:
                                 node = new_node
                         except Exception as e:
@@ -188,9 +247,9 @@ class MasterNode:
                             await send_queue.put({'command': 'error', 'orig_msg': msg.data,
                                                   'message': 'Exception: ' + str(e)})
                     elif msg.type == WSMsgType.ERROR:
-                        self._status_func(log_error=f'Connection for client "{node.client.nick if node else address}" '
+                        self._status_func(log_error=f'Connection for client "{node.name if node else address}" '
                                                     'closed with err: %s' % ws.exception())
-                self._status_func(log_info=f'Connection closed from "{node.client.nick if node else address}"')
+                self._status_func(log_info=f'Connection closed from "{node.name if node else address}"')
             finally:
                 if node:
                     node.destroy()
@@ -200,10 +259,42 @@ class MasterNode:
 
         # Start serving chunks over HTTP and accepting client connections on websocket endpoint
         file_io = FileIO(Path(base_dir), 0, ul_limit)
-        return self._fileserver.create_http_server(
+        server = self._fileserver.create_http_server(
             port, file_io, https_cert, https_key,
-            extra_routes=[web.get('/ws', http_handler__start_websocket)])
+            extra_routes=[
+                web.get('/ws', http_handler__start_websocket),
+                web.get('/', http_handler__status)
+            ])
 
+        # Register this server as seed node
+        self._seed_node = self._planner.node_join(self._planner.all_chunks, 0, concurrent_uploads, master_node=True)
+        self._seed_node.name = 'MASTER'
+        self._seed_node.client = SimpleNamespace(
+            dl_url=self._fileserver.base_url + '/chunk/{chunk}',
+            send_queue=None)
+
+        return server
+
+
+    async def planner_loop(self):
+        print("planner_loop starting...")
+        while True:
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._replan_trigger.wait(), timeout=2)
+            self._replan_trigger.clear()
+
+            # Track seed file server upload performance
+            self._seed_node.update_transfer_speed(self._fileserver.upload_times)
+            self._fileserver.upload_times.clear()
+
+            for t in self._planner.plan_transfers():
+                self._status_func(log_info=f'Scheduling dl of {t.chunk} from {t.from_node.name} to '
+                                           f'{t.to_node.name}, timeout {t.timeout_secs}')
+                await t.to_node.client.send_queue.put({
+                    'action': 'download',
+                    'chunk': t.chunk,
+                    'timeout': t.timeout_secs,
+                    'url': t.from_node.client.dl_url.format(chunk=t.chunk)})
 
 # ---------------------------------------------------------------------------------------------------
 
@@ -214,7 +305,7 @@ async def run_master_server(base_dir: str, port: int,
 
     server = MasterNode(status_func=status_func, chunk_size=chunk_size)
 
-    async def dir_scanner():
+    async def dir_scanner_loop():
         def progress_func_adapter(cur_filename, file_progress, total_progress):
             status_func(progress=total_progress,
                         cur_status=f'Hashing "{cur_filename}" ({int(file_progress * 100 + 0.5)}% done)')
@@ -224,8 +315,9 @@ async def run_master_server(base_dir: str, port: int,
             await server.replace_filelist(new_chunks)
 
     await asyncio.gather(
-        dir_scanner(),
-        server.run_master_server(base_dir=base_dir, port=port, ul_limit=ul_limit, https_cert=https_cert, https_key=https_key))
+        dir_scanner_loop(),
+        server.planner_loop(),
+        server.server_loop(base_dir=base_dir, port=port, ul_limit=ul_limit, https_cert=https_cert, https_key=https_key))
 
 
 def main():

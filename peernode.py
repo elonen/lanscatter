@@ -1,8 +1,8 @@
-from typing import Callable
-from chunker import FileChunk, hash_dir, chunks_to_json, json_to_chunks
-from datetime import timedelta
-import asyncio, aiohttp, aiofiles, aiofiles.os
-import os, hashlib, random, traceback, io, time, argparse
+from typing import Callable, Iterable, Optional
+from chunker import FileChunk, ChunkId, json_to_chunks, chunks_to_json, dict_to_chunks, scan_dir
+import asyncio, aiohttp
+from aiohttp import web, WSMsgType
+import traceback, time, argparse, os
 from pathlib import Path
 from fileserver import FileServer
 from contextlib import suppress
@@ -23,303 +23,326 @@ class PeerNode:
                  port: int,  # TCP port for listening to peers
                  file_rescan_interval: float,  # How often to rescan sync directory (seconds)
                  dl_limit: float,  # Download limit, Mbits/s
-                 ul_limit: float):                      # Upload limit, Mbits/s
+                 ul_limit: float):  # Upload limit, Mbits/s
 
-        self._basedir: str = basedir
-        self._local_rescan_interval = file_rescan_interval
-        self._next_folder_rescan = datetime.utcnow()
+        self.local_rescan_interval = file_rescan_interval
+        self.earliest_periodical_rescan = time.time()
 
-        if not Path(base_dir).is_dir():
+        if not Path(basedir).is_dir():
             raise NotADirectoryError(f'Path "{basedir}" is not a directory. Cannot read/write files in it.')
-        self._file_io = FileIO(Path(basedir), dl_limit, ul_limit)
+        self.file_io = FileIO(Path(basedir), dl_limit, ul_limit)
 
-        self._port = port
-        self._server_url: str = server_url
-        self._status_func = status_func
+        self.port = port
+        self.server_url: str = server_url
+        self.status_func = status_func
 
-        self._local_chunks = []                     # Hashed file parts that exist here, locally
-        self._remote_chunks = []                    # Hashed file parts that exist on server (copy of filelist)
+        self.remote_filelist: Set[ChunkId] = set()                    # Hashed file parts that exist on server (copy of filelist)
 
-        self._chunk_size = None                      # Read from server
+        self.chunk_size = None                      # Read from server
 
-        self._peer_server = None                    # FileServer instance for serving chunks to peers
+        self.busy_chunks = set()
 
-        # Cached HTTP data from server
-        self._peers = CachedHttpObject(             # Map of hash -> URL (p2p data sources)
-                url=server_url+'/peers', status_func=status_func, name='peer list', cache_time=peer_list_cache_time)
-        self._filelist = CachedHttpObject(          # _remote_chunks as plain JSON table
-                url=server_url+'/filelist', status_func=status_func, name='filelist', cache_time=filelist_cache_time)
+        self.server_send_queue = asyncio.Queue()
+        self.full_rescan_trigger = asyncio.Event()
+
+        async def __on_upload(finished: bool):
+            if finished:
+                await self.send_transfer_report()
+        self.fileserver = FileServer(status_func=self.status_func, upload_callback=__on_upload)
 
 
-    async def _report_new_local_chunks_to_server(self, http_session):
+    async def send_transfer_report(self):
+        await self.server_send_queue.put({
+            'action': 'report_transfers',
+            'dls': len(self.busy_chunks),
+            'uls': self.fileserver.active_uploads,
+            'busy': list(self.busy_chunks),
+            'ul_times': list(self.fileserver.upload_times)
+        })
+        self.fileserver.upload_times.clear()
+
+
+    async def send_chunk_report_all(self):
+        await self.server_send_queue.put({
+            'action': 'set_chunks',
+            'chunks': list(self.fileserver.hash_to_chunk.keys())
+        })
+
+    async def send_chunk_report_new(self, new_chunks: Iterable[ChunkId]):
+        await self.server_send_queue.put({
+            'action': 'add_chunks',
+            'chunks': list(new_chunks)
+        })
+
+
+    async def do_local_file_fixups(self):
         '''
-        Add local peer server's hash download URLs to master's peer list.
+        Walk through local file list and:
+         - copy chunks from already downloaded files to missing ones if possible
+         - delete dangling extra files
+         - set modification time to the target time when file matches remote specs (to speed up rescans)
+         - set modification time to current time when file contents differ (=local file is incomplete)
         '''
-        my_url = self._peer_server.base_url()
-        # Find which local chunks server doesn't know about yet:
-        new_chunks = []
-        for c in self._local_chunks:
-            if (c.hash not in self._peers.data) or not any([u.startswith(my_url) for u in self._peers.data[c.hash]]):
-                new_chunks.append(c)
-        if new_chunks:
-            try:
-                data = [['ADD', c.hash, f'{my_url}/chunk/{c.hash}'] for c in new_chunks]
-                async with http_session.post(f'{self._server_url}/peers', json=data) as resp:
-                    if resp.status != 200:
-                        self._status_func(log_error=f'HTTP error POST {resp.status} on {url}.')
-                    else:
-                        # Update peer list while we are at it
-                        self._peers.ingest_data(data=await resp.json(), etag=(resp.headers.get('ETag') or '-'))
-                        self._status_func(log_info=f'Posted {len(new_chunks)} local chunk URLs to master server')
-            except Exception as e:
-                self._status_func(log_error=f'Warning: Failed to report new chunks to server: {str(e)}')
-
-
-    async def _fetch_chunk(self, c: FileChunk, http_session):
-        # Got it locally already? Reuse:
-        for lc in self._local_chunks:
-            if lc.hash == c.hash:
-                self._status_func(log_info=f'Reusing local copy, chunk {c.hash}')
-                async with aiofiles.open(Path(self._basedir)/c.filename, mode='rb') as f:
-                    await f.seek(lc.pos)
-                    buff = bytearray(lc.size)
-                    cnt = await f.readinto(buff)
-                    if cnt == c.size:
-                        return buff
-                    else:
-                        self._status_func(log_error=f'Failed to read chunk {str(c.hash)} locally from disk.')
-                        break
-        # Need to download
-        if not self._peers.data.get(c.hash):
-            self._status_func(log_error=f'No download URLs for chunk {str(c.hash)} of {c.filename}')
-            return None
-        # Try to download at most 5 times from random peers:
-        my_url = self._peer_server.base_url()
-        for attempt in range(5):
-            url = random.choice([u for u in self._peers.data.get(c.hash) if not u.startswith(my_url)])
-            self._status_func(log_info=f'Downloading chunk {str(c.hash)} from {url}')
-            try:
-                async with http_session.get(url) as resp:
-                    if resp.status != 200:  # some error
-                        self._status_func(log_error=f'HTTP error GET {resp.status} on {url}.')
-                    else:
-                        try:
-                            data, read = io.BytesIO(), b'-'
-                            h = hashlib.blake2b(digest_size=12)
-                            while read:
-                                limited_n = int(await self._dl_limiter.acquire(64*1024, 4*1024))
-                                read = await resp.content.read(limited_n)
-                                self._dl_limiter.unspend(limited_n - len(read))
-                                h.update(read)
-                                data.write(read)
-                            if h.hexdigest() == c.hash:
-                                return data.getbuffer()
-                            else:
-                                self._status_func(log_error=f'Checksum error verifying {c.hash} from {url}!')
-                        except Exception as e:
-                            self._status_func(log_error=f'Error parsing GET {url}: {str(e)}')
-            except aiohttp.client_exceptions.ClientConnectorError as e:
-                self._status_func(log_error=f'HTTP connection failed on {url}: {str(e)}')
-
-            # HTTP request failed? Report bad peer URL
-            try:
-                async with http_session.post(f'{self._server_url}/peers', json=[['DEL', c.hash, url]]) as resp:
-                    if resp.status != 200:
-                        self._status_func(log_error=f'HTTP error POST {resp.status} on {url}.')
-                    else:
-                        self._peers.ingest_data(data=await resp.json(), etag=(resp.headers.get('ETag') or '-'))
-            except Exception as e:
-                self._status_func(log_error=f'Warning: Failed to report bad peer: {str(e)}')
-
-        return None
-
-
-
-    async def sync_folder(self):
-        '''
-        Scan local folder, compare it to remote_chunks from server, and sync if not identical.
-        '''
-        if not self._chunk_size:
-            self._status_func(
-                log_info=f'Chunk size not known yet. Cannot sync_folder().',
-                cur_status='Waiting for filelist...')
-            return
-        if not self._remote_chunks:
-            self._status_func(
-                log_info=f'NOTE: no remote filelist - skipping sync for now.',
-                cur_status='Waiting for filelist...')
+        if not self.remote_filelist:
+            self.status_func(log_info=f"LOCAL: Remote filelist is empty or missing; will not delete local files.")
             return
 
-        # Scan/hash local sync dir
-        self._status_func(log_info='Scanning local folder...')
-        def hash_dir_progress_func(cur_filename, file_progress, total_progress):
-            self._status_func(progress=total_progress, cur_status=f'Hashing ({cur_filename} / {int(file_progress*100+0.5)}%)')
-        self._local_chunks = await hash_dir(self._basedir, chunk_size=self._chunk_size, old_chunks=self._remote_chunks, progress_func=hash_dir_progress_func)
-        self._status_func(progress=-1, cur_status=f'Local files hashed')
+        all_local_files = set([c.filename for c in self.fileserver.filelist])
+        all_remote_files = set([c.filename for c in self.remote_filelist])
 
-        # Start serving local chunks to peers
-        if self._peer_server:
-            self._peer_server.replace_filelist(self._local_chunks)
+        # Copy already downloaded chunks to missing files if possible
+        for missing_file in (all_remote_files - all_local_files):
+            for c in [c for c in self.remote_filelist if c.filename == missing_file]:
+                copy_from = self.fileserver.hash_to_chunk.get(c.hash)
+                if copy_from:
+                    self.status_func(log_info=f'LOCAL: Reusing {c.hash} from "{copy_from.filename}" to "{c.filename}".')
+                    await self.file_io.copy_chunk_locally(copy_from, c)
+                    self.fileserver.add_chunks([c])
 
-        async with aiohttp.ClientSession() as http_session:
-            await self._report_new_local_chunks_to_server(http_session)
 
-            # Do we need to sync?
-            if chunks_to_json(self._local_chunks, self._chunk_size) == chunks_to_json(self._remote_chunks, self._chunk_size):
-                self._status_func(progress=-1, cur_status='Up to date.')
+        # Delete dangling files and fix timestamps on complete / incomplete files
+        for fname in all_local_files:
+            if fname not in all_remote_files:
+                self.status_func(log_info=f'LOCAL: Deleting dangling file: "{fname}"')
+                await self.file_io.remove_file_and_paths(fname)
+                self.full_rescan_trigger.set()
             else:
-                await self._peers.refresh(http_session)
-                self._status_func(log_info=f'Downloading new files...', popup=True)
-                base_path = Path(self._basedir)
-                remote_files_by_name = {c.filename: c for c in self._remote_chunks}
-                local_files_by_name = {c.filename: c for c in self._local_chunks}
+                local_chunks = set([c.hash for c in self.fileserver.filelist if c.filename == fname])
+                remote_chunks = set([c.hash for c in self.remote_filelist if c.filename == fname])
+                missing_chunks = remote_chunks - local_chunks
 
-                def remove_dir_and_paths(p, uppermost_parent):
-                    os.remove(p)
-                    for d in p.parents:
-                        if d == uppermost_parent:
-                            break
-                        with suppress(OSError):
-                            d.rmdir()
+                local_size, local_mtime = await self.file_io.size_and_mtime(fname)
+                remote_mtime = next(iter((c.file_mtime for c in self.remote_filelist if c.filename == fname)))
 
-                # 1) Delete dangling and changed local files
-                removed = []
-                for fn, lc in local_files_by_name.items():
-                    local_path = base_path / Path(fn)   # path concatenation
-                    if base_path not in local_path.parents:
-                        self._status_func(log_error=f'SECURITY BUG: Local path pointing outside base dir?? ABORTING! "{fn}"', popup=True)
-                        return
-                    else:
-                        rc = remote_files_by_name.get(fn)
-                        if rc is None:
-                            self._status_func(log_info=f'SYNC: File not in remote dir. Deleting: "{fn}"')
-                            remove_dir_and_paths(local_path, base_path)
-                            removed.append(fn)
-                        else:
-                            if lc.hash != rc.hash:  # compare last chunks
-                                self._status_func(log_info=f'SYNC: File changed on remote. Deleting local: "{fn}"')
-                                remove_dir_and_paths(local_path, base_path)
-                                removed.append(fn)
-                            elif lc.file_mtime != rc.file_mtime:
-                                self._status_func(log_info=f'SYNC: Checksum matches but fixing mtime on: "{fn}"')
-                                os.utime(str(local_path.absolute()), (rc.file_mtime, rc.file_mtime))
-                for fn in removed:
-                    del(local_files_by_name[fn])
+                if missing_chunks and local_mtime == remote_mtime:
+                    self.status_func(log_info=f'LOCAL: File "{fname}" is missing chunks but mtime was'
+                                              f' set to target time. Resetting it to "now".')
+                    await self.file_io.change_mtime(fname, time.time())
+                    self.fileserver.change_mtime(fname, remote_mtime)
+                elif local_mtime != remote_mtime:
+                    self.status_func(log_info=f'LOCAL: File complete, setting mtime: "{fname}"')
+                    await self.file_io.change_mtime(fname, remote_mtime)
+                    self.fileserver.change_mtime(fname, remote_mtime)
 
-                # 2) Download missing files
-                missing_files = [c for c in remote_files_by_name.values() if c.filename not in local_files_by_name]
-                download_total_bytes = sum([c.file_size for c in missing_files])
-                remaining_bytes = download_total_bytes
-                megabytes_per_sec = 0.0
-                errors = False
-                for rc in missing_files:
-                    fn = rc.filename
-                    remaining_before_file_dl = remaining_bytes
+        if chunks_to_json(self.remote_filelist, self.chunk_size) == \
+           chunks_to_json(self.fileserver.filelist, self.chunk_size):
+            self.status_func(log_info='Up to date.', cur_status='Up to date.', progress=-1)
 
-                    local_path = base_path / Path(fn)
-                    if base_path not in local_path.parents:
-                        self._status_func(log_error=f'SECURITY ERROR: Remote path pointing outside base dir?? Skip! "{fn}"', popup=True)
-                    else:
-                        self._status_func(log_info=f'SYNC: Ready to download "{fn}"')
-                        await self._peers.refresh(http_session)
-                        abs_path = str(local_path.absolute())
-                        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-                        async with aiofiles.open(abs_path, 'wb') as f:
-                            i = 0
-                            file_chunks = [c for c in self._remote_chunks if c.filename == fn]
-                            for c in file_chunks:
-                                i += 1
-                                start_time = time.perf_counter()
-                                self._status_func(
-                                    progress=1.0 - float(remaining_bytes) / download_total_bytes,
-                                    cur_status=f'Downloading {round(megabytes_per_sec,1)} MB/s, "{fn}" chunk {i}/{len(file_chunks)}')
-                                data = await self._fetch_chunk(c, http_session)
-                                self._local_chunks.append(c)
-                                end_time = time.perf_counter()
-                                megabytes_per_sec = (c.size/1024/1024) / (end_time-start_time)
-                                if data:
-                                    await f.write(data)
-                                    remaining_bytes -= c.size
-                                else:
-                                    self._status_func(log_error=f'SYNC: Failed to get file: {fn}', cur_status='Sync failed.')
-                                    break
-
-                        self._local_chunks = sorted(self._local_chunks, key=lambda c: c.filename + f'{c.pos:016}')
-
-                        # Set correct modification time if file is now complete
-                        st = await aiofiles.os.stat(abs_path)
-                        if st.st_size == rc.file_size:
-                            os.utime(abs_path, (rc.file_mtime, rc.file_mtime))
-                            self._peer_server.replace_filelist(self._local_chunks)
-                            await self._report_new_local_chunks_to_server(http_session)
-                        else:
-                            # Otherwise delete the incomplete file
-                            self._local_chunks = [c for c in self._local_chunks if c.filename != fn]
-                            self._status_func(log_info=f'Deleting incompletely downloaded file: {fn}')
-                            os.remove(abs_path)
-                            errors = True
-
-                    # Recalc progress (in case some chunks failed to download)
-                    remaining_bytes = remaining_before_file_dl - rc.file_size
-                    self._status_func(progress=1.0-float(remaining_bytes)/download_total_bytes, cur_status=f'Syncing...')
-
-                if errors:
-                    self._status_func(cur_status=f'Sync incomplete. Trying again in a bit.')
-                else:
-                    self._status_func(progress=-1, cur_status=f'Sync done.')
-
-
-    async def run_syncer(self):
+    async def download_task(self, chunk_hash, url, http_session, timeout):
         '''
-        Infinite task that periodically rescans local folder and resyncs from server when necessary
+        Async task to download chunk with given hash from given URL and writing it to relevant files.
         '''
-        self._next_folder_rescan = datetime.utcnow()
-        async def resync_loop():
-            self._status_func(log_info=f'Resync loop starting.')
+        relevant_chunks = set([x for x in self.remote_filelist if x.hash == chunk_hash])
+        if not relevant_chunks:
+            raise IOError(f'Bad download command from master, or old filelist? Chunk {chunk_hash} is unknown.')
 
-            async with aiohttp.ClientSession() as http_session:
-                while True:
-                    # Get new filelist?
-                    if await self._filelist.refresh(http_session):
-                        self._remote_chunks, self._chunk_size = json_to_chunks(json.dumps(self._filelist.data))
-                        self._next_folder_rescan = datetime.utcnow()
-                        self._peers_expires = datetime.utcnow()
+        already_got = relevant_chunks.intersection(self.fileserver.filelist)
+        missing = relevant_chunks - already_got
+        if not missing or chunk_hash in self.busy_chunks:
+            return
 
-                    # Rescan / resync?
-                    if datetime.utcnow() >= self._next_folder_rescan and self._chunk_size:
-                        await self.sync_folder()
-                        self._next_folder_rescan = datetime.utcnow() + timedelta(seconds=self._local_rescan_interval)
+        try:
+            # No local chunks with given hash -> download it to one of them, ...
+            if not already_got:
+                assert(url)
+                self.busy_chunks.add(chunk_hash)
+                await self.send_transfer_report()
+                target = next(iter(missing))
+                self.status_func(log_info=f'Downloading from: {url}')
+                progr = len(self.fileserver.filelist) / (len(self.remote_filelist) or 1)
+                self.status_func(cur_status=f'Downloading chunks...', progress=progr)
+                await asyncio.wait_for(
+                    self.file_io.download_chunk(target, url, http_session),
+                    timeout=timeout)
+                already_got.add(target)
+                missing.discard(target)
+                self.fileserver.add_chunks([target])
+                await self.send_chunk_report_new([chunk_hash])
 
-                    await asyncio.sleep(1)
+            # ...and then copy existing chunk with given hash to all other files
+            copy_from = next(iter(already_got))
+            for copy_to in missing:
+                self.status_func(log_info=f'Reusing {chunk_hash} to local {copy_to.filename}.')
+                await self.file_io.copy_chunk_locally(copy_from, copy_to)
+                self.fileserver.add_chunks([copy_to])
 
-        # Serve chunks to peers over HTTP
-        async def peer_server():
-            self._peer_server = FileServer(self._basedir, status_func=self._status_func)
-            await self._peer_server.run_server(port=self._port, serve_filelist=False, ul_limit=self._ul_limit)
+            # Rescan when it looks like we've got everything
+            if len(self.fileserver.filelist) == len(self.remote_filelist):
+                self.status_func(log_info=f'Probably got everything. Rescanning to make sure...')
+                self.full_rescan_trigger.set()
 
-        # Run all
+        except asyncio.TimeoutError:
+            self.status_func(log_info=f'Download from {url} took over timeout ({timeout}). Aborted.')
+
+        except IOError as e:
+            self.status_func(log_error=f'Download from {url} failed: {str(e)}')
+
+        except Exception as e:
+            self.status_func(log_error=f'Exception in download_task: \n' +
+                                       traceback.format_exc(), popup=True)
+            raise e
+
+        finally:
+            self.busy_chunks.discard(chunk_hash)
+            await self.send_transfer_report()
+
+
+    async def handle_server_msg(self, msg, http_session):
+        # self.status_func(log_info=f'Message from server: {str(msg)}')
+
+        async def error(txt):
+            self.status_func(log_error=f'Error handling server message: {txt}, orig msg="{str(msg)}"')
+            await self.server_send_queue.put({'action': 'error', 'orig_msg': msg, 'message': txt})
+
+        try:
+            action = msg.get('action')
+
+            if action == 'download':
+                chunk, url, timeout = msg.get('chunk'), msg.get('url'), msg.get('timeout')
+                if None in (chunk, url, timeout):
+                    return error('Bad download command from server')
+                asyncio.create_task(self.download_task(chunk, url, http_session, timeout))
+
+            elif action == 'rehash':
+                self.status_func(log_info=f'Server requested rescan: "{msg.get("message")}"')
+                self.full_rescan_trigger.set()
+
+            elif action in ('new_filelist', 'initial_filelist'):
+                data = msg.get('data')
+                if not data or None in (data.get('chunks'), data.get('chunk_size')):
+                    return error(f'Bad args for "{action}"')
+
+                new_filelist, new_chunk_size = dict_to_chunks(data)
+                if not self.chunk_size or chunks_to_json(self.remote_filelist, self.chunk_size) != \
+                        chunks_to_json(new_filelist, new_chunk_size):
+                    self.chunk_size = new_chunk_size
+                    self.full_rescan_trigger.set()
+                    self.remote_filelist = set(new_filelist)
+
+            elif action == 'error':
+                self.status_func(log_error='Error from server:' + str(json.dumps(msg, indent=2)))
+            elif action == 'ok':
+                pass
+            elif action is None:
+                return await error("Missing parameter 'action")
+            else:
+                return await error(f"Unknown action '{str(action)}'")
+
+        except Exception as e:
+            #await error('Exception raised: ' + str(e))
+            self.status_func(log_error=f'Error while handling server message "{str(msg)}": \n' +
+                                       traceback.format_exc(), popup=True)
+
+
+    async def server_connection_loop(self):
+
+        # Connect server
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(self.server_url) as ws:
+
+                # Read send_queue and pass them to websocket
+                async def send_loop():
+                    while not ws.closed:
+                        with suppress(asyncio.TimeoutError):
+                            msg = await asyncio.wait_for(self.server_send_queue.get(), timeout=1.0)
+                            if msg and not ws.closed:
+                                await ws.send_json(msg)
+                send_task = asyncio.create_task(send_loop())
+
+                # Read messages from websocket and handle them
+                async for msg in ws:
+                    if msg.type == WSMsgType.TEXT:
+                        try:
+                            await self.handle_server_msg(msg.json(), session)
+                        except Exception as e:
+                            self.status_func(log_error=f'Error ("{str(e)}") handling server msg: {msg.data}'
+                                                        'traceback: ' + traceback.format_exc())
+                            await self.server_send_queue.put({'command': 'error', 'orig_msg': msg.data,
+                                                               'message': 'Exception: ' + str(e)})
+                    elif msg.type == WSMsgType.ERROR:
+                        self.status_func(
+                            log_error=f'Connection to server closed with error: %s' % ws.exception())
+
+                self.status_func(log_info=f'Connection to server closed.')
+                send_task.cancel()
+
+
+    async def file_rescan_loop(self):
+        self.status_func(log_info=f'File scanner loop starting.')
+
+        def __hash_dir_progress_func(cur_filename, file_progress, total_progress):
+            self.status_func(progress=total_progress, cur_status=f'Hashing ({cur_filename} / {int(file_progress*100+0.5)}%)')
+
+        local_chunks = None
+
+        # Wait until server has told us chunk size (cannot chunk files without it)
+        while not self.chunk_size:
+            await asyncio.sleep(1)
+
+        while True:
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self.full_rescan_trigger.wait(), timeout=2)
+
+            # TODO: process a per-file queue to scan files when fully downloaded
+
+            # Time for a periodical rescan after sync is complete?
+            full_periodical_now = len(self.fileserver.filelist) == len(self.remote_filelist) and \
+                                  time.time() >= self.earliest_periodical_rescan
+
+            if self.full_rescan_trigger.is_set() or full_periodical_now:
+                self.earliest_periodical_rescan = time.time() + self.local_rescan_interval
+                self.full_rescan_trigger.clear()
+
+                self.status_func(log_info='Rescanning local files.')
+                new_local_chunks = await scan_dir(
+                    str(self.file_io.basedir), chunk_size=self.chunk_size,
+                    old_chunks=local_chunks or (), progress_func=__hash_dir_progress_func)
+                self.status_func(log_info='Rescan finished.')
+
+                different_from_remote = chunks_to_json(self.remote_filelist, self.chunk_size) != \
+                                        chunks_to_json(new_local_chunks, self.chunk_size)
+
+                if new_local_chunks is not local_chunks or different_from_remote:
+                    self.fileserver.clear_chunks()
+                    self.fileserver.add_chunks(new_local_chunks)
+                    await self.do_local_file_fixups()
+                    if local_chunks is None:
+                        await self.server_send_queue.put({
+                            'action': 'join_swarm',
+                            'chunks': [c.hash for c in new_local_chunks],
+                            'dl_url': self.fileserver.base_url + '/chunk/{chunk}',
+                            'nick': self.fileserver.hostname,
+                            'concurrent_transfers': 2  # TODO: make this a command line arg
+                        })
+                    else:
+                        await self.send_chunk_report_all()
+                    local_chunks = new_local_chunks
+
+    async def run(self):
+        '''
+        Run all async loop until one of them exits.
+        '''
         try:
             with suppress(asyncio.CancelledError, GeneratorExit):
-                await asyncio.gather(resync_loop(), peer_server())
-        except:
-            self._status_func(log_error='FILECLIENT error:\n'+traceback.format_exc(), popup=True)
-        self._status_func(log_info='fileclient run_syncer() exiting.')
+                await asyncio.gather(
+                    self.fileserver.create_http_server(port=self.port, fileio=self.file_io),
+                    self.file_rescan_loop(),
+                    self.server_connection_loop())
+        except Exception as e:
+            self.status_func(log_error='PeerNode error:\n' + traceback.format_exc(), popup=True)
+        self.status_func(log_info='PeerNode run_forever() exiting.')
 
+# --------------------------------------------------------------------------------------------------------
 
 async def run_file_client(base_dir: str, server_url: str, port: int, status_func=None,
-                          cache_interval: float = 45, rescan_interval: float = 60,
-                          dl_limit: float = 10000, ul_limit: float = 10000):
-    client = PeerNode(
-        basedir=base_dir, server_url=server_url, status_func=status_func, port=port,
-        filelist_cache_time=cache_interval, peer_list_cache_time=cache_interval, file_rescan_interval=rescan_interval,
-        dl_limit=dl_limit, ul_limit=ul_limit)
-    return await client.run_syncer()
-
+                          rescan_interval: float = 60, dl_limit: float = 10000, ul_limit: float = 10000):
+    await PeerNode(basedir=base_dir, server_url=server_url, status_func=status_func, port=port,
+             file_rescan_interval=rescan_interval, dl_limit=dl_limit, ul_limit=ul_limit).run()
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('dir', help='Sync directory')
-    parser.add_argument('--url', default='http://localhost:14433', help='Master server URL')
+    parser.add_argument('--url', default='ws://localhost:14433/ws', help='Master server URL')
     parser.add_argument('-p', '--port', dest='port', type=int, default=14435, help='HTTP(s) port for P2P transfers')
     parser.add_argument('--rescan-interval', dest='rescan_interval', type=float, default=60, help='How often to rescan files')
     parser.add_argument('--dl-rate', dest='dl_limit', type=float, default=10000, help='Rate limit downloads, Mb/s')
@@ -330,7 +353,7 @@ def main():
     status_func = json_status_func if args.json else human_cli_status_func
     with suppress(KeyboardInterrupt):
         asyncio.run(run_file_client(base_dir=args.dir, server_url=args.url, port=args.port,
-                                    cache_interval=args.cache_time, rescan_interval=args.rescan_interval,
+                                    rescan_interval=args.rescan_interval,
                                     dl_limit=args.dl_limit, ul_limit=args.ul_limit,
                                     status_func=status_func))
 

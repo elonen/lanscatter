@@ -5,6 +5,8 @@ import aiofiles, aiofiles.os, io
 # Tools for scanning files in a directory and splitting them into hashed chunks.
 # FileServer and FileClient both use this for maintaining and syncing their state.
 
+ChunkId = str
+
 
 class FileChunk:
     filename: str       # path + filename
@@ -12,7 +14,7 @@ class FileChunk:
     size: int           # chunk size in bytes
     file_size: int      # size of complete file in bytes
     file_mtime: int     # last modified (unix timestamp)
-    hash: str           # Hex checksum of data contents (blake2, digest_size=12)
+    hash: ChunkId       # Hex checksum of data contents (blake2, digest_size=12)
 
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)
@@ -24,8 +26,24 @@ class FileChunk:
         return self.__repr__() == other.__repr__()
 
 
-async def _hash_file(basedir: str, relpath: str, chunk_size: int,
-                     file_progress_func=None) -> List[FileChunk]:
+# Replaceable hash function, currently implemented as blake2b
+class HashFunc:
+    def __init__(self):
+        self.h = hashlib.blake2b(digest_size=12)
+
+    def update(self, data):
+        self.h.update(data)
+
+    async def update_async(self, data):
+        # TODO: make this run in a separate thread or process pool for better concurrency with file/net IO
+        self.h.update(data)
+
+    def result(self) -> ChunkId:
+        return self.h.hexdigest()
+
+
+async def hash_file(basedir: str, relpath: str, chunk_size: int,
+                    file_progress_func=None) -> List[FileChunk]:
     '''
     Split given file into chunks and hash them
     :param: basedir: Base directory to search for files
@@ -42,13 +60,13 @@ async def _hash_file(basedir: str, relpath: str, chunk_size: int,
         file_progress_func(relpath, 0, 0, st.st_size)
 
     async with aiofiles.open(path, 'rb') as f:
-        while pos < st.st_size:
+        while True:
             assert (pos <= st.st_size)
             sz = min((st.st_size-pos), chunk_size)
 
             remaining = sz
             buff = bytearray(64*1024)
-            h = hashlib.blake2b(digest_size=12)
+            h = HashFunc()
             read = -1
             while read:
                 if remaining < len(buff):
@@ -63,20 +81,24 @@ async def _hash_file(basedir: str, relpath: str, chunk_size: int,
                     size=sz,
                     file_size=st.st_size,
                     file_mtime=int(st.st_mtime+0.5),
-                    hash=h.hexdigest()))
+                    hash=h.result()))
             pos += sz
             if file_progress_func:
                 file_progress_func(relpath, sz, pos, st.st_size)
+            if pos >= st.st_size:
+                break
 
     return res
 
 
-async def hash_dir(basedir: str, chunk_size: int, old_chunks=None, progress_func=None) -> List[FileChunk]:
+async def scan_dir(basedir: str, chunk_size: int, old_chunks=(), progress_func=None) -> List[FileChunk]:
     '''
-    Scan given directory and generate a list of FileChunks of its contents.
+    Scan given directory and generate a list of FileChunks of its contents. If old_chunks is provided,
+    assumes contents haven't changed if mtime and size are identical.
+
     :param basedir: Folders to scan
     :param progress_func: Progress report callback - func(cur_filename, file_progress, total_progress)
-    :return:
+    :return: New list of FileChunks, or old_chunks if no changes are detected
     '''
     fnames = []
     for root, d_names, f_names in os.walk(basedir, topdown=False, onerror=None, followlinks=False):
@@ -110,7 +132,7 @@ async def hash_dir(basedir: str, chunk_size: int, old_chunks=None, progress_func
         total_remaining -= just_read
         if progress_func:
             perc = float(pos)/file_size if file_size>0 else 1.0
-            progress_func(path, total_progress=1-float(total_remaining)/total_size, file_progress=perc)
+            progress_func(path, total_progress=1-float(total_remaining)/(total_size or 1), file_progress=perc)
 
     # Hash files as needed
     res = []
@@ -119,7 +141,7 @@ async def hash_dir(basedir: str, chunk_size: int, old_chunks=None, progress_func
             res.extend([c for c in old_chunks if c.filename == fn])
             total_remaining -= res[-1].file_size
         else:
-            res.extend(await _hash_file(basedir, fn, chunk_size, file_progress_func=file_progress))
+            res.extend(await hash_file(basedir, fn, chunk_size, file_progress_func=file_progress))
 
     # Sort results by filename and then by chunk position
     return sorted(res, key=lambda c: c.filename+f'{c.pos:016}')
@@ -138,7 +160,7 @@ async def monitor_folder_forever(basedir: str, update_interval: float, progress_
     '''
     chunks = []
     while True:
-        new_chunks = await hash_dir(basedir, chunk_size=chunk_size, old_chunks=chunks, progress_func=progress_func)
+        new_chunks = await scan_dir(basedir, chunk_size=chunk_size, old_chunks=chunks, progress_func=progress_func)
         if not (new_chunks is chunks):
             chunks = new_chunks
             yield chunks
@@ -153,8 +175,10 @@ def chunks_to_dict(chunks, chunk_size):
 def chunks_to_json(chunks, chunk_size):
     return json.dumps(chunks_to_dict(chunks, chunk_size), indent=2)
 
-def json_to_chunks(json_str):
-    data = json.loads(json_str)
+def dict_to_chunks(data):
     chunk_size = data['chunk_size']
     chunks = [FileChunk(**d) for d in data['chunks']]
     return chunks, chunk_size
+
+def json_to_chunks(json_str):
+    return dict_to_chunks(json.loads(json_str))
