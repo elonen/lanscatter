@@ -3,17 +3,13 @@ from pathlib import Path
 from typing import Callable, Optional
 import asyncio, aiofiles, argparse, traceback, html
 from chunker import monitor_folder_forever, chunks_to_dict, chunks_to_json
+from common import make_human_cli_status_func, json_status_func
 from types import SimpleNamespace
 from contextlib import suppress
-from common import *
-
+from datetime import datetime
 import planner
 from fileio import FileIO
 from fileserver import FileServer
-
-# HTTP file server that continuously auto-scans given directory,
-# serves file chunks to clients, and maintains a list of P2P URLs so network load get distributed
-# like a centrally controlled bittorrent.
 
 
 class MasterNode:
@@ -25,28 +21,28 @@ class MasterNode:
         self.status_func = status_func
         self.replan_trigger = asyncio.Event()
 
-        async def __on_upload_callback(finished: bool):
-            if finished:
-                self.seed_node.set_active_transfers((), 0, self._fileserver.active_uploads)
-                self.seed_node.update_transfer_speed(self._fileserver.upload_times)
-                self._fileserver.upload_times.clear()
+        async def __on_upload_finished():
+            # Let planner know how many free upload slots masternode's file server has
+            self.seed_node.set_active_transfers((), 0, self.fileserver.active_uploads)
+            self.seed_node.update_transfer_speed(self.fileserver.upload_times)
+            self.fileserver.upload_times.clear()
 
-        self._fileserver = FileServer(status_func, upload_callback=__on_upload_callback)
+        self.fileserver = FileServer(status_func, upload_finished_func=__on_upload_finished)
 
 
     def __make_filelist_msg(self):
-        return {'action': 'new_filelist', 'data': chunks_to_dict(self._fileserver.filelist or (), self.chunk_size)}
+        return {'action': 'new_filelist', 'data': chunks_to_dict(self.fileserver.filelist or (), self.chunk_size)}
 
     async def replace_filelist(self, new_filelist):
-        old = chunks_to_json(self._fileserver.filelist, self.chunk_size)
+        old = chunks_to_json(self.fileserver.filelist, self.chunk_size)
         new = chunks_to_json(new_filelist, self.chunk_size)
         if old != new:
             self.status_func(log_info='Filelist changed. Updating planner and notifying clients.')
-            self._fileserver.clear_chunks()
-            self._fileserver.add_chunks(new_filelist)
+            self.fileserver.clear_chunks()
+            self.fileserver.add_chunks(new_filelist)
 
             # Update planner and send new list to clients
-            self.swarm.reset_chunks((c.hash for c in self._fileserver.filelist))
+            self.swarm.reset_chunks((c.hash for c in self.fileserver.filelist))
             self.seed_node.add_chunks(self.swarm.all_chunks, clear_first=True)
             fl_msg = self.__make_filelist_msg()
             for n in self.swarm.nodes:
@@ -76,8 +72,8 @@ class MasterNode:
             :param msg: Message from client in a dict
             :return: New Node handle if messages caused a swarm join, otherwise None
             '''
-            client_name = (node.name if node else self._fileserver.hostname)
-            self.status_func(log_info=f'[{address}] Msg from {client_name}: {str(msg)}')
+            client_name = (node.name if node else self.fileserver.hostname)
+            self.status_func(log_debug=f'[{address}] Msg from {client_name}: {str(msg)}')
 
             async def error(txt):
                 self.status_func(log_error=f'[{address}] Sending error to {client_name}: {txt}')
@@ -110,7 +106,7 @@ class MasterNode:
                         self.status_func(log_info=f'[{address}] Rejoining "{client_name}".')
 
                     node = self.swarm.node_join(initial_chunks, dl_slots, dl_slots)
-                    node.name = msg.get('nick') or self._fileserver.hostname
+                    node.name = msg.get('nick') or self.fileserver.hostname
                     node.client = SimpleNamespace(
                         dl_url=dl_url,
                         send_queue=send_queue)
@@ -177,7 +173,7 @@ class MasterNode:
             '''
             Show a HTML formatted status report.
             '''
-            #self._status_func(log_info=f"[{request.remote}] GET {request.path_qs}")
+            self.status_func(log_debug=f"[{request.remote}] GET {request.path_qs}")
             colors = {1: 'black', 0.5: 'green', 0: 'lightgray'}
             st = self.swarm.get_status_table()
             th = '<th colspan="{colspan}" style="text-align: left;">{txt}</th>'
@@ -250,7 +246,7 @@ class MasterNode:
 
         # Start serving chunks over HTTP and accepting client connections on websocket endpoint
         file_io = FileIO(Path(base_dir), 0, ul_limit)
-        server = self._fileserver.create_http_server(
+        server = self.fileserver.create_http_server(
             port, file_io, https_cert, https_key,
             extra_routes=[
                 web.get('/ws', http_handler__start_websocket),
@@ -258,10 +254,10 @@ class MasterNode:
             ])
 
         # Register this server as seed node
-        self.seed_node = self.swarm.node_join(self.swarm.all_chunks, 0, 1, master_node=True)
+        self.seed_node = self.swarm.node_join(self.swarm.all_chunks, 0, concurrent_uploads, master_node=True)
         self.seed_node.name = 'MASTER'
         self.seed_node.client = SimpleNamespace(
-            dl_url=self._fileserver.base_url + '/chunk/{chunk}',
+            dl_url=self.fileserver.base_url + '/chunk/{chunk}',
             send_queue=None)
 
         return server
@@ -275,11 +271,11 @@ class MasterNode:
             self.replan_trigger.clear()
 
             # Track seed file server upload performance
-            self.seed_node.update_transfer_speed(self._fileserver.upload_times)
-            self._fileserver.upload_times.clear()
+            self.seed_node.update_transfer_speed(self.fileserver.upload_times)
+            self.fileserver.upload_times.clear()
 
             for t in self.swarm.plan_transfers():
-                self.status_func(log_info=f'Scheduling dl of {t.chunk} from {t.from_node.name} to '
+                self.status_func(log_debug=f'Scheduling dl of {t.chunk} from {t.from_node.name} to '
                                            f'{t.to_node.name}, timeout {t.timeout_secs}')
                 await t.to_node.client.send_queue.put({
                     'action': 'download',
@@ -291,7 +287,7 @@ class MasterNode:
 
 async def run_master_server(base_dir: str, port: int,
                             dir_scan_interval: float = 20, status_func=None, ul_limit: float = 10000,
-                            chunk_size=64*1024*1024,
+                            concurrent_uploads: int = 4, chunk_size=64*1024*1024,
                             https_cert=None, https_key=None):
 
     server = MasterNode(status_func=status_func, chunk_size=chunk_size)
@@ -308,7 +304,8 @@ async def run_master_server(base_dir: str, port: int,
     await asyncio.gather(
         dir_scanner_loop(),
         server.planner_loop(),
-        server.server_loop(base_dir=base_dir, port=port, ul_limit=ul_limit, https_cert=https_cert, https_key=https_key))
+        server.server_loop(base_dir=base_dir, port=port, ul_limit=ul_limit, concurrent_uploads=concurrent_uploads,
+                           https_cert=https_cert, https_key=https_key))
 
 
 def main():
@@ -316,15 +313,18 @@ def main():
     parser.add_argument('dir', help='Directory to serve files from')
     parser.add_argument('-p', '--port', dest='port', type=int, default=14433, help='HTTP(s) server port')
     parser.add_argument('--ul-rate', dest='ul_limit', type=float, default=10000, help='Rate limit uploads, Mb/s')
+    parser.add_argument('-c', '--concurrent-transfers', dest='ct', type=int, default=2, help='Max concurrent uploads')
     parser.add_argument('--chunksize', dest='chunksize', type=int, default=64*1024*1024, help='Chunk size for splitting files (in bytes)')
     parser.add_argument('--sslcert', type=str, default=None, help='SSL certificate file for HTTPS (optional)')
     parser.add_argument('--sslkey', type=str, default=None, help='SSL key file for HTTPS (optional)')
     parser.add_argument('--json', dest='json', action='store_true', default=False, help='Show status as JSON (for GUI usage)')
+    parser.add_argument('-d', '--debug', dest='debug', action='store_true', default=False,
+                        help='Show debug level log messages (no effect if --json is specified')
     args = parser.parse_args()
-    status_func = json_status_func if args.json else human_cli_status_func
+    status_func = json_status_func if args.json else make_human_cli_status_func(log_level_debug=args.debug)
     with suppress(KeyboardInterrupt):
         asyncio.run(run_master_server(
-            base_dir=args.dir, port=args.port, ul_limit=args.ul_limit,
+            base_dir=args.dir, port=args.port, ul_limit=args.ul_limit, concurrent_uploads=args.ct,
             https_cert=args.sslcert, https_key=args.sslkey,
             chunk_size=args.chunksize, status_func=status_func))
 

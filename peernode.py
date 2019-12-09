@@ -1,12 +1,12 @@
 from typing import Callable
 from chunker import ChunkId, chunks_to_json, dict_to_chunks, scan_dir
+from common import make_human_cli_status_func, json_status_func
 import asyncio, aiohttp
 from aiohttp import web, WSMsgType
 import traceback, time, argparse, os
 from pathlib import Path
 from fileserver import FileServer
 from contextlib import suppress
-from common import *
 from fileio import FileIO
 
 # Client that keeps given directory synced with a master server,
@@ -24,22 +24,22 @@ class PeerNode:
                  ul_limit: float):  # Upload limit, Mbits/s
 
         self.local_rescan_interval = file_rescan_interval
-        self.earliest_periodical_rescan = time.time()
+        self.next_periodical_rescan = time.time()
         self.file_io = FileIO(Path(basedir), dl_limit, ul_limit)
         self.status_func = status_func
 
-        self.remote_filelist: Set[ChunkId] = set()                    # Hashed file parts that exist on server (copy of filelist)
-
+        self.remote_filelist: Set[ChunkId] = set()  # Hashed file parts that exist on server (copy of filelist)
         self.chunk_size = None                      # Read from server
         self.busy_chunks = set()
 
         self.server_send_queue = asyncio.Queue()
         self.full_rescan_trigger = asyncio.Event()
+        self.exit_trigger = asyncio.Event()
 
-        async def on_upload_callback(finished: bool):
-            if finished:
-                await self.send_transfer_report()
-        self.fileserver = FileServer(status_func=self.status_func, upload_callback=on_upload_callback)
+        async def __on_upload_finished():
+            await self.send_transfer_report()  # Let server know how many free upload slots peer node has
+
+        self.fileserver = FileServer(status_func=self.status_func, upload_finished_func=__on_upload_finished)
 
 
     async def send_transfer_report(self):
@@ -53,9 +53,9 @@ class PeerNode:
         self.fileserver.upload_times.clear()
 
 
-    async def do_local_file_fixups(self):
+    async def local_file_fixups(self):
         '''
-        Walk through local file list and:
+        Compare local and remote filelists and:
          - copy chunks from already downloaded files to missing ones if possible
          - delete dangling extra files
          - set modification time to the target time when file matches remote specs (to speed up rescans)
@@ -67,6 +67,9 @@ class PeerNode:
 
         all_local_files = set([c.filename for c in self.fileserver.filelist])
         all_remote_files = set([c.filename for c in self.remote_filelist])
+
+        # TODO: Bugfix: this should consider all missing filechunks, not just completely missing files
+        # TODO: Move this to a separate function and call on download finish / rechunk, too
 
         # Copy already downloaded chunks to missing files if possible
         for missing_file in (all_remote_files - all_local_files):
@@ -120,8 +123,8 @@ class PeerNode:
             await self.send_transfer_report()
             target = next(iter(relevant_chunks))
             self.status_func(log_info=f'Downloading from: {url}')
-            progr = len(self.fileserver.filelist) / (len(self.remote_filelist) or 1)
-            self.status_func(cur_status=f'Downloading chunks...', progress=progr)
+            self.status_func(cur_status=f'Downloading chunks...',
+                             progress=len(self.fileserver.filelist) / (len(self.remote_filelist) or 1))
             await asyncio.wait_for(
                 self.file_io.download_chunk(target, url, http_session),
                 timeout=timeout)
@@ -134,11 +137,11 @@ class PeerNode:
             unique_chunks_local = len(set((c.hash for c in self.fileserver.filelist)))
             unique_chunks_remote = len(set((c.hash for c in self.remote_filelist)))
             if unique_chunks_local == unique_chunks_remote:
-                self.status_func(log_info=f'Probably got everything. Rescanning to make sure...')
+                self.status_func(log_info=f'All downloads apparently complete. Rescanning to make sure.')
                 self.full_rescan_trigger.set()
 
         except asyncio.TimeoutError:
-            self.status_func(log_info=f'Download from {url} took over timeout ({timeout}). Aborted.')
+            self.status_func(log_info=f'Download from {url} took over timeout ({timeout}s). Aborted.')
         except IOError as e:
             self.status_func(log_error=f'Download from {url} failed: {str(e)}')
         except Exception as e:
@@ -149,14 +152,13 @@ class PeerNode:
             await self.send_transfer_report()
 
 
-    async def handle_server_msg(self, msg, http_session):
-        # self.status_func(log_info=f'Message from server: {str(msg)}')
-
-        async def error(txt):
-            self.status_func(log_error=f'Error handling server message: {txt}, orig msg="{str(msg)}"')
-            await self.server_send_queue.put({'action': 'error', 'orig_msg': msg, 'message': txt})
-
+    async def process_server_msg(self, msg, http_session):
+        self.status_func(log_debug=f'Message from server: {str(msg)}')
         try:
+            async def error(txt):
+                self.status_func(log_error=f'Error handling server message: {txt}, orig msg="{str(msg)}"')
+                await self.server_send_queue.put({'action': 'error', 'orig_msg': msg, 'message': txt})
+
             action = msg.get('action')
 
             if action == 'download':
@@ -183,11 +185,7 @@ class PeerNode:
 
             elif action == 'error':
                 self.status_func(log_error='Error from server:' + str(json.dumps(msg, indent=2)))
-            elif action == 'ok':
-                pass
-            elif action is None:
-                return await error("Missing parameter 'action")
-            else:
+            elif action != 'ok':
                 return await error(f"Unknown action '{str(action)}'")
 
         except Exception as e:
@@ -199,37 +197,43 @@ class PeerNode:
     async def server_connection_loop(self, server_url: str):
 
         # Connect server
-        async with aiohttp.ClientSession() as session:
-            async with session.ws_connect(server_url) as ws:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(server_url) as ws:
 
-                # Read send_queue and pass them to websocket
-                async def send_loop():
-                    while not ws.closed:
-                        with suppress(asyncio.TimeoutError):
-                            msg = await asyncio.wait_for(self.server_send_queue.get(), timeout=1.0)
-                            if msg and not ws.closed:
-                                await ws.send_json(msg)
-                send_task = asyncio.create_task(send_loop())
+                    # Read send_queue and pass them to websocket
+                    async def send_loop():
+                        while not ws.closed:
+                            with suppress(asyncio.TimeoutError):
+                                msg = await asyncio.wait_for(self.server_send_queue.get(), timeout=1.0)
+                                if msg and not ws.closed:
+                                    await ws.send_json(msg)
 
-                # Read messages from websocket and handle them
-                async for msg in ws:
-                    if msg.type == WSMsgType.TEXT:
-                        try:
-                            await self.handle_server_msg(msg.json(), session)
-                        except Exception as e:
-                            self.status_func(log_error=f'Error ("{str(e)}") handling server msg: {msg.data}'
-                                                        'traceback: ' + traceback.format_exc())
-                            await self.server_send_queue.put({'command': 'error', 'orig_msg': msg.data,
-                                                               'message': 'Exception: ' + str(e)})
-                    elif msg.type == WSMsgType.ERROR:
-                        self.status_func(
-                            log_error=f'Connection to server closed with error: %s' % ws.exception())
+                    send_task = asyncio.create_task(send_loop())
 
-                self.status_func(log_info=f'Connection to server closed.')
-                send_task.cancel()
+                    # Read messages from websocket and handle them
+                    async for msg in ws:
+                        if msg.type == WSMsgType.ERROR:
+                            self.status_func(log_error=f'Connection to server closed with error: %s' % ws.exception())
+                        elif msg.type == WSMsgType.TEXT:
+                            try:
+                                await self.process_server_msg(msg.json(), session)
+                            except Exception as e:
+                                await self.server_send_queue.put({
+                                    'command': 'error', 'orig_msg': msg.data, 'message': 'Exception: ' + str(e)})
+                                self.status_func(log_error=f'Error ("{str(e)}") handling server msg: {msg.data}'
+                                                            'traceback: ' + traceback.format_exc())
+
+                    self.status_func(log_info=f'Connection to server closed.')
+                    send_task.cancel()
+
+        except aiohttp.client_exceptions.ClientConnectorError:
+            self.status_func(log_error=f'HTTP/Websocket connect to server {server_url} failed.')
+        finally:
+            self.exit_trigger.set()
 
 
-    async def file_rescan_loop(self):
+    async def file_rescan_loop(self, concurrent_transfer_limit: int):
         self.status_func(log_info=f'File scanner loop starting.')
 
         def __hash_dir_progress_func(cur_filename, file_progress, total_progress):
@@ -237,22 +241,17 @@ class PeerNode:
 
         local_chunks = None
 
-        # Wait until server has told us chunk size (cannot chunk files without it)
-        while not self.chunk_size:
-            await asyncio.sleep(1)
-
-        while True:
-            with suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(self.full_rescan_trigger.wait(), timeout=2)
+        while not self.exit_trigger.is_set():
 
             # TODO: process a per-file queue to scan files when fully downloaded
 
             # Time for a periodical rescan after sync is complete?
             full_periodical_now = len(self.fileserver.filelist) == len(self.remote_filelist) and \
-                                  time.time() >= self.earliest_periodical_rescan
+                                  time.time() >= self.next_periodical_rescan
 
-            if self.full_rescan_trigger.is_set() or full_periodical_now:
-                self.earliest_periodical_rescan = time.time() + self.local_rescan_interval
+            # Wait until server has told us chunk size (cannot chunk files without it)
+            if self.chunk_size and (self.full_rescan_trigger.is_set() or full_periodical_now):
+                self.next_periodical_rescan = time.time() + self.local_rescan_interval
                 self.full_rescan_trigger.clear()
 
                 self.status_func(log_info='Rescanning local files.')
@@ -267,14 +266,14 @@ class PeerNode:
                 if new_local_chunks is not local_chunks or different_from_remote:
                     self.fileserver.clear_chunks()
                     self.fileserver.add_chunks(new_local_chunks)
-                    await self.do_local_file_fixups()
+                    await self.local_file_fixups()
                     if local_chunks is None:
                         await self.server_send_queue.put({
                             'action': 'join_swarm',
                             'chunks': [c.hash for c in new_local_chunks],
                             'dl_url': self.fileserver.base_url + '/chunk/{chunk}',
                             'nick': self.fileserver.hostname,
-                            'concurrent_transfers': 2  # TODO: make this a command line arg
+                            'concurrent_transfers': concurrent_transfer_limit
                         })
                     else:
                         await self.server_send_queue.put({
@@ -282,7 +281,13 @@ class PeerNode:
                             'chunks': list(self.fileserver.hash_to_chunk.keys())})
                     local_chunks = new_local_chunks
 
-    async def run(self, port, server_url):
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait(
+                    (self.full_rescan_trigger.wait(), self.exit_trigger.wait()),
+                    timeout=2, return_when=asyncio.FIRST_COMPLETED)
+
+
+    async def run(self, port: int, server_url: str, concurrent_transfer_limit: int):
         '''
         Run all async loop until one of them exits.
         '''
@@ -290,18 +295,19 @@ class PeerNode:
             with suppress(asyncio.CancelledError, GeneratorExit):
                 await asyncio.gather(
                     self.fileserver.create_http_server(port=port, fileio=self.file_io),
-                    self.file_rescan_loop(),
+                    self.file_rescan_loop(concurrent_transfer_limit),
                     self.server_connection_loop(server_url))
         except Exception as e:
             self.status_func(log_error='PeerNode error:\n' + traceback.format_exc(), popup=True)
-        self.status_func(log_info='PeerNode run_forever() exiting.')
 
 # --------------------------------------------------------------------------------------------------------
 
 async def run_file_client(base_dir: str, server_url: str, port: int, status_func=None,
-                          rescan_interval: float = 60, dl_limit: float = 10000, ul_limit: float = 10000):
+                          rescan_interval: float = 60,
+                          dl_limit: float = 10000, ul_limit: float = 10000,
+                          concurrent_transfer_limit: int = 2):
     await PeerNode(basedir=base_dir, status_func=status_func, file_rescan_interval=rescan_interval,
-                   dl_limit=dl_limit, ul_limit=ul_limit).run(port, server_url)
+                   dl_limit=dl_limit, ul_limit=ul_limit).run(port, server_url, concurrent_transfer_limit)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -311,14 +317,17 @@ def main():
     parser.add_argument('--rescan-interval', dest='rescan_interval', type=float, default=60, help='How often to rescan files')
     parser.add_argument('--dl-rate', dest='dl_limit', type=float, default=10000, help='Rate limit downloads, Mb/s')
     parser.add_argument('--ul-rate', dest='ul_limit', type=float, default=10000, help='Rate limit uploads, Mb/s')
+    parser.add_argument('-c', '--concurrent-transfers', dest='ct', type=int, default=2, help='Max concurrent dls/uls')
     parser.add_argument('--cache-time', dest='cache_time', type=float, default=45, help='HTTP cache expiration time')
     parser.add_argument('--json', dest='json', action='store_true', default=False, help='Show status as JSON (for GUI usage)')
+    parser.add_argument('-d', '--debug', dest='debug', action='store_true', default=False,
+                        help='Show debug level log messages (no effect if --json is specified')
     args = parser.parse_args()
-    status_func = json_status_func if args.json else human_cli_status_func
+    status_func = json_status_func if args.json else make_human_cli_status_func(log_level_debug=args.debug)
     with suppress(KeyboardInterrupt):
         asyncio.run(run_file_client(base_dir=args.dir, server_url=args.url, port=args.port,
                                     rescan_interval=args.rescan_interval,
-                                    dl_limit=args.dl_limit, ul_limit=args.ul_limit,
+                                    dl_limit=args.dl_limit, ul_limit=args.ul_limit, concurrent_transfer_limit=args.ct,
                                     status_func=status_func))
 
 

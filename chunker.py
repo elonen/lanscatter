@@ -1,6 +1,6 @@
 from typing import List
-import os, json, hashlib, asyncio, zlib
-import aiofiles, aiofiles.os, io
+import os, json, hashlib, asyncio
+import aiofiles, aiofiles.os
 
 # Tools for scanning files in a directory and splitting them into hashed chunks.
 # FileServer and FileClient both use this for maintaining and syncing their state.
@@ -36,6 +36,7 @@ class HashFunc:
 
     async def update_async(self, data):
         # TODO: make this run in a separate thread or process pool for better concurrency with file/net IO
+        await asyncio.sleep(0)  # Minimal yield -- give simultaneously started IO tasks a chance to go first
         self.h.update(data)
 
     def result(self) -> ChunkId:
@@ -59,21 +60,38 @@ async def hash_file(basedir: str, relpath: str, chunk_size: int,
     if file_progress_func:
         file_progress_func(relpath, 0, 0, st.st_size)
 
-    async with aiofiles.open(path, 'rb') as f:
-        while True:
-            assert (pos <= st.st_size)
-            sz = min((st.st_size-pos), chunk_size)
+    FILE_BUFFER_SIZE = 256 * 1024
 
+    async with aiofiles.open(path, 'rb') as f:
+        while True:  # Need to run loop at least once, break is at the end
+            assert (pos <= st.st_size)
+            csum = HashFunc()
+            buff_in, buff_out = bytearray(FILE_BUFFER_SIZE), None
+            sz = min((st.st_size-pos), chunk_size)
             remaining = sz
-            buff = bytearray(64*1024)
-            h = HashFunc()
-            read = -1
-            while read:
-                if remaining < len(buff):
-                    buff = bytearray(remaining)
-                read = await f.readinto(buff)
-                h.update(buff)
-                remaining -= read
+
+            async def read_file():
+                nonlocal buff_in, remaining
+                if remaining > 0:
+                    if remaining < len(buff_in):
+                        buff_in = bytearray(remaining)
+                    cnt = await f.readinto(buff_in)
+                    remaining -= cnt
+                else:
+                    buff_in = None
+
+            async def update_hash():
+                nonlocal buff_out
+                if not buff_out:
+                    buff_out = bytearray(FILE_BUFFER_SIZE)
+                else:
+                    await csum.update_async(buff_out)
+
+            # Read and hash concurrently
+            while remaining > 0:
+                await asyncio.gather(read_file(), update_hash())
+                buff_in, buff_out = buff_out, buff_in  # Swap buffers
+            await update_hash()  # Write once more to flush buff_out
 
             res.append(FileChunk(
                     filename=relpath,
@@ -81,10 +99,12 @@ async def hash_file(basedir: str, relpath: str, chunk_size: int,
                     size=sz,
                     file_size=st.st_size,
                     file_mtime=int(st.st_mtime+0.5),
-                    hash=h.result()))
+                    hash=csum.result()))
+
             pos += sz
             if file_progress_func:
                 file_progress_func(relpath, sz, pos, st.st_size)
+
             if pos >= st.st_size:
                 break
 
@@ -113,9 +133,7 @@ async def scan_dir(basedir: str, chunk_size: int, old_chunks=(), progress_func=N
             c = fn_to_old_chunk[filename]
             s = await aiofiles.os.stat(os.path.join(basedir, filename))
             return c.file_size != s.st_size or c.file_mtime != int(s.st_mtime + 0.5)
-        except FileNotFoundError:
-            return True
-        except KeyError:
+        except (FileNotFoundError, KeyError):
             return True
 
     # Return immediately if we are completely up to date:

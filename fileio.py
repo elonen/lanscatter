@@ -16,7 +16,7 @@ class FileIO:
     ul_limiter: RateLimiter
 
     FILE_BUFFER_SIZE = 256 * 1024
-    DOWNLOAD_BUFFER_MAX = 64 * 1024
+    DOWNLOAD_BUFFER_MAX = 256 * 1024
     NETWORK_BUFFER_MIN = 8 * 1024
 
     def __init__(self, basedir: Path, dl_rate_limit: float, ul_rate_limit: float):
@@ -74,7 +74,8 @@ class FileIO:
     async def upload_chunk(self, chunk: FileChunk, request: web.Request)\
             -> Tuple[web.StreamResponse, Optional[float]]:
         '''
-        Read given chunk from disk and stream out as a HTTP response
+        Read given chunk from disk and stream out as a HTTP response.
+
         :param chunk: Chunk to read
         :param request: HTTP request to answer
         :return: Tuple(Aiohttp.response, float(seconds the upload took) or None if it no progress was made)
@@ -117,8 +118,9 @@ class FileIO:
                             i += limited_n
                             cnt -= limited_n
 
+                # Double buffered read & write
                 while remaining > 0:
-                    await asyncio.gather(read_file(), write_http())  # Read and write concurrently
+                    await asyncio.gather(read_file(), write_http())
                     buff_in, buff_out = buff_out, buff_in  # Swap buffers
                 await write_http()  # Write once more to flush buff_out
 
@@ -183,17 +185,29 @@ class FileIO:
                 if resp.status != 200:  # some error
                     raise IOError(f'Unknown/unsupported HTTP status: {resp.status}')
                 else:
-                    read_bytes = b'-'
                     csum = HashFunc()
-                    while read_bytes:
+                    buff_in, buff_out = None, b''
+
+                    async def read_http():
+                        nonlocal buff_in
                         limited_n = int(await self.dl_limiter.acquire(self.DOWNLOAD_BUFFER_MAX, self.NETWORK_BUFFER_MIN))
-                        read_bytes = await resp.content.read(limited_n)
-                        self.dl_limiter.unspend(limited_n - len(read_bytes))
+                        buff_in = await resp.content.read(limited_n)
+                        self.dl_limiter.unspend(limited_n - len(buff_in))
+                        buff_in = buff_in if buff_in else None
+
+                    async def write_and_csum():
+                        nonlocal buff_out
                         await asyncio.gather(
-                            outf.write(read_bytes),
-                            csum.update_async(read_bytes))
+                            outf.write(buff_out),
+                            csum.update_async(buff_out))
+
+                    while buff_out is not None:
+                        await asyncio.gather(read_http(), write_and_csum())  # Read and write concurrently
+                        buff_in, buff_out = buff_out, buff_in  # Swap buffers
+
                     if csum.result() != chunk.hash:
                         raise IOError(f'Checksum error verifying {chunk.hash} from {url}')
+
             os.truncate(self.resolve_and_sanitize(chunk.filename), chunk.file_size)
 
 

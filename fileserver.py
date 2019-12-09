@@ -7,15 +7,15 @@ from fileio import FileIO
 
 class FileServer:
 
-    def __init__(self, status_func: Callable, upload_callback=None):
+    def __init__(self, status_func: Callable, upload_finished_func=None):
         self.filelist = set()          # List fo all FileChunks
         self.hash_to_chunk = {}        # Map hash -> FileChunk (NOT a bijection! Same chunk may be in several files.)
         self.base_url: str = '(server not running)'
         self.hostname = socket.gethostname()
         self.upload_times = []              # List of how long each upload took (for tracking speed)
-        self._status_func = status_func
-        self._upload_callback = upload_callback  # async def(finished=bool)
         self.active_uploads = 0
+        self._status_func = status_func
+        self._on_upload_finished = upload_finished_func
 
     def add_chunks(self, chunks: Iterable[FileChunk]) -> None:
         '''
@@ -60,7 +60,6 @@ class FileServer:
             self._status_func(log_info=f"[{request.remote}] GET {request.path_qs}")
             h = request.match_info.get('hash')
             self.active_uploads += 1
-            await self._upload_callback(finished=False)
             try:
                 chunk = self.hash_to_chunk.get(h or '-')
                 if chunk is None:
@@ -70,12 +69,11 @@ class FileServer:
                     if ul_time:
                         self.upload_times.append(ul_time)
                 except Exception as e:
-                    print('hdl__get_chunk error ('+str(type(e))+'): '+str(e))
                     raise e
                 return res
             finally:
                 self.active_uploads -= 1
-                await self._upload_callback(finished=True)
+                await self._on_upload_finished()
 
         app = web.Application()
         app.add_routes([web.get('/chunk/{hash}', hdl__get_chunk)])

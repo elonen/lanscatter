@@ -177,7 +177,7 @@ class SwarmCoordinator(object):
         # Match uploaders and downloaders to transfer rarest chunks first:
         proposed_transfers = []
         for ul in free_uploaders:
-            for _ in range(ul.max_concurrent_uls - ul.active_uploads):
+            for __ in range(ul.max_concurrent_uls - ul.active_uploads):
                 for dl in free_downloaders:
                     if dl.active_downloads < dl.max_concurrent_dls:  # need to recheck every iteration
                         new_chunks = ul.chunks - dl.chunks - dl.busy_chunks
