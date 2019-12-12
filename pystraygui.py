@@ -1,7 +1,8 @@
-import pystray
 from PIL import Image
 import tkinter as tk
 import tkinter.ttk as ttk
+
+import pystray
 
 # Kill app on ctrl-c
 import signal
@@ -18,6 +19,7 @@ class Gui(object):
 			self.icon.stop()
 
 		def show_window(icon, item):
+			self.icon.stop()
 			if not (self.window and self.window.winfo_exists()):
 				def on_closing():
 					self.window.destroy()

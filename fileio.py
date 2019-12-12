@@ -4,7 +4,7 @@ from chunker import FileChunk, HashFunc
 from aiohttp import web, ClientSession
 from typing import Tuple, Optional
 from contextlib import suppress
-import aiofiles, os, time, asyncio, aiohttp
+import aiofiles, os, time, asyncio, aiohttp, mmap
 
 class FileIO:
     '''
@@ -84,7 +84,7 @@ class FileIO:
         remaining = chunk.size
         start_t = time.time()
         try:
-            async with self.open_and_seek(chunk.filename, chunk.pos, for_write=False) as f:
+            async with self.open_and_seek(chunk.path, chunk.pos, for_write=False) as f:
                 # Ok, read chunk from file and stream it out
                 response = web.StreamResponse(
                     status=200,
@@ -101,7 +101,7 @@ class FileIO:
                             buff_in = bytearray(remaining)
                         cnt = await f.readinto(buff_in)
                         if cnt != len(buff_in):
-                            raise web.HTTPNotFound(reson=f'Filesize mismatch / "{str(chunk.filename)}" changed? Read {cnt} but expected {len(buff_in)}.')
+                            raise web.HTTPNotFound(reason=f'Filesize mismatch / "{str(chunk.path)}" changed? Read {cnt} but expected {len(buff_in)}.')
                         remaining -= cnt
                     else:
                         buff_in = None
@@ -143,45 +143,41 @@ class FileIO:
             raise web.HTTPInternalServerError(reason=str(e))
 
 
-    async def copy_chunk_locally(self, copy_from: FileChunk, copy_to: FileChunk) -> None:
+    async def copy_chunk_locally(self, copy_from: FileChunk, copy_to: FileChunk) -> bool:
         '''
         Locally copy chunk contents from one file (+position) to another.
         :param copy_from: Where to copy from
         :param copy_to: Where to copy into
-        :return: None
+        :return: True if chunk was copied ok, False if content hash didn't match anymore
         '''
+        if copy_from.path == copy_to.path and copy_from.pos == copy_to.pos:
+            return True
         if copy_from.hash != copy_to.hash:
             raise ValueError(f"From and To chunks must have same hash (was: '{copy_from.hash}' vs '{copy_to.hash}').")
 
-        if copy_from.filename == copy_to.filename and copy_from.pos == copy_to.pos:
-            return  # Nothing to do
-
-        async with self.open_and_seek(copy_from.filename, copy_from.pos, for_write=False) as inf:
+        async with self.open_and_seek(copy_from.path, copy_from.pos, for_write=False) as inf:
             if not inf:
-                raise FileNotFoundError(f'Local copy failed, no such file: {str(copy_from.filename)}')
-            async with self.open_and_seek(copy_to.filename, copy_to.pos, for_write=True) as outf:
-                remaining = copy_from.size
-                buff = bytearray(self.FILE_BUFFER_SIZE)
-                while remaining > 0:
-                    if remaining < len(buff):
-                        buff = bytearray(remaining)
-                    read = await inf.readinto(buff)
-                    if read != len(buff):
-                        raise IOError(
-                            f"'File {str(copy_from.filename)}' changed? Expected {len(buff)} bytes but got {read}.")
-                    await outf.write(buff)
-                    remaining -= read
+                raise FileNotFoundError(f'Local copy failed, no such file: {str(copy_from.path)}')
+            chunk_data = await inf.read(copy_from.size)
+            csum = await HashFunc().update_async(chunk_data)
+            if csum.result() == copy_from.hash:
+                async with self.open_and_seek(copy_to.path, copy_to.pos, for_write=True) as outf:
+                    await outf.write(chunk_data)
+                return True
+            else:
+                return False
 
 
-    async def download_chunk(self, chunk: FileChunk, url: str, http_session: ClientSession) -> None:
+    async def download_chunk(self, chunk: FileChunk, url: str, http_session: ClientSession, file_size: int= -1) -> None:
         '''
         Download chunk from given URL and write directly into (the middle of a) file as specified by FileChunk.
         :param chunk: Specs for chunk to get
         :param url: URL to download from
         :param http_session: AioHTTP session to use for GET.
+        :param file_size: Size of complete file (optional). File will be truncated to this size.
         '''
         async with http_session.get(url, raise_for_status=True) as resp:
-            async with self.open_and_seek(chunk.filename, chunk.pos, for_write=True) as outf:
+            async with self.open_and_seek(chunk.path, chunk.pos, for_write=True) as outf:
                 if resp.status != 200:  # some error
                     raise IOError(f'Unknown/unsupported HTTP status: {resp.status}')
                 else:
@@ -208,8 +204,8 @@ class FileIO:
                     if csum.result() != chunk.hash:
                         raise IOError(f'Checksum error verifying {chunk.hash} from {url}')
 
-            os.truncate(self.resolve_and_sanitize(chunk.filename), chunk.file_size)
-
+                    if file_size >= 0:
+                        outf.truncate(file_size)
 
 
     async def change_mtime(self, path, mtime):

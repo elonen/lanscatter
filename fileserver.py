@@ -1,15 +1,13 @@
-from aiohttp import web, WSMsgType
-from typing import Callable, Iterable
-import ssl, aiofiles, socket
-from chunker import FileChunk
+from aiohttp import web
+from typing import Callable
+import ssl, socket
 from fileio import FileIO
-
+from chunker import SyncBatch
 
 class FileServer:
 
     def __init__(self, status_func: Callable, upload_finished_func=None):
-        self.filelist = set()          # List fo all FileChunks
-        self.hash_to_chunk = {}        # Map hash -> FileChunk (NOT a bijection! Same chunk may be in several files.)
+        self.batch = SyncBatch(0)
         self.base_url: str = '(server not running)'
         self.hostname = socket.gethostname()
         self.upload_times = []              # List of how long each upload took (for tracking speed)
@@ -17,25 +15,8 @@ class FileServer:
         self._status_func = status_func
         self._on_upload_finished = upload_finished_func
 
-    def add_chunks(self, chunks: Iterable[FileChunk]) -> None:
-        '''
-        Start serving some new chunks
-        '''
-        for c in chunks:
-            self.filelist.add(c)
-            self.hash_to_chunk[c.hash] = c
-
-    def clear_chunks(self) -> None:
-        self.filelist.clear()
-        self.hash_to_chunk.clear()
-
-    def change_mtime(self, filename: str, new_mtime: float):
-        new_list = [c for c in self.filelist]
-        for c in new_list:
-            if c.filename == filename:
-                c.file_mtime = new_mtime
-        self.clear_chunks()
-        self.add_chunks(new_list)
+    def set_batch(self, new_batch: SyncBatch):
+        self.batch = new_batch
 
     def create_http_server(self, port, fileio: FileIO, https_cert=None, https_key=None, extra_routes=()):
         '''
@@ -57,13 +38,14 @@ class FileServer:
             '''
             HTTP GET handler that serves out a file chunk with given hash.
             '''
-            self._status_func(log_info=f"[{request.remote}] GET {request.path_qs}")
-            h = request.match_info.get('hash')
             self.active_uploads += 1
             try:
-                chunk = self.hash_to_chunk.get(h or '-')
-                if chunk is None:
-                    raise web.HTTPNotFound(reson=f'Chunk not on this host: {h}')
+                self._status_func(log_info=f"[{request.remote}] GET {request.path_qs}")
+                h = request.match_info.get('hash')
+
+                chunk = self.batch.first_chunk_with(hash=h)
+                if not chunk:
+                    raise web.HTTPNotFound(reason=f'Chunk not on this host: {h}')
                 try:
                     res, ul_time = await fileio.upload_chunk(chunk, request)
                     if ul_time:
@@ -76,7 +58,7 @@ class FileServer:
                 await self._on_upload_finished()
 
         app = web.Application()
-        app.add_routes([web.get('/chunk/{hash}', hdl__get_chunk)])
+        app.add_routes([web.get('/blob/{hash}', hdl__get_chunk)])
         if extra_routes:
             app.add_routes(extra_routes)
 

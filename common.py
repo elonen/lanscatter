@@ -7,17 +7,23 @@ def make_human_cli_status_func(log_level_debug = False):
              log_error: str = None, log_info: str = None, log_debug: str = None, popup: bool = False):
         dt = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         sep = '*' if popup else '|'
+        parts = []
         if progress is not None:
-            p = str(int(progress*100+0.5))+'%' if progress >= 0 else '-'
-            print(f"{dt} PROGRESS{sep} {p}")
+            p = str(int(progress*100+0.5)).rjust(3)+'%' if progress >= 0 else '  - '
+            parts.append(f"{p}")
+        else:
+            parts.append('    ')
         if cur_status is not None:
-            print(f"{dt} STATUS  {sep} Cur status: {cur_status}")
+            parts.append(f"STATUS  {sep} {cur_status}")
         if log_error is not None:
-            print(f"{dt} ERROR   {sep} {log_error}")
+            parts.append(f"ERROR   {sep} {log_error}")
         if log_info is not None:
-            print(f"{dt} INFO    {sep} {log_info}")
+            parts.append(f"INFO    {sep} {log_info}")
         if log_level_debug and log_debug is not None:
-            print(f"{dt} DEBUG    {sep} {log_debug}")
+            parts.append(f"DEBUG    {sep} {log_debug}")
+
+        if parts and (''.join(parts)).strip():
+            print(f"{dt} {sep} " + ' | '.join(parts))
 
     return func
 

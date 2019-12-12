@@ -2,7 +2,7 @@ from aiohttp import web, WSMsgType
 from pathlib import Path
 from typing import Callable, Optional
 import asyncio, aiofiles, argparse, traceback, html
-from chunker import monitor_folder_forever, chunks_to_dict, chunks_to_json
+from chunker import monitor_folder_forever
 from common import make_human_cli_status_func, json_status_func
 from types import SimpleNamespace
 from contextlib import suppress
@@ -23,34 +23,31 @@ class MasterNode:
 
         async def __on_upload_finished():
             # Let planner know how many free upload slots masternode's file server has
-            self.seed_node.set_active_transfers((), 0, self.fileserver.active_uploads)
-            self.seed_node.update_transfer_speed(self.fileserver.upload_times)
-            self.fileserver.upload_times.clear()
+            self.seed_node.set_active_transfers((), 0, self.file_server.active_uploads)
+            self.seed_node.update_transfer_speed(self.file_server.upload_times)
+            self.file_server.upload_times.clear()
 
-        self.fileserver = FileServer(status_func, upload_finished_func=__on_upload_finished)
+        self.file_server = FileServer(status_func, upload_finished_func=__on_upload_finished)
 
 
-    def __make_filelist_msg(self):
-        return {'action': 'new_filelist', 'data': chunks_to_dict(self.fileserver.filelist or (), self.chunk_size)}
+    def __make_batch_msg(self):
+        return {'action': 'new_batch', 'data': self.file_server.batch.to_dict()}
 
-    async def replace_filelist(self, new_filelist):
-        old = chunks_to_json(self.fileserver.filelist, self.chunk_size)
-        new = chunks_to_json(new_filelist, self.chunk_size)
-        if old != new:
-            self.status_func(log_info='Filelist changed. Updating planner and notifying clients.')
-            self.fileserver.clear_chunks()
-            self.fileserver.add_chunks(new_filelist)
+    async def replace_sync_batch(self, new_batch):
+        if new_batch.to_json() != self.file_server.batch.to_json():
+            self.status_func(log_info='Sync batch changed. Updating planner and notifying clients.')
+            self.file_server.set_batch(new_batch)
 
             # Update planner and send new list to clients
-            self.swarm.reset_chunks((c.hash for c in self.fileserver.filelist))
-            self.seed_node.add_chunks(self.swarm.all_chunks, clear_first=True)
-            fl_msg = self.__make_filelist_msg()
+            self.swarm.reset_hashes((c.hash for c in self.file_server.batch.chunks))
+            self.seed_node.add_hashes(self.swarm.all_hashes, clear_first=True)
+            fl_msg = self.__make_batch_msg()
             for n in self.swarm.nodes:
                 if n != self.seed_node:
                     await n.client.send_queue.put(fl_msg)
             self.replan_trigger.set()
         else:
-            self.status_func(log_info='New filelist identical to old one. No action.')
+            self.status_func(log_info='New sync batch was identical to old one. No action.')
 
 
     def server_loop(self, base_dir: str,
@@ -72,7 +69,7 @@ class MasterNode:
             :param msg: Message from client in a dict
             :return: New Node handle if messages caused a swarm join, otherwise None
             '''
-            client_name = (node.name if node else self.fileserver.hostname)
+            client_name = (node.name if node else self.file_server.hostname)
             self.status_func(log_debug=f'[{address}] Msg from {client_name}: {str(msg)}')
 
             async def error(txt):
@@ -91,67 +88,68 @@ class MasterNode:
                 if action == 'join_swarm':
                     dl_slots = msg.get('concurrent_transfers') or 2
 
-                    initial_chunks = msg.get('chunks')
-                    if not isinstance(initial_chunks, list):
-                        return await error("'chunks' argument missing or invalid.")
+                    initial_hashes = msg.get('hashes')
+                    if not isinstance(initial_hashes, list):
+                        return await error("'hashes' argument missing or invalid.")
 
                     dl_url = msg.get('dl_url')
                     if not dl_url or 'http' not in dl_url:
                         return await error("'dl_url' argument missing or invalid.")
-                    if not '{chunk}' in dl_url:
-                        return await error("'dl_url' must contain placeholder '{chunks}'.")
+                    if '{hash}' not in dl_url:
+                        return await error("'dl_url' must contain placeholder '{hash}'.")
 
                     if node:  # rejoin = destroy old and create new
                         node.destroy()
                         self.status_func(log_info=f'[{address}] Rejoining "{client_name}".')
 
-                    node = self.swarm.node_join(initial_chunks, dl_slots, dl_slots)
-                    node.name = msg.get('nick') or self.fileserver.hostname
+                    node = self.swarm.node_join(initial_hashes, dl_slots, dl_slots)
+                    node.name = msg.get('nick') or self.file_server.hostname
                     node.client = SimpleNamespace(
                         dl_url=dl_url,
                         send_queue=send_queue)
 
                     self.status_func(log_info=f'[{address}] Client "{client_name}" joined swarm as "{node.name}".'
-                                               f' URL: {node.client.dl_url}')
+                                              f' URL: {node.client.dl_url}')
                     await ok('Joined swarm.')
-                    await send_queue.put(self.__make_filelist_msg())
+                    await send_queue.put(self.__make_batch_msg())
+
                     self.replan_trigger.set()
                     return node
 
                 # ---------------------------------------------------
                 # Client's got (new) chunks
                 # ---------------------------------------------------
-                if action == 'set_chunks' or action == 'add_chunks':
-                    if not isinstance(msg.get('chunks'), list):
-                        return await error("Must have list in arg 'chunks'")
+                if action == 'set_hashes' or action == 'add_hashes':
+                    if not isinstance(msg.get('hashes'), list):
+                        return await error("Must have list in arg 'hashes'")
                     if not node:
                         return await error("Join the swarm first.")
 
-                    unknown_chunks = node.add_chunks(msg.get('chunks'), clear_first=(action == 'set_chunks'))
+                    unknown_hashes = node.add_hashes(msg.get('hashes'), clear_first=(action == 'set_hashes'))
 
                     self.replan_trigger.set()
-                    await ok('Chunks updated')
+                    await ok('Hashes updated')
 
-                    if unknown_chunks:
-                        self.status_func(log_info=f'Client "{client_name}" had unknown chunks: {str(unknown_chunks)}')
+                    if unknown_hashes:
+                        self.status_func(log_info=f'Client "{client_name}" had unknown hashes: {str(unknown_hashes)}')
                         await send_queue.put({
                             'action': 'rehash',
-                            'message': 'You reported chunks not belonging to the swarm. You need to rehash files.',
-                            'unknown_chunks': tuple(unknown_chunks)})
+                            'message': 'You reported hashes not belonging to the swarm. You need to rehash files.',
+                            'unknown_hashes': tuple(unknown_hashes)})
 
                 # ---------------------------------------------------
                 # Client reports current downloads, uploads and speed
                 # ---------------------------------------------------
                 elif action == 'report_transfers':
                     dl_count, ul_count = msg.get('dls'), msg.get('uls')
-                    busy_chunks = msg.get('busy')
+                    incoming = msg.get('incoming')
                     upload_times = msg.get('ul_times')
-                    if None in (dl_count, ul_count, busy_chunks, upload_times):
+                    if None in (dl_count, ul_count, incoming, upload_times):
                         return await error(f"Missing args.")
                     if not node:
                         return await error("Join the swarm first.")
 
-                    node.set_active_transfers(busy_chunks, dl_count, ul_count)
+                    node.set_active_transfers(incoming, dl_count, ul_count)
                     node.update_transfer_speed(upload_times)
 
                     if ul_count < node.max_concurrent_uls or dl_count < node.max_concurrent_dls:
@@ -180,25 +178,25 @@ class MasterNode:
             res = '<html><head><meta http-equiv="refresh" content="3"></head><body>'\
                   f"<h1>Swarm status</h1><p>{str(datetime.now().isoformat(' ', 'seconds'))}</p>"
 
-            if st['all_chunks']:
-                res += '<table><tr>' + th.format(txt='Node', colspan=1) + th.format(txt='Chunks', colspan=len(st["all_chunks"])) +\
+            if st['all_hashes']:
+                res += '<table><tr>' + th.format(txt='Node', colspan=1) + th.format(txt='Hashes', colspan=len(st["all_hashes"])) +\
                        th.format(txt='↓', colspan=1) + th.format(txt='↑', colspan=1) +\
                        th.format(txt='⧖', colspan=1) + '</tr>\n'
                 for n in st['nodes']:
                     res += f'<tr><td>{html.escape(n["name"])}</td>'
                     res += ''.join(['<td style="padding: 1px; background: {color}">&nbsp;</td>'.format(
-                        color=colors[c]) for c in n['chunks']])
+                        color=colors[c]) for c in n['hashes']])
                     res += ''.join(f'<td>{v}</td>' for v in (int(n['dls']), int(n['uls']), '%.1f s'%n['avg_ul_time']))
                     res += "</tr>\n"
                 res += '</table><p>↓ = active downloads, ↑ = active uploads, ⧖ = average upload time</p>\n'
             else:
-                res += "(No chunks. Probably still hashing. Try again later.)"
+                res += "(No content. Probably still hashing. Try again later.)"
             res += '</body></html>'
             return web.Response(text=res, content_type='text/html')
 
 
         async def http_handler__start_websocket(request):
-            self.status_func(log_info=f"[{request.remote}] GET {request.path_qs}. Converting to websocket.")
+            self.status_func(log_info=f"[{request.remote}] HTTP GET {request.path_qs}. Upgrading to websocket.")
             ws = web.WebSocketResponse(heartbeat=30)
             await ws.prepare(request)
 
@@ -215,8 +213,12 @@ class MasterNode:
                             await ws.send_json(msg)
             send_task = asyncio.create_task(send_loop())
 
-            welcome = self.__make_filelist_msg()
-            welcome['action'] = 'initial_filelist'
+            while not self.file_server.batch:
+                await send_queue.put({'action': 'ok', 'message': "Hold on. Master is doing initial file scan."})
+                await asyncio.wait_for(self.replan_trigger.wait(), timeout=5)
+
+            welcome = self.__make_batch_msg()
+            welcome['action'] = 'initial_batch'
             welcome['message'] = 'Welcome. Hash your files against this and join_swarm when ready to sync.'
             await send_queue.put(welcome)
 
@@ -244,9 +246,9 @@ class MasterNode:
             send_task.cancel()
             return ws
 
-        # Start serving chunks over HTTP and accepting client connections on websocket endpoint
+        # Start serving blobs over HTTP and accepting client connections on websocket endpoint
         file_io = FileIO(Path(base_dir), 0, ul_limit)
-        server = self.fileserver.create_http_server(
+        server = self.file_server.create_http_server(
             port, file_io, https_cert, https_key,
             extra_routes=[
                 web.get('/ws', http_handler__start_websocket),
@@ -254,34 +256,35 @@ class MasterNode:
             ])
 
         # Register this server as seed node
-        self.seed_node = self.swarm.node_join(self.swarm.all_chunks, 0, concurrent_uploads, master_node=True)
+        self.seed_node = self.swarm.node_join(self.swarm.all_hashes, 0, concurrent_uploads, master_node=True)
         self.seed_node.name = 'MASTER'
         self.seed_node.client = SimpleNamespace(
-            dl_url=self.fileserver.base_url + '/chunk/{chunk}',
+            dl_url=self.file_server.base_url + '/blob/{hash}',
             send_queue=None)
 
         return server
 
 
     async def planner_loop(self):
-        print("planner_loop starting...")
+        self.status_func(log_info=f'Planner loop starting.')
         while True:
             with suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self.replan_trigger.wait(), timeout=2)
             self.replan_trigger.clear()
 
             # Track seed file server upload performance
-            self.seed_node.update_transfer_speed(self.fileserver.upload_times)
-            self.fileserver.upload_times.clear()
+            self.seed_node.set_active_transfers((), 0, self.file_server.active_uploads)
+            self.seed_node.update_transfer_speed(self.file_server.upload_times)
+            self.file_server.upload_times.clear()
 
             for t in self.swarm.plan_transfers():
-                self.status_func(log_debug=f'Scheduling dl of {t.chunk} from {t.from_node.name} to '
+                self.status_func(log_debug=f'Scheduling dl of {t.hash} from {t.from_node.name} to '
                                            f'{t.to_node.name}, timeout {t.timeout_secs}')
                 await t.to_node.client.send_queue.put({
                     'action': 'download',
-                    'chunk': t.chunk,
+                    'hash': t.hash,
                     'timeout': t.timeout_secs,
-                    'url': t.from_node.client.dl_url.format(chunk=t.chunk)})
+                    'url': t.from_node.client.dl_url.format(hash=t.hash)})
 
 # ---------------------------------------------------------------------------------------------------
 
@@ -296,10 +299,10 @@ async def run_master_server(base_dir: str, port: int,
         def progress_func_adapter(cur_filename, file_progress, total_progress):
             status_func(progress=total_progress,
                         cur_status=f'Hashing "{cur_filename}" ({int(file_progress * 100 + 0.5)}% done)')
-        async for new_chunks in monitor_folder_forever(
+        async for new_batch in monitor_folder_forever(
                 base_dir, dir_scan_interval,
                 progress_func_adapter, chunk_size=chunk_size):
-            await server.replace_filelist(new_chunks)
+            await server.replace_sync_batch(new_batch)
 
     await asyncio.gather(
         dir_scanner_loop(),
