@@ -5,12 +5,13 @@ from contextlib import suppress
 from typing import Callable
 import multiprocessing as mp
 from datetime import datetime, timedelta
+import common
 
 APP_NAME = 'Lanscatter'
 
 SETTINGS_DEFAULTS = {
-    'listen_port': 14435,
-    'master_url': 'http://127.0.0.1:14433',
+    'listen_port': common.defaults.TCP_PORT,
+    'master_url': f'ws://127.0.0.1:{common.defaults.TCP_PORT}/ws',
     'sync_dir': './sync-target/',
     'is_master': False}
 
@@ -83,7 +84,7 @@ class SettingsDlg(wx.Dialog):
         # Port to listen
         hb = wx.BoxSizer(wx.HORIZONTAL)
         hb.Add(wx.StaticText(panel, label='Local port'), st_hor)
-        self.listen_port = wx.SpinCtrl(panel, value="1", min=1, max=65535, initial=144335)
+        self.listen_port = wx.SpinCtrl(panel, value="1", min=1, max=65535, initial=common.defaults.TCP_PORT)
         hb.Add(self.listen_port, st_hor)
         vbox.Add(hb, st_vert)
 

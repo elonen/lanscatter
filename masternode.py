@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Callable, Optional
 import asyncio, aiofiles, argparse, traceback, html
 from chunker import monitor_folder_forever
-from common import make_human_cli_status_func, json_status_func
+from common import make_human_cli_status_func, json_status_func, defaults
 from types import SimpleNamespace
 from contextlib import suppress
 from datetime import datetime
@@ -34,7 +34,7 @@ class MasterNode:
         return {'action': 'new_batch', 'data': self.file_server.batch.to_dict()}
 
     async def replace_sync_batch(self, new_batch):
-        if new_batch.to_json() != self.file_server.batch.to_json():
+        if new_batch != self.file_server:
             self.status_func(log_info='Sync batch changed. Updating planner and notifying clients.')
             self.file_server.set_batch(new_batch)
 
@@ -50,9 +50,9 @@ class MasterNode:
             self.status_func(log_info='New sync batch was identical to old one. No action.')
 
 
-    def server_loop(self, base_dir: str,
-                    port=14433, https_cert=None, https_key=None,
-                    ul_limit: float = 10000, concurrent_uploads: int = 4):
+    def server_loop(self, base_dir: str, port: int,
+                    ul_limit: float, concurrent_uploads: int,
+                    https_cert: Optional[str], https_key: Optional[str]):
 
         if not Path(base_dir).is_dir():
             raise NotADirectoryError(f'Path "{base_dir}" is not a directory. Cannot serve from it.')
@@ -208,7 +208,7 @@ class MasterNode:
             async def send_loop():
                 while not ws.closed:
                     with suppress(asyncio.TimeoutError):
-                        msg = await asyncio.wait_for(send_queue.get(), timeout=1.0)
+                        msg = await asyncio.wait_for(send_queue.get(), timeout=1)
                         if msg and not ws.closed:
                             await ws.send_json(msg)
             send_task = asyncio.create_task(send_loop())
@@ -286,11 +286,17 @@ class MasterNode:
                     'timeout': t.timeout_secs,
                     'url': t.from_node.client.dl_url.format(hash=t.hash)})
 
+
 # ---------------------------------------------------------------------------------------------------
 
-async def run_master_server(base_dir: str, port: int,
-                            dir_scan_interval: float = 20, status_func=None, ul_limit: float = 10000,
-                            concurrent_uploads: int = 4, chunk_size=64*1024*1024,
+
+async def run_master_server(base_dir: str,
+                            port: int = defaults.TCP_PORT,
+                            dir_scan_interval: float = defaults.DIR_SCAN_INTERVAL_MASTER,
+                            status_func=None,
+                            ul_limit: float = defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC,
+                            concurrent_uploads: int = defaults.CONCURRENT_TRANSFERS_MASTER,
+                            chunk_size=defaults.CHUNK_SIZE,
                             https_cert=None, https_key=None):
 
     server = MasterNode(status_func=status_func, chunk_size=chunk_size)
@@ -300,8 +306,8 @@ async def run_master_server(base_dir: str, port: int,
             status_func(progress=total_progress,
                         cur_status=f'Hashing "{cur_filename}" ({int(file_progress * 100 + 0.5)}% done)')
         async for new_batch in monitor_folder_forever(
-                base_dir, dir_scan_interval,
-                progress_func_adapter, chunk_size=chunk_size):
+                basedir=base_dir, update_interval=dir_scan_interval,
+                progress_func=progress_func_adapter, chunk_size=chunk_size):
             await server.replace_sync_batch(new_batch)
 
     await asyncio.gather(
@@ -314,10 +320,15 @@ async def run_master_server(base_dir: str, port: int,
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('dir', help='Directory to serve files from')
-    parser.add_argument('-p', '--port', dest='port', type=int, default=14433, help='HTTP(s) server port')
-    parser.add_argument('--ul-rate', dest='ul_limit', type=float, default=10000, help='Rate limit uploads, Mb/s')
-    parser.add_argument('-c', '--concurrent-transfers', dest='ct', type=int, default=2, help='Max concurrent uploads')
-    parser.add_argument('--chunksize', dest='chunksize', type=int, default=64*1024*1024, help='Chunk size for splitting files (in bytes)')
+    parser.add_argument('-p', '--port', dest='port', type=int, default=defaults.TCP_PORT, help='HTTP(s) server port')
+    parser.add_argument('--ul-rate', dest='ul_limit', type=float,
+                        default=defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC, help='Rate limit uploads, Mb/s')
+    parser.add_argument('-c', '--concurrent-transfers', dest='ct', type=int,
+                        default=defaults.CONCURRENT_TRANSFERS_MASTER, help='Max concurrent uploads')
+    parser.add_argument('--chunksize', dest='chunksize', type=int,
+                        default=defaults.CHUNK_SIZE, help='Chunk size for splitting files (in bytes)')
+    parser.add_argument('-s', '--rescan-interval', dest='rescan_interval', type=float,
+                        default=defaults.DIR_SCAN_INTERVAL_MASTER, help='Seconds to wait between sync dir rescans')
     parser.add_argument('--sslcert', type=str, default=None, help='SSL certificate file for HTTPS (optional)')
     parser.add_argument('--sslkey', type=str, default=None, help='SSL key file for HTTPS (optional)')
     parser.add_argument('--json', dest='json', action='store_true', default=False, help='Show status as JSON (for GUI usage)')
@@ -328,6 +339,7 @@ def main():
     with suppress(KeyboardInterrupt):
         asyncio.run(run_master_server(
             base_dir=args.dir, port=args.port, ul_limit=args.ul_limit, concurrent_uploads=args.ct,
+            dir_scan_interval=args.rescan_interval,
             https_cert=args.sslcert, https_key=args.sslkey,
             chunk_size=args.chunksize, status_func=status_func))
 

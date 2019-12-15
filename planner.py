@@ -226,7 +226,7 @@ def simulate() -> None:
     Simulate file swarm, controlled by SwarmCoordinator.
     Prints a block diagram to stdout until all blocks are done.
     '''
-    N_HASHSES = 72
+    N_HASHES = 72
     N_NODES = 38
     SEEDER_UL_SLOTS = 4
     NODE_UL_SLOT = 2
@@ -236,14 +236,14 @@ def simulate() -> None:
     # For simulating network errors and slowdowns
     ERROR_PROBABILITY = 1/100  # Probability of individual transfer failing
 
-    DROPOUT_PROBABILITY = 1/(N_HASHSES * N_NODES)*8  # Probability of node dropping out of swarm completely
-    JOIN_PROBABILITY = 10/N_HASHSES*3
+    DROPOUT_PROBABILITY = 1/(N_HASHES * N_NODES)*8  # Probability of node dropping out of swarm completely
+    JOIN_PROBABILITY = 10/N_HASHES*3
 
     SLOWDOWN_PROBABILITY = 1/8  # every N't node will be very slow uploader
     SLOWDOWN_FACTOR = 100  # transfer time multiplier for "very slow" nodes
 
     swarm = SwarmCoordinator()
-    swarm.reset_hashes((str(i) for i in range(N_HASHSES)))
+    swarm.reset_hashes((str(i) for i in range(N_HASHES)))
 
     plan_now_trigger = asyncio.Event()  # asyncio event to wake planner
     joins_left, next_node_num = N_NODES, 0
@@ -344,7 +344,7 @@ def simulate() -> None:
             await asyncio.sleep(0.5)
         print_status()
 
-        best_t = (TRANSFER_TIME_MIN+TRANSFER_TIME_MAX)/2 * N_HASHSES / min(SEEDER_UL_SLOTS, NODE_UL_SLOT)
+        best_t = (TRANSFER_TIME_MIN+TRANSFER_TIME_MAX)/2 * N_HASHES / min(SEEDER_UL_SLOTS, NODE_UL_SLOT)
         print("ALL DONE. Efficiency vs. ideal multicast = %.1f%%" % (best_t / (time.time() - start_t) * 100))
 
     asyncio.run(runner())

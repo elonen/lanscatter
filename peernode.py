@@ -1,6 +1,6 @@
 from typing import Callable, Dict, Tuple, Set, Optional
 from chunker import SyncBatch, scan_dir
-from common import make_human_cli_status_func, json_status_func
+from common import make_human_cli_status_func, json_status_func, defaults
 import asyncio, aiohttp
 from aiohttp import web, WSMsgType
 from pathlib import Path
@@ -18,11 +18,11 @@ class PeerNode:
     Process that scans sync directory, hashes it, and keeps it synced with a file list from master server.
     '''
     def __init__(self,
-                 basedir: str,  # Sync directory path
-                 status_func: Callable,  # Callback for status reporting
-                 file_rescan_interval: float,  # How often to rescan sync directory (seconds)
-                 dl_limit: float,  # Download limit, Mbits/s
-                 ul_limit: float):  # Upload limit, Mbits/s
+                 basedir: str,                  # Sync directory path
+                 status_func: Callable,         # Callback for status reporting
+                 file_rescan_interval: float,   # How often to rescan sync directory (seconds)
+                 dl_limit: float,               # Download limit, Mbits/s
+                 ul_limit: float):              # Upload limit, Mbits/s
 
         self.local_rescan_interval = file_rescan_interval
         self.next_periodical_rescan = time.time()
@@ -36,6 +36,7 @@ class PeerNode:
         self.local_batch = SyncBatch()
         self.remote_batch = SyncBatch()
         self.incoming = set()
+        self.joined_swarm = False
 
         async def __on_upload_finished():
             await self.send_transfer_report()  # Let server know how many free upload slots peer node has
@@ -82,7 +83,7 @@ class PeerNode:
 
         # Check each missing chunk to see if we've already got it in another local file
         for missing in chunk_diff.there_only:
-            dupe = next(iter(self.local_batch.chunks_containing(missing.hash)), None)
+            dupe = self.local_batch.first_chunk_with(missing.hash)
             if dupe:
                 self.status_func(log_info=f'LOCAL: Copying {missing.hash} from "{dupe.path}"/{dupe.pos}'
                                           f' to "{missing.path}"/{missing.pos}')
@@ -127,7 +128,7 @@ class PeerNode:
         self.local_batch.sanity_checks()
 
         # Are we in sync yet?
-        if self.local_batch.to_json() == self.remote_batch.to_json():
+        if self.local_batch == self.remote_batch:
             self.status_func(log_info='Up to date.', cur_status='Up to date.', progress=-1)
         else:
             # If we've got all hashes, local changes and scans should get us up to date. Run multiple times if needed.
@@ -145,7 +146,7 @@ class PeerNode:
         '''
         Async task to download chunk with given hash from given URL and writing it to relevant files.
         '''
-        if self.local_batch.chunks_containing(chunk_hash):
+        if self.local_batch.first_chunk_with(chunk_hash):
             self.status_func(log_info=f"Aborting download of {chunk_hash}; already got it.")
             return
 
@@ -153,7 +154,7 @@ class PeerNode:
             self.status_func(log_info=f"Aborting download of {chunk_hash}; hash alreadin in 'incoming'.")
             return
 
-        target = next(iter(self.remote_batch.chunks_containing(chunk_hash)), None)
+        target = self.remote_batch.first_chunk_with(chunk_hash)
         if not target:
             raise IOError(f'Bad download command from master, or old filelist? Chunk {chunk_hash} is unknown.')
         try:
@@ -163,7 +164,8 @@ class PeerNode:
             self.status_func(cur_status=f'Downloading chunks...',
                              progress=len(self.local_batch.all_hashes()) / len(self.remote_batch.all_hashes()))
             await asyncio.wait_for(self.file_io.download_chunk(
-                target, url, http_session, file_size=self.remote_batch.files[target.path].size), timeout=timeout)
+                chunk=target, url=url, http_session=http_session,
+                file_size=self.remote_batch.files[target.path].size), timeout=timeout)
 
             self.local_batch.add(chunks=(target,))
             await self.server_send_queue.put({
@@ -212,13 +214,14 @@ class PeerNode:
             elif action == 'initial_batch':
                 self.status_func(log_info=f'Initial sync batch received.')
                 new_batch = SyncBatch.from_dict(msg.get('data'))
-                self.status_func(log_info=f'Chunks size is {int(new_batch.chunk_size/1024/1024+0.5)} MB ({new_batch.chunk_size} bytes).')
+                self.status_func(log_info=f'Chunks size is {int(new_batch.chunk_size/1024/1024+0.5)} MB '
+                                          f'({new_batch.chunk_size} bytes).')
                 self.remote_batch = new_batch
                 self.full_rescan_trigger.set()
 
             elif action == 'new_batch':
                 new_batch = SyncBatch.from_dict(msg.get('data'))
-                if new_batch.to_json() != self.remote_batch.to_json():
+                if new_batch != self.remote_batch:
                     self.status_func(log_info=f'New sync batch received.')
                     self.remote_batch = new_batch
                     await self.local_file_fixups()
@@ -278,7 +281,10 @@ class PeerNode:
                 with suppress(asyncio.TimeoutError):
                     await asyncio.wait([self.exit_trigger.wait()], timeout=5)
             finally:
+                # Return into initial state for new connection
                 self.remote_batch = SyncBatch()
+                self.next_periodical_rescan = time.time()
+                self.joined_swarm = False
 
         self.status_func(log_info=f'Server connection loop exiting.')
 
@@ -287,9 +293,8 @@ class PeerNode:
         self.status_func(log_info=f'File scanner loop starting.')
 
         def __hash_dir_progress_func(cur_filename, file_progress, total_progress):
-            self.status_func(progress=total_progress, cur_status=f'Hashing ({cur_filename} / {int(file_progress*100+0.5)}%)')
-
-        joined = False
+            self.status_func(progress=total_progress,
+                             cur_status=f'Hashing ({cur_filename} / {int(file_progress*100+0.5)}%)')
 
         while not self.exit_trigger.is_set():
             # TODO: process a per-file queue to scan files when fully downloaded
@@ -297,7 +302,7 @@ class PeerNode:
             if self.remote_batch.chunk_size > 0:
                 # Time for a periodical rescan after sync is complete?
                 full_periodical_now = time.time() >= self.next_periodical_rescan and \
-                                      self.local_batch.to_json() == self.remote_batch.to_json()
+                                      self.local_batch == self.remote_batch
 
                 # Wait until server has give us a remote batch (cannot chunk files without knowing chunk size)
                 if self.full_rescan_trigger.is_set() or full_periodical_now:
@@ -310,13 +315,13 @@ class PeerNode:
                         old_batch=self.local_batch, progress_func=__hash_dir_progress_func)
                     self.status_func(log_debug='Rescan finished.')
 
-                    different_from_remote = self.remote_batch.to_json() != new_local_batch.to_json()
+                    different_from_remote = self.remote_batch != new_local_batch
 
-                    if not joined or new_local_batch != self.local_batch or different_from_remote:
+                    if not self.joined_swarm or new_local_batch != self.local_batch or different_from_remote:
                         self.local_batch = new_local_batch
                         self.fileserver.batch = self.local_batch
                         await self.local_file_fixups()
-                        if not joined:
+                        if not self.joined_swarm:
                             joined = True
                             await self.server_send_queue.put({
                                 'action': 'join_swarm',
@@ -343,8 +348,10 @@ class PeerNode:
         def sig_exit():
             self.exit_trigger.set()
         try:
-            for sig in (SIGINT, SIGTERM):  # FIXME: CTRL-C doesn't terminate if server is connected
+            for sig in (SIGINT, SIGTERM):
                 asyncio.get_running_loop().add_signal_handler(sig, sig_exit)
+
+            # TODO: Runaway loop detection and avoidance with ratelimiter
 
             await self.fileserver.create_http_server(port=port, fileio=self.file_io)
             await asyncio.wait([
@@ -356,12 +363,16 @@ class PeerNode:
         except Exception as e:
             self.status_func(log_error='PeerNode error:\n' + traceback.format_exc(), popup=True)
 
+
 # --------------------------------------------------------------------------------------------------------
 
-async def run_file_client(base_dir: str, server_url: str, port: int, status_func=None,
-                          rescan_interval: float = 60,
-                          dl_limit: float = 10000, ul_limit: float = 10000,
-                          concurrent_transfer_limit: int = 2):
+
+async def run_file_client(base_dir: str, server_url: str, status_func=None,
+                          port: int = defaults.TCP_PORT,
+                          rescan_interval: float = defaults.DIR_SCAN_INTERVAL_MASTER,
+                          dl_limit: float = defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC,
+                          ul_limit: float = defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC,
+                          concurrent_transfer_limit: int = defaults.CONCURRENT_TRANSFERS_PEER):
     pn = PeerNode(basedir=base_dir, status_func=status_func, file_rescan_interval=rescan_interval,
                   dl_limit=dl_limit, ul_limit=ul_limit)
     await pn.run(port, server_url, concurrent_transfer_limit)
@@ -370,14 +381,19 @@ async def run_file_client(base_dir: str, server_url: str, port: int, status_func
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('dir', help='Sync directory')
-    parser.add_argument('--url', default='ws://localhost:14433/ws', help='Master server URL')
-    parser.add_argument('-p', '--port', dest='port', type=int, default=14435, help='HTTP(s) port for P2P transfers')
-    parser.add_argument('--rescan-interval', dest='rescan_interval', type=float, default=60, help='How often to rescan files')
-    parser.add_argument('--dl-rate', dest='dl_limit', type=float, default=10000, help='Rate limit downloads, Mb/s')
-    parser.add_argument('--ul-rate', dest='ul_limit', type=float, default=10000, help='Rate limit uploads, Mb/s')
-    parser.add_argument('-c', '--concurrent-transfers', dest='ct', type=int, default=2, help='Max concurrent dls/uls')
-    parser.add_argument('--cache-time', dest='cache_time', type=float, default=45, help='HTTP cache expiration time')
-    parser.add_argument('--json', dest='json', action='store_true', default=False, help='Show status as JSON (for GUI usage)')
+    parser.add_argument('--url', required=True, help='Master server URL. E.g. ws://localhost:10565/ws ')
+    parser.add_argument('-p', '--port', dest='port', type=int,
+                        default=defaults.TCP_PORT, help='TCP port for P2P transfers')
+    parser.add_argument('--ul-rate', dest='ul_limit', type=float,
+                        default=defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC, help='Rate limit uploads, Mb/s')
+    parser.add_argument('--dl-rate', dest='dl_limit', type=float,
+                        default=defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC, help='Rate limit downloads, Mb/s')
+    parser.add_argument('-c', '--concurrent-transfers', dest='ct', type=int,
+                        default=defaults.CONCURRENT_TRANSFERS_PEER, help='Max concurrent dls/uls')
+    parser.add_argument('-s', '--rescan-interval', dest='rescan_interval', type=float,
+                        default=defaults.DIR_SCAN_INTERVAL_PEER, help='Seconds to wait between sync dir rescans')
+    parser.add_argument('--json', dest='json', action='store_true', default=False,
+                        help='Show status as JSON (for GUI usage)')
     parser.add_argument('-d', '--debug', dest='debug', action='store_true', default=False,
                         help='Show debug level log messages (no effect if --json is specified')
     args = parser.parse_args()
@@ -387,6 +403,7 @@ def main():
                                     rescan_interval=args.rescan_interval,
                                     dl_limit=args.dl_limit, ul_limit=args.ul_limit, concurrent_transfer_limit=args.ct,
                                     status_func=status_func))
+
 
 if __name__ == "__main__":
     main()

@@ -4,6 +4,7 @@ from chunker import FileChunk, HashFunc
 from aiohttp import web, ClientSession
 from typing import Tuple, Optional
 from contextlib import suppress
+from common import defaults
 import aiofiles, os, time, asyncio, aiohttp, mmap
 
 class FileIO:
@@ -14,10 +15,6 @@ class FileIO:
     basedir: Path
     dl_limiter: RateLimiter
     ul_limiter: RateLimiter
-
-    FILE_BUFFER_SIZE = 256 * 1024
-    DOWNLOAD_BUFFER_MAX = 256 * 1024
-    NETWORK_BUFFER_MIN = 8 * 1024
 
     def __init__(self, basedir: Path, dl_rate_limit: float, ul_rate_limit: float):
         '''
@@ -92,7 +89,7 @@ class FileIO:
                     headers={'Content-Type': 'application/octet-stream', 'Content-Disposition': 'inline'})
                 await response.prepare(request)
 
-                buff_in, buff_out = bytearray(self.FILE_BUFFER_SIZE), None
+                buff_in, buff_out = bytearray(defaults.FILE_BUFFER_SIZE), None
 
                 async def read_file():
                     nonlocal buff_in, remaining, chunk
@@ -109,11 +106,11 @@ class FileIO:
                 async def write_http():
                     nonlocal buff_out
                     if not buff_out:
-                        buff_out = bytearray(self.FILE_BUFFER_SIZE)
+                        buff_out = bytearray(defaults.FILE_BUFFER_SIZE)
                     else:
                         i, cnt = 0, len(buff_out)
                         while cnt > 0:
-                            limited_n = int(await self.ul_limiter.acquire(cnt, self.NETWORK_BUFFER_MIN))
+                            limited_n = int(await self.ul_limiter.acquire(cnt, defaults.NETWORK_BUFFER_MIN))
                             await response.write(buff_out[i:(i + limited_n)])
                             i += limited_n
                             cnt -= limited_n
@@ -186,7 +183,8 @@ class FileIO:
 
                     async def read_http():
                         nonlocal buff_in
-                        limited_n = int(await self.dl_limiter.acquire(self.DOWNLOAD_BUFFER_MAX, self.NETWORK_BUFFER_MIN))
+                        limited_n = int(await self.dl_limiter.acquire(
+                            defaults.DOWNLOAD_BUFFER_MAX, defaults.NETWORK_BUFFER_MIN))
                         buff_in = await resp.content.read(limited_n)
                         self.dl_limiter.unspend(limited_n - len(buff_in))
                         buff_in = buff_in if buff_in else None
