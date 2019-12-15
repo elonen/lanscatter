@@ -1,9 +1,9 @@
 from aiohttp import web, WSMsgType
 from pathlib import Path
 from typing import Callable, Optional
-import asyncio, aiofiles, argparse, traceback, html
-from chunker import monitor_folder_forever
-from common import make_human_cli_status_func, json_status_func, defaults
+import asyncio, aiofiles, traceback, html
+from chunker import scan_dir
+from common import make_human_cli_status_func, json_status_func, defaults, parse_cli_args
 from types import SimpleNamespace
 from contextlib import suppress
 from datetime import datetime
@@ -11,6 +11,8 @@ import planner
 from fileio import FileIO
 from fileserver import FileServer
 
+# Server that plans p2p distribution of sync directory files to connected clients,
+# and also works as a seed node.
 
 class MasterNode:
 
@@ -302,13 +304,17 @@ async def run_master_server(base_dir: str,
     server = MasterNode(status_func=status_func, chunk_size=chunk_size)
 
     async def dir_scanner_loop():
+        """Periodically scan sync directory for changes"""
         def progress_func_adapter(cur_filename, file_progress, total_progress):
             status_func(progress=total_progress,
                         cur_status=f'Hashing "{cur_filename}" ({int(file_progress * 100 + 0.5)}% done)')
-        async for new_batch in monitor_folder_forever(
-                basedir=base_dir, update_interval=dir_scan_interval,
-                progress_func=progress_func_adapter, chunk_size=chunk_size):
-            await server.replace_sync_batch(new_batch)
+        while True:
+            # TODO: integrate with inotify (watchdog package) to avoid frequent rescans
+            new_batch = await scan_dir(base_dir, chunk_size=chunk_size, old_batch=server.file_server.batch,
+                                       progress_func=progress_func_adapter)
+            if new_batch is not server.file_server.batch:
+                await server.replace_sync_batch(new_batch)
+            await asyncio.sleep(dir_scan_interval)
 
     await asyncio.gather(
         dir_scanner_loop(),
@@ -318,23 +324,7 @@ async def run_master_server(base_dir: str,
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('dir', help='Directory to serve files from')
-    parser.add_argument('-p', '--port', dest='port', type=int, default=defaults.TCP_PORT, help='HTTP(s) server port')
-    parser.add_argument('--ul-rate', dest='ul_limit', type=float,
-                        default=defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC, help='Rate limit uploads, Mb/s')
-    parser.add_argument('-c', '--concurrent-transfers', dest='ct', type=int,
-                        default=defaults.CONCURRENT_TRANSFERS_MASTER, help='Max concurrent uploads')
-    parser.add_argument('--chunksize', dest='chunksize', type=int,
-                        default=defaults.CHUNK_SIZE, help='Chunk size for splitting files (in bytes)')
-    parser.add_argument('-s', '--rescan-interval', dest='rescan_interval', type=float,
-                        default=defaults.DIR_SCAN_INTERVAL_MASTER, help='Seconds to wait between sync dir rescans')
-    parser.add_argument('--sslcert', type=str, default=None, help='SSL certificate file for HTTPS (optional)')
-    parser.add_argument('--sslkey', type=str, default=None, help='SSL key file for HTTPS (optional)')
-    parser.add_argument('--json', dest='json', action='store_true', default=False, help='Show status as JSON (for GUI usage)')
-    parser.add_argument('-d', '--debug', dest='debug', action='store_true', default=False,
-                        help='Show debug level log messages (no effect if --json is specified')
-    args = parser.parse_args()
+    args = parse_cli_args(is_master=True)
     status_func = json_status_func if args.json else make_human_cli_status_func(log_level_debug=args.debug)
     with suppress(KeyboardInterrupt):
         asyncio.run(run_master_server(

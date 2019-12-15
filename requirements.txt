@@ -3,5 +3,8 @@ aiohttp
 aiofiles
 wxPython
 
+pytest
+pytest-timeout
+
 win10toast; sys_platform == 'windows'
 pyobjc-core; sys_platform == 'darwin'

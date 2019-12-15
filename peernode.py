@@ -1,6 +1,6 @@
 from typing import Callable, Dict, Tuple, Set, Optional
 from chunker import SyncBatch, scan_dir
-from common import make_human_cli_status_func, json_status_func, defaults
+from common import make_human_cli_status_func, json_status_func, defaults, parse_cli_args
 import asyncio, aiohttp
 from aiohttp import web, WSMsgType
 from pathlib import Path
@@ -14,9 +14,7 @@ from signal import SIGINT, SIGTERM
 # and then serves downloaded chunks to peers for network load distribution.
 
 class PeerNode:
-    '''
-    Process that scans sync directory, hashes it, and keeps it synced with a file list from master server.
-    '''
+
     def __init__(self,
                  basedir: str,                  # Sync directory path
                  status_func: Callable,         # Callback for status reporting
@@ -60,10 +58,10 @@ class PeerNode:
 
     async def local_file_fixups(self, max_recursions=4):
         '''
-        Compare local and remote batch and:
+        Compare local and remote batch and try to get them in sync:
          - filter out local chunks that have no useful content
          - copy chunks from already downloaded files to missing ones if possible
-         - delete dangling extra files
+         - delete dangling (extraneous) files
          - set modification time to the target time when file matches remote specs (to speed up rescans)
          - set modification time to current time when file contents differ (=local file is incomplete)
         '''
@@ -151,7 +149,7 @@ class PeerNode:
             return
 
         if chunk_hash in self.incoming:
-            self.status_func(log_info=f"Aborting download of {chunk_hash}; hash alreadin in 'incoming'.")
+            self.status_func(log_info=f"Aborting download of {chunk_hash}; hash already in 'incoming'.")
             return
 
         target = self.remote_batch.first_chunk_with(chunk_hash)
@@ -181,6 +179,8 @@ class PeerNode:
             self.status_func(log_info=f'Download from {url} took over timeout ({timeout}s). Aborted.')
         except IOError as e:
             self.status_func(log_error=f'Download from {url} failed: {str(e)}')
+        except aiohttp.client_exceptions.ClientError as e:
+            self.status_func(log_error=f'Download from {url} failed, aiohttp ClientError: {str(e)}')
         except Exception as e:
             self.status_func(log_error=f'Exception in download_task: \n' + traceback.format_exc(), popup=True)
             raise e
@@ -297,7 +297,8 @@ class PeerNode:
                              cur_status=f'Hashing ({cur_filename} / {int(file_progress*100+0.5)}%)')
 
         while not self.exit_trigger.is_set():
-            # TODO: process a per-file queue to scan files when fully downloaded
+            # TODO: integrate with inotify (watchdog package) to avoid frequent rescans when up-to-date.
+            #  (on any event, schedule next scan 10s in the future to avoid trashing when modification is on-going)
 
             if self.remote_batch.chunk_size > 0:
                 # Time for a periodical rescan after sync is complete?
@@ -379,24 +380,7 @@ async def run_file_client(base_dir: str, server_url: str, status_func=None,
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('dir', help='Sync directory')
-    parser.add_argument('--url', required=True, help='Master server URL. E.g. ws://localhost:10565/ws ')
-    parser.add_argument('-p', '--port', dest='port', type=int,
-                        default=defaults.TCP_PORT, help='TCP port for P2P transfers')
-    parser.add_argument('--ul-rate', dest='ul_limit', type=float,
-                        default=defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC, help='Rate limit uploads, Mb/s')
-    parser.add_argument('--dl-rate', dest='dl_limit', type=float,
-                        default=defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC, help='Rate limit downloads, Mb/s')
-    parser.add_argument('-c', '--concurrent-transfers', dest='ct', type=int,
-                        default=defaults.CONCURRENT_TRANSFERS_PEER, help='Max concurrent dls/uls')
-    parser.add_argument('-s', '--rescan-interval', dest='rescan_interval', type=float,
-                        default=defaults.DIR_SCAN_INTERVAL_PEER, help='Seconds to wait between sync dir rescans')
-    parser.add_argument('--json', dest='json', action='store_true', default=False,
-                        help='Show status as JSON (for GUI usage)')
-    parser.add_argument('-d', '--debug', dest='debug', action='store_true', default=False,
-                        help='Show debug level log messages (no effect if --json is specified')
-    args = parser.parse_args()
+    args = parse_cli_args(is_master=False)
     status_func = json_status_func if args.json else make_human_cli_status_func(log_level_debug=args.debug)
     with suppress(KeyboardInterrupt):
         asyncio.run(run_file_client(base_dir=args.dir, server_url=args.url, port=args.port,

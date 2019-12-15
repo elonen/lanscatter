@@ -1,5 +1,5 @@
 from datetime import datetime
-import json
+import json, argparse
 
 class defaults:
     TCP_PORT = 10565
@@ -15,6 +15,33 @@ class defaults:
 
     CONCURRENT_TRANSFERS_PEER = 2
     DIR_SCAN_INTERVAL_PEER = 60
+
+
+def parse_cli_args(is_master: bool):
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('dir', help='Sync directory')
+    if not is_master:
+        parser.add_argument('url', help='URL to master node. E.g. ws://localhost:10565/ws ')
+        parser.add_argument('--dl-rate', dest='dl_limit', type=float,
+                            default=defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC, help='Rate limit downloads, Mb/s')
+    parser.add_argument('--ul-rate', dest='ul_limit', type=float,
+                        default=defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC, help='Rate limit uploads, Mb/s')
+    parser.add_argument('-c', '--concurrent-transfers', dest='ct', type=int,
+                        default=defaults.CONCURRENT_TRANSFERS_MASTER, help='Max concurrent transfers')
+    parser.add_argument('-p', '--port', dest='port', type=int, default=defaults.TCP_PORT, help='TCP port to listen')
+    parser.add_argument('-s', '--rescan-interval', dest='rescan_interval', type=float,
+                        default=defaults.DIR_SCAN_INTERVAL_MASTER, help='Seconds to wait between sync dir rescans')
+    if is_master:
+        parser.add_argument('--chunksize', dest='chunksize', type=int,
+                            default=defaults.CHUNK_SIZE, help='Chunk size for splitting files (in bytes)')
+        parser.add_argument('--sslcert', type=str, default=None, help='SSL certificate file for HTTPS (optional)')
+        parser.add_argument('--sslkey', type=str, default=None, help='SSL key file for HTTPS (optional)')
+
+    parser.add_argument('--json', dest='json', action='store_true', default=False, help='Show status as JSON (for GUI usage)')
+    parser.add_argument('-d', '--debug', dest='debug', action='store_true', default=False,
+                        help='Show debug level log messages. No effect if --json is specified.')
+    return parser.parse_args()
+
 
 def make_human_cli_status_func(log_level_debug = False):
 

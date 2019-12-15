@@ -152,6 +152,9 @@ class FileIO:
         if copy_from.hash != copy_to.hash:
             raise ValueError(f"From and To chunks must have same hash (was: '{copy_from.hash}' vs '{copy_to.hash}').")
 
+        # TODO: do this in blocks instead of loading the whole chunk into RAM. Rare overlap corruption edge case
+        #  doesn't matter as it will be detected by rescan and fixed in due time.
+
         async with self.open_and_seek(copy_from.path, copy_from.pos, for_write=False) as inf:
             if not inf:
                 raise FileNotFoundError(f'Local copy failed, no such file: {str(copy_from.path)}')
@@ -173,11 +176,11 @@ class FileIO:
         :param http_session: AioHTTP session to use for GET.
         :param file_size: Size of complete file (optional). File will be truncated to this size.
         '''
-        async with http_session.get(url, raise_for_status=True) as resp:
-            async with self.open_and_seek(chunk.path, chunk.pos, for_write=True) as outf:
-                if resp.status != 200:  # some error
-                    raise IOError(f'Unknown/unsupported HTTP status: {resp.status}')
-                else:
+        async with http_session.get(url) as resp:
+            if resp.status != 200:  # some error
+                raise IOError(f'Unknown/unsupported HTTP status: {resp.status}')
+            else:
+                async with self.open_and_seek(chunk.path, chunk.pos, for_write=True) as outf:
                     csum = HashFunc()
                     buff_in, buff_out = None, b''
 
@@ -227,3 +230,6 @@ class FileIO:
                 break
             with suppress(OSError):
                 d.rmdir()
+
+
+# TODO: Write unit test to confirm sanitizing works and prevents messing up files outside the sync dir

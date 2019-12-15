@@ -2,10 +2,12 @@ from typing import List, Set, Iterable, Dict, Tuple, Optional, Callable
 from types import SimpleNamespace
 import os, json, hashlib, asyncio, time
 import aiofiles, aiofiles.os, collections
-import mmap
+import mmap, concurrent.futures
 
 # Tools for scanning files in a directory and splitting them into hashed chunks.
-# FileServer and FileClient both use this for maintaining and syncing their state.
+# MasterNode and PeerNode both use this for maintaining and syncing their state.
+
+# TODO: convert to use fileio.py instead of directly os.*
 
 HashType = str
 
@@ -169,7 +171,6 @@ class HashFunc:
         return self
 
     async def update_async(self, data):
-        # TODO: make this run in a separate thread or process pool for better concurrency with file/net IO
         await asyncio.sleep(0)  # Minimal yield -- give simultaneously started IO tasks a chance to go first
         self.h.update(data)
         return self
@@ -211,11 +212,10 @@ async def hash_file(basedir: str, relpath: str, chunk_size: int,
             while pos < st.st_size:
                 sz = min(chunk_size, st.st_size - pos)
                 csum = await HashFunc().update_async(map[pos:(pos+sz)])
-                hash = csum.result()
                 chunks.append(FileChunk(
                         path=relpath,
                         pos=pos, size=sz,
-                        hash=hash))
+                        hash=csum.result()))
                 pos += sz
                 file_progress_func(relpath, sz, pos, st.st_size)
 
@@ -277,26 +277,6 @@ async def scan_dir(basedir: str, chunk_size: int, old_batch: Optional[SyncBatch]
     res = SyncBatch(chunk_size)
     res.add(files=res_files, chunks=res_chunks)
     return res
-
-
-async def monitor_folder_forever(basedir: str, update_interval: float, chunk_size: int, progress_func: Callable):
-    '''
-    Test 'basedir' for changes every 'update_interval_secs' and yield a new list of FileChunks when it happens.
-    (This is an async generator, intended to be used with "async for" syntax.)
-
-    :param basedir: Folder to watch
-    :param update_interval: Update interval in seconds
-    :param progress_func: Callback for progress reports when hashing - func(cur_filename, file_progress, total_progress)
-    :param chunk_size: Chunk size in bytes (for splitting files)
-    '''
-    batch = None
-    while True:
-        new_batch = await scan_dir(basedir, chunk_size=chunk_size, old_batch=batch, progress_func=progress_func)
-        if not (new_batch is batch):
-            batch = new_batch
-            yield batch
-        else:
-            await asyncio.sleep(update_interval)
 
 
 # ----------------------------
