@@ -214,8 +214,9 @@ class FileIO:
         os.utime(str(path), (mtime, mtime))
 
     async def create_folders(self, path):
+        """Create given directory and all parents"""
         path = self.resolve_and_sanitize(path)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.makedirs(path, exist_ok=True)
 
     async def size_and_mtime(self, path):
         path = self.resolve_and_sanitize(path)
@@ -224,9 +225,14 @@ class FileIO:
 
     async def remove_file_and_paths(self, path):
         path = self.resolve_and_sanitize(path)
-        path.unlink()
+        if path.exists():
+            if path.is_dir():
+                with suppress(OSError):
+                    path.rmdir()
+            else:
+                path.unlink()
         for d in path.parents:
-            if d == self.basedir:
+            if d == self.basedir and d != '.':
                 break
             with suppress(OSError):
                 d.rmdir()

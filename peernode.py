@@ -79,6 +79,14 @@ class PeerNode:
                                   f'{len(path_diff.with_different_attribs) + len(path_diff.there_only)} altered / '
                                   f'{len(path_diff.here_only)} dangling files.')
 
+        # Create missing directories
+        for p in path_diff.there_only:
+            f = self.remote_batch.files[p]
+            if f.is_dir:
+                await self.file_io.create_folders(p)
+                await self.file_io.change_mtime(p, f.mtime)
+                self.local_batch.add(files=[f])
+
         # Check each missing chunk to see if we've already got it in another local file
         for missing in chunk_diff.there_only:
             dupe = self.local_batch.first_chunk_with(missing.hash)
@@ -107,20 +115,30 @@ class PeerNode:
         for f in path_diff.with_different_attribs:
             here = self.local_batch.files[f.path]
             there = self.remote_batch.files[f.path]
-            assert(there.treehash is not None)
-            if here.treehash == there.treehash:
-                if here.size == there.size:
-                    assert(here.mtime != there.mtime)
-                    self.status_func(log_info=f'LOCAL: File complete, setting mtime: "{here.path}"')
+
+            if here.is_dir != there.is_dir:
+                self.status_func(log_info=f'LOCAL: "{f.path}" is dir here and file there (or vice versa). Deleting.')
+                await self.file_io.remove_file_and_paths(f.path)
+            elif here.is_dir:
+                if here.mtime != there.mtime:
+                    self.status_func(log_info=f'LOCAL: Fixing mtime for dir "{here.path}".')
                     await self.file_io.change_mtime(here.path, there.mtime)
                     here.mtime = there.mtime
-                else:
-                    self.status_func(log_error=f'LOCAL: Hash collision or bug?? Here: {str(here)}, there: {str(there)}')
-            elif here.mtime == there.mtime:
-                self.status_func(log_info=f'LOCAL: File "{here.path}" is has wrong content but was'
-                                          f' set to target time. Resetting it to "now".')
-                here.mtime = time.time()
-                await self.file_io.change_mtime(here.path, here.mtime)
+            else:
+                assert(there.treehash is not None)
+                if here.treehash == there.treehash:
+                    if here.size == there.size:
+                        assert(here.mtime != there.mtime)
+                        self.status_func(log_info=f'LOCAL: File complete, setting mtime: "{here.path}"')
+                        await self.file_io.change_mtime(here.path, there.mtime)
+                        here.mtime = there.mtime
+                    else:
+                        self.status_func(log_error=f'LOCAL: Hash collision or bug?? Here: {str(here)}, there: {str(there)}')
+                elif here.mtime == there.mtime:
+                    self.status_func(log_info=f'LOCAL: File "{here.path}" is has wrong content but was'
+                                              f' set to target time. Resetting it to "now".')
+                    here.mtime = time.time()
+                    await self.file_io.change_mtime(here.path, here.mtime)
 
         self.status_func(log_debug=f"LOCAL: Local fixups done.")
         self.local_batch.sanity_checks()
@@ -323,7 +341,7 @@ class PeerNode:
                         self.fileserver.batch = self.local_batch
                         await self.local_file_fixups()
                         if not self.joined_swarm:
-                            joined = True
+                            self.joined_swarm = True
                             await self.server_send_queue.put({
                                 'action': 'join_swarm',
                                 'hashes': tuple(self.local_batch.all_hashes()),

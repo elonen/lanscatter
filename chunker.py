@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import os, json, hashlib, asyncio, time
 import aiofiles, aiofiles.os, collections
 import mmap, concurrent.futures
+from pathlib import Path
 
 # Tools for scanning files in a directory and splitting them into hashed chunks.
 # MasterNode and PeerNode both use this for maintaining and syncing their state.
@@ -34,6 +35,10 @@ class FileAttribs(HashableBase):
     size: int      # size of complete file in bytes
     mtime: int     # last modified (unix timestamp)
     treehash: HashType   # combine hash for whole file (hash of concatenated chunk hashes)
+
+    @property
+    def is_dir(self):
+        return self.size < 0
 
 
 def calc_tree_hash(chunks: Iterable[FileChunk]) -> HashType:
@@ -80,10 +85,16 @@ class SyncBatch:
 
     def sanity_checks(self) -> None:
         """Assert that contents are valid"""
-        #Check that we don't have multiple chunks for a file at same pos
-        dupe_count = collections.Counter([c.path + '\0' + str(c.pos) for c in self.chunks])
+        dupe_count = collections.Counter([(c.path, c.pos) for c in self.chunks])
         illegal_dupes = [chunk for (chunk, cnt) in dupe_count.items() if cnt != 1]
-        assert (not illegal_dupes)
+        assert not illegal_dupes
+        for f in self.files.values():
+            assert '\\' not in f.path  # Windows version should also use '/' as a separator
+        for f in self.files.values():
+            assert f.is_dir == f.path.endswith('/')
+        for c in self.chunks:
+            assert c.path in self.files
+
 
     def add(self, files: Iterable[FileAttribs] = (), chunks: Iterable[FileChunk] = ()):
         """
@@ -151,14 +162,10 @@ class SyncBatch:
 
     @staticmethod
     def from_dict(data: Dict) -> 'SyncBatch':
-        res = SyncBatch(chunk_size = data['chunk_size'])
+        res = SyncBatch(chunk_size=data['chunk_size'])
         res.add(files=(FileAttribs(**d) for d in data['files']),
                 chunks=(FileChunk(**d) for d in data['chunks']))
         return res
-
-    @staticmethod
-    def from_json(json_txt: str) -> 'SyncBatch':
-        return from_dict(json.loads(json_txt))
 
 
 class HashFunc:
@@ -235,7 +242,10 @@ async def scan_dir(basedir: str, chunk_size: int, old_batch: Optional[SyncBatch]
     :return: New list of FileChunks, or old_chunks if no changes are detected
     '''
     fnames = []
+    dirs = []
     for root, d_names, f_names in os.walk(basedir, topdown=False, onerror=None, followlinks=False):
+        for path in d_names:
+            dirs.append(os.path.relpath(os.path.join(root, path), basedir))
         for f in f_names:
             fnames.append(os.path.relpath(os.path.join(root, f), basedir))
 
@@ -273,6 +283,13 @@ async def scan_dir(basedir: str, chunk_size: int, old_batch: Optional[SyncBatch]
             res_chunks.extend([c for c in old_batch.chunks if c.path == fn])
             res_files.append(old_batch.files[fn])
             total_remaining -= res_files[-1].size
+
+    # Build a minimal list of empty directories, without redundant parents
+    dirs = set(dirs) | set((str(Path(p).parent) for p in fnames)) - set('.')
+    for d in dirs:
+        res_files.append(FileAttribs(
+            path=d+'/', size=-1, treehash=None,
+            mtime=int((Path(basedir)/d).stat().st_mtime)))
 
     res = SyncBatch(chunk_size)
     res.add(files=res_files, chunks=res_chunks)

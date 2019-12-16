@@ -36,7 +36,7 @@ class MasterNode:
         return {'action': 'new_batch', 'data': self.file_server.batch.to_dict()}
 
     async def replace_sync_batch(self, new_batch):
-        if new_batch != self.file_server:
+        if new_batch != self.file_server.batch:
             self.status_func(log_info='Sync batch changed. Updating planner and notifying clients.')
             self.file_server.set_batch(new_batch)
 
@@ -49,7 +49,7 @@ class MasterNode:
                     await n.client.send_queue.put(fl_msg)
             self.replan_trigger.set()
         else:
-            self.status_func(log_info='New sync batch was identical to old one. No action.')
+            self.status_func(log_info='No changes in sync dir.')
 
 
     def server_loop(self, base_dir: str, port: int,
@@ -312,7 +312,7 @@ async def run_master_server(base_dir: str,
             # TODO: integrate with inotify (watchdog package) to avoid frequent rescans
             new_batch = await scan_dir(base_dir, chunk_size=chunk_size, old_batch=server.file_server.batch,
                                        progress_func=progress_func_adapter)
-            if new_batch is not server.file_server.batch:
+            if new_batch != server.file_server.batch:
                 await server.replace_sync_batch(new_batch)
             await asyncio.sleep(dir_scan_interval)
 

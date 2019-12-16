@@ -31,13 +31,25 @@ def make_test_dirs(tmp_path):
         mtime = int(time.time() * random.random())
         os.utime(str(p), (mtime, mtime))
 
+    rnd_postfix = 0
+    def rnd_name(prefix: str, postfix: str = ''):
+        nonlocal  rnd_postfix
+        rnd_postfix += 1
+        return prefix + '%05d' % int(random.random()*1000) + '_%d'%rnd_postfix + postfix
+
     def setup_test_content(base: Path, sub_dir: str, keep_empty=False):
         base = base / sub_dir
         base.mkdir(parents=True, exist_ok=True)
         if not keep_empty:
-            # TODO: enable empty dir test and write application code to make it pass:
-            #(base / f'empty_dir_{int(random.random() * 1000)}').mkdir(parents=True, exist_ok=True)  # create empty dir
-            for d in ('.', 'dir1', 'dir2', 'dir2/dir2_nested'):
+
+            # Create some empty dirs
+            (base / rnd_name('empty_dir')).mkdir(parents=True, exist_ok=True)
+            p = base / rnd_name('empty_dir') / 'a'
+            (p / 'b' / 'c').mkdir(parents=True, exist_ok=True)
+            create_file(p / rnd_name('file', '.bin'), CHUNK_SIZE)
+
+            # Create some dirs with content
+            for d in ('.', 'dir1', rnd_name('dir_'), 'dir2/dir2_nested'):
                 p = base / d
                 p.mkdir(parents=True, exist_ok=True)
                 create_file(p / 'empty', 0)
@@ -54,9 +66,8 @@ def make_test_dirs(tmp_path):
                 create_file(p / 'many_chunks.bin', int(CHUNK_SIZE * 5.5))
                 create_file(p / 'zeroes.bin', int(CHUNK_SIZE * 3.1), pattern=b'\0' * CHUNK_SIZE)
                 create_file(p / 'less_zeroes.bin', int(CHUNK_SIZE * 1.1), pattern=b'\0' * CHUNK_SIZE)
-                n = int(random.random() * 100000)
                 for x in range(5):
-                    create_file(p / f'rnd_file_{n+x}.bin', int(random.random() * CHUNK_SIZE * 7))
+                    create_file(p / rnd_name('rnd_file', '.bin'), int(random.random() * CHUNK_SIZE * 7))
         return str(base.resolve())
 
     print(f"Creating seed dir contents in '{tmp_path}'...")
