@@ -293,7 +293,7 @@ class MasterNode:
 
 
 async def run_master_server(base_dir: str,
-                            port: int = Defaults.TCP_PORT,
+                            port: int = Defaults.TCP_PORT_MASTER,
                             dir_scan_interval: float = Defaults.DIR_SCAN_INTERVAL_MASTER,
                             status_func=None,
                             ul_limit: float = Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC,
@@ -312,6 +312,7 @@ async def run_master_server(base_dir: str,
             # TODO: integrate with inotify (watchdog package) to avoid frequent rescans
             new_batch = await scan_dir(base_dir, chunk_size=chunk_size, old_batch=server.file_server.batch,
                                        progress_func=progress_func_adapter)
+            status_func(cur_status=f'Serving as master.')
             if new_batch != server.file_server.batch:
                 await server.replace_sync_batch(new_batch)
             await asyncio.sleep(dir_scan_interval)

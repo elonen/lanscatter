@@ -27,14 +27,14 @@ class FileChunk(HashableBase):
     path: str           # path + filename
     pos: int            # chunk start position in bytes
     size: int           # chunk size in bytes
-    hash: HashType       # Hex checksum of data contents (blake2, digest_size=12)
+    hash: HashType      # Hex checksum of data contents (blake2, digest_size=12)
 
 
 class FileAttribs(HashableBase):
     path: str
-    size: int      # size of complete file in bytes
-    mtime: int     # last modified (unix timestamp)
-    treehash: HashType   # combine hash for whole file (hash of concatenated chunk hashes)
+    size: int                      # size of complete file in bytes
+    mtime: int                     # last modified (unix timestamp)
+    treehash: Optional[HashType]   # combine hash for whole file (hash of concatenated chunk hashes)
 
     @property
     def is_dir(self):
@@ -139,10 +139,10 @@ class SyncBatch:
 
     def chunk_diff(self, there: 'SyncBatch'):
         """Compare this and given batches for content (chunk list) changes"""
-        there = there.chunks
+        there_chunks = there.chunks
         return SimpleNamespace(
-            there_only=there - self.chunks,
-            here_only=self.chunks - there)
+            there_only=there_chunks - self.chunks,
+            here_only=self.chunks - there_chunks)
 
     def all_hashes(self) -> Set[HashType]:
         """Return set of unique hashes in the batch"""
@@ -275,9 +275,9 @@ async def scan_dir(basedir: str, chunk_size: int, old_batch: Optional[SyncBatch]
     res_files, res_chunks = [], []
     for fn in fnames:
         if fn in files_needing_rehash:
-            f, c = await hash_file(basedir, fn, chunk_size, file_progress_func=file_progress)
-            res_files.append(f)
-            res_chunks.extend(c)
+            attribs, chunks = await hash_file(basedir, fn, chunk_size, file_progress_func=file_progress)
+            res_files.append(attribs)
+            res_chunks.extend(chunks)
         else:
             res_chunks.extend([c for c in old_batch.chunks if c.path == fn])
             res_files.append(old_batch.files[fn])

@@ -171,6 +171,7 @@ def test_actual_swarm_on_localhost(make_test_dirs):
         cmp = filecmp.dircmp(p.dir, master.dir)
         try:
             assert 'Exception' not in p.out.getvalue(), f'Exception(s) on {p.name}'
+            assert 'egmentation fault' not in p.out.getvalue()
             assert p.is_master or 'Up to date' in p.out.getvalue(), 'Node never reached up-to-date state.'
             assert not cmp.diff_files, f'Differing files between {p.name} and master: {str(cmp.diff_files)}'
             assert not cmp.funny_files, f'"Funny" files between {p.name} and master: {str(cmp.funny_files)}'

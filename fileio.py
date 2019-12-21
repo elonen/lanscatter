@@ -7,6 +7,7 @@ from contextlib import suppress
 from common import Defaults
 import aiofiles, os, time, asyncio, aiohttp, mmap
 
+
 class FileIO:
     """
     Helper for reading and writing chunks from/to files + downloading / uploading them over network.

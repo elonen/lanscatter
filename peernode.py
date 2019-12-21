@@ -211,7 +211,6 @@ class PeerNode:
         """
         Ingest messages from websocket connection with master.
         """
-        self.status_func(log_debug=f'Message from server: {str(msg)}')
         try:
             async def error(txt):
                 self.status_func(log_error=f'Error handling server message: {txt}, orig msg="{str(msg)}"')
@@ -220,9 +219,9 @@ class PeerNode:
             action = msg.get('action')
 
             if action == 'download':
-                chunk_hash, url, timeout = msg.get('chunk_hash'), msg.get('url'), msg.get('timeout')
+                chunk_hash, url, timeout = msg.get('hash'), msg.get('url'), msg.get('timeout')
                 if None in (chunk_hash, url, timeout):
-                    return error('Bad download command from server')
+                    return await error('Bad download command from server')
                 asyncio.create_task(self.download_task(chunk_hash, url, http_session, timeout))
 
             elif action == 'rehash':
@@ -294,8 +293,14 @@ class PeerNode:
                         self.status_func(log_info=f'Connection to master closed.')
                         send_task.cancel()
 
+            except aiohttp.client_exceptions.WSServerHandshakeError:
+                self.status_func(log_error=f'Websock handshake to {server_url} failed. Bad URL? Aborting.', popup=True)
+                return
+
             except aiohttp.client_exceptions.ClientConnectorError:
-                self.status_func(log_error=f'HTTP/Websocket connect to server {server_url} failed. Retrying in a bit...')
+                self.status_func(
+                    log_error=f'HTTP/Websocket connect to server {server_url} failed. Retrying in a bit...',
+                    cur_status='Connecting master...')
                 with suppress(asyncio.TimeoutError):
                     await asyncio.wait([self.exit_trigger.wait()], timeout=5)
             finally:
@@ -387,7 +392,7 @@ class PeerNode:
 
 
 async def run_file_client(base_dir: str, server_url: str, status_func=None,
-                          port: int = Defaults.TCP_PORT,
+                          port: int = Defaults.TCP_PORT_PEER,
                           rescan_interval: float = Defaults.DIR_SCAN_INTERVAL_MASTER,
                           dl_limit: float = Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC,
                           ul_limit: float = Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC,

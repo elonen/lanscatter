@@ -7,13 +7,12 @@ import multiprocessing as mp
 from datetime import datetime, timedelta
 import common
 
-APP_NAME = 'Lanscatter'
-
 SETTINGS_DEFAULTS = {
-    'listen_port': common.Defaults.TCP_PORT,
-    'master_url': f'ws://127.0.0.1:{common.Defaults.TCP_PORT}/ws',
+    'listen_port': common.Defaults.TCP_PORT_PEER,
+    'master_url': f'ws://127.0.0.1:{common.Defaults.TCP_PORT_MASTER}/ws',
     'sync_dir': './sync-target/',
-    'is_master': False}
+    'is_master': False
+}
 
 
 # To be run in separate process:
@@ -27,8 +26,8 @@ def sync_proc(conn, is_master, argv):
         sys.stdout, sys.stderr = out, out
         sys.argv = argv
         if is_master:
-            import fileserver
-            fileserver.main()
+            import masternode
+            masternode.main()
         else:
             import peernode
             peernode.main()
@@ -84,7 +83,7 @@ class SettingsDlg(wx.Dialog):
         # Port to listen
         hb = wx.BoxSizer(wx.HORIZONTAL)
         hb.Add(wx.StaticText(panel, label='Local port'), st_hor)
-        self.listen_port = wx.SpinCtrl(panel, value="1", min=1, max=65535, initial=common.Defaults.TCP_PORT)
+        self.listen_port = wx.SpinCtrl(panel, value="1", min=1, max=65535, initial=common.Defaults.TCP_PORT_PEER)
         hb.Add(self.listen_port, st_hor)
         vbox.Add(hb, st_vert)
 
@@ -125,6 +124,31 @@ class SettingsDlg(wx.Dialog):
         return res
 
 
+# Simple log viewer window
+class LogWindow(wx.Dialog):
+    def __init__(self, parent=None, systray_icon: 'TaskBarIcon' = None):
+        super(LogWindow, self).__init__(parent, style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.systray_icon = systray_icon
+        panel = wx.Panel(self, wx.ID_ANY)
+        self.Bind(wx.EVT_CLOSE, self.OnClose)
+
+        self.log_widget = wx.TextCtrl(panel, wx.ID_ANY, size=(640, 240), style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL)
+        self.log_widget.SetFont(wx.Font(10, wx.MODERN, wx.NORMAL, wx.NORMAL, False, u'Courier'))
+        self.log_widget.WriteText(self.systray_icon.log_text.getvalue())
+
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        sizer.Add(self.log_widget, 1, wx.ALL | wx.EXPAND, 5)
+        panel.SetSizer(sizer)
+        self.Centre()
+
+    def OnClose(self, event):
+        self.Destroy()
+        self.systray_icon.log_win = None
+
+    def write(self, txt):
+        wx.CallAfter(self.log_widget.WriteText, txt)
+
+
 # Animated sys tray icon with popup menu (main UI class for this app)
 class TaskBarIcon(wx.adv.TaskBarIcon):
 
@@ -139,8 +163,12 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
         wx.adv.TaskBarIcon.__init__(self)
 
         self.cur_progress_text = ''
-        self.cur_status_text = '(sync not running)'
+        self.cur_status_text = '(not running)'
         self.syncer = None
+
+        self.log_text = io.StringIO()
+        self.log_win = None
+        self.log_formatter = common.make_human_cli_status_func(print_func=lambda txt: self.write_log(txt + '\n'))
 
         self.latest_progress_change = datetime.utcnow() - timedelta(seconds=60)
 
@@ -191,18 +219,35 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
         menu.Bind(wx.EVT_MENU, self.on_menu_settings, id=settings_item.GetId())
         menu.Append(settings_item)
 
+        show_log_item = wx.MenuItem(menu, -1, 'Show log')
+        menu.Bind(wx.EVT_MENU, self.on_show_log, id=show_log_item.GetId())
+        menu.Append(show_log_item)
+
         quitm = wx.MenuItem(menu, wx.ID_EXIT, 'Quit')
         menu.Bind(wx.EVT_MENU, self.on_menu_quit, id=quitm.GetId())
         menu.Append(quitm)
         self.menu = menu
         return menu
 
+    # Adds a string to log viewer window
+    def write_log(self, txt):
+        self.log_text.write(txt)
+        if self.log_win:
+            self.log_win.write(txt)
+
+    # "Settings" menu item selected
     def on_menu_settings(self, event):
         ex = SettingsDlg(None, title='Settings', settings=self.settings)
         if ex.ShowModal() == wx.ID_OK:
             self.settings = ex.get_settings()
 
+    # "Show log" menu item selected
+    def on_show_log(self, event):
+        if not self.log_win:
+            self.log_win = LogWindow(systray_icon=self)
+            self.log_win.Show(True)
 
+    # Start or stop menu item selected
     def on_menu_start_stop(self, event):
         if self.syncer:
             self.syncer.terminate()
@@ -221,18 +266,22 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
             self.icon_idx = (self.icon_idx + 1) % len(self.icons)
             self.SetIcon(wx.Icon(self.icons[self.icon_idx]))
 
+    # Quit menu item selected
     def on_menu_quit(self, event):
         if self.syncer:
             self.syncer.terminate()
         self.RemoveIcon()
         wx.CallAfter(self.Destroy)
         self.frame.Close()
+        self.frame = None
 
-
+    # Receive JSON log line from syncer (master or peer node) process
     def on_syncer_message(self, msg):
-        print(msg)
         try:
             msg = json.loads(msg)
+            self.log_formatter(cur_status=msg.get('cur_status'), log_error=msg.get('log_error'),
+                               log_info=msg.get('log_info'), progress=msg.get('progress'),
+                               log_debug=msg.get('log_debug'), popup=msg.get('popup'))
 
             if msg.get('progress') is not None:
                 prog = msg.get('progress') or -1
@@ -244,7 +293,7 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
 
             if msg.get('popup'):
                 txt = ((msg.get('log_error') or '') + '\n' + (msg.get('log_info') or '')).strip()
-                wx.adv.NotificationMessage(APP_NAME, txt).Show(timeout=5)
+                wx.adv.NotificationMessage(common.Defaults.APP_NAME, txt).Show(timeout=5)
 
             if msg.get('cur_status'):
                 self.cur_status_text = msg.get('cur_status')
@@ -255,34 +304,49 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
             wx.adv.NotificationMessage("Syncer error?", str(msg)).Show(timeout=5)
 
     def on_syncer_exit(self, ex, tb):
-        print(str(ex), str(tb))
+        self.write_log('\n------- syncer process exited -------\n\n')
+        if ex or tb:
+            print(ex, tb)
+            self.write_log(str(ex) + '\n')
+            self.write_log(str(tb) + '\n')
+            self.write_log('--------------------------------------\n\n')
+        self.cur_progress_text, self.cur_status_text = '', '(not running)'
+        with suppress(RuntimeError):
+            self.menu.SetLabel(self.MENUID_STATUS_TEXT, self.cur_status_text)
 
     def spawn_sync_process(self, is_master: bool, sync_dir: str, port: int, master_url: str):
         """
-        Start a sync client or server in separate process, forwarding stdout to given queue.
+        Start a sync client or server in separate process, forwarding stdout to given inter-process queue.
         """
         # Read pipe from sync_proc and delegate to given callbacks
         def comm_thread(conn):
             buff = ''
+            res = (None, None)
             with suppress(EOFError):
                 while conn:
                     o = conn.recv()
                     if isinstance(o, tuple):
-                        wx.CallAfter(self.on_syncer_exit, o[0], o[1])
+                        res = o
+                        break
                     else:
                         buff += str(o)
                         while '\n' in buff:
                             msg, buff = buff.split('\n', 1)
-                            wx.CallAfter(self.on_syncer_message, msg)
-            print('comm_thread done')
+                            if self.frame:
+                                wx.CallAfter(self.on_syncer_message, msg)
+            if self.frame:  # might be destroyed at this point
+                wx.CallAfter(self.on_syncer_exit, res[0], res[1])
 
         conn_recv, conn_send = mp.Pipe(duplex=False)  # Multi-CPU safe conn_send -> conn_recv pipe
-        argv = ['fileserver.py', sync_dir, '--port', str(port), '--json'] if is_master else \
-            ['peernode.py', sync_dir, '--port', str(port), '--url', master_url, '--json']
-        syncer = mp.Process(target=sync_proc, name='sync-worker', args=(conn_send, is_master, argv))
+        argv = ['masternode.py', sync_dir, '--port', str(port), '--json'] if is_master else \
+               ['peernode.py', sync_dir, master_url, '--port', str(port), '--json']
+        cmdline = ' '.join(argv)
+        self.write_log(f'\n-------Launching "{cmdline}" -------\n\n')
+        syncer = mp.Process(target=sync_proc, args=(conn_send, is_master, argv))
         threading.Thread(target=comm_thread, args=(conn_recv,)).start()
         syncer.start()
         return syncer
+
 
 def main():
     app = wx.App()
@@ -290,6 +354,7 @@ def main():
     app.SetTopWindow(frame)
     TaskBarIcon(frame)
     app.MainLoop()
+
 
 if __name__ == '__main__':
     main()

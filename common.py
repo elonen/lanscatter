@@ -3,7 +3,10 @@ import json, argparse
 
 
 class Defaults:
-    TCP_PORT = 10565
+    APP_NAME = 'LANScatter'
+
+    TCP_PORT_PEER = 10565
+    TCP_PORT_MASTER = 10564
     CHUNK_SIZE = 64 * 1024 * 1024
     BANDWIDTH_LIMIT_MBITS_PER_SEC = 10000
 
@@ -29,7 +32,8 @@ def parse_cli_args(is_master: bool):
                         default=Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC, help='Rate limit uploads, Mb/s')
     parser.add_argument('-c', '--concurrent-transfers', dest='ct', type=int,
                         default=Defaults.CONCURRENT_TRANSFERS_MASTER, help='Max concurrent transfers')
-    parser.add_argument('-p', '--port', dest='port', type=int, default=Defaults.TCP_PORT, help='TCP port to listen')
+    default_port = Defaults.TCP_PORT_MASTER if is_master else Defaults.TCP_PORT_PEER
+    parser.add_argument('-p', '--port', dest='port', type=int, default=default_port, help='TCP port to listen')
     parser.add_argument('-s', '--rescan-interval', dest='rescan_interval', type=float,
                         default=Defaults.DIR_SCAN_INTERVAL_MASTER, help='Seconds to wait between sync dir rescans')
     if is_master:
@@ -44,7 +48,7 @@ def parse_cli_args(is_master: bool):
     return parser.parse_args()
 
 
-def make_human_cli_status_func(log_level_debug=False):
+def make_human_cli_status_func(log_level_debug=False, print_func=print):
 
     def func(progress: float = None, cur_status: str = None,
              log_error: str = None, log_info: str = None, log_debug: str = None, popup: bool = False):
@@ -66,7 +70,7 @@ def make_human_cli_status_func(log_level_debug=False):
             parts.append(f"DEBUG    {sep} {log_debug}")
 
         if parts and (''.join(parts)).strip():
-            print(f"{dt} {sep} " + ' | '.join(parts))
+            print_func(f"{dt} {sep} " + ' | '.join(parts))
 
     return func
 
