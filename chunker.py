@@ -2,7 +2,7 @@ from typing import List, Set, Iterable, Dict, Tuple, Optional, Callable
 from types import SimpleNamespace
 import os, json, hashlib, asyncio, time
 import aiofiles, aiofiles.os, collections
-import mmap, concurrent.futures
+import mmap
 from pathlib import Path
 
 # Tools for scanning files in a directory and splitting them into hashed chunks.
@@ -95,7 +95,6 @@ class SyncBatch:
         for c in self.chunks:
             assert c.path in self.files
 
-
     def add(self, files: Iterable[FileAttribs] = (), chunks: Iterable[FileChunk] = ()):
         """
         Add given file attributes and chunks to batch, if not there already.
@@ -110,10 +109,10 @@ class SyncBatch:
             self.files[path].treehash = calc_tree_hash((c for c in self.chunks if c.path == path))
 
     def discard(self, paths: Iterable[str] = (), chunks: Iterable[FileChunk] = ()):
-        '''
+        """
         Remove given paths and chunks from current batch.
         Deletes hashes for deleted paths, and invalidates (doesn't recalc) treehashes for paths with removed chunks.
-        '''
+        """
         paths = set(paths)
         for path in paths:
             self.files.pop(path, None)
@@ -124,9 +123,9 @@ class SyncBatch:
             if c.path in self.files:
                 self.files[c.path].treehash = None
 
-    def first_chunk_with(self, hash: HashType) -> Optional[FileChunk]:
+    def first_chunk_with(self, chunk_hash: HashType) -> Optional[FileChunk]:
         """Return first chunk with given content (hash)"""
-        return next(iter((c for c in self.chunks if c.hash == hash)), None)
+        return next(iter((c for c in self.chunks if c.hash == chunk_hash)), None)
 
     def file_tree_diff(self, there: 'SyncBatch'):
         """Compare this and given batches for file attribute changes"""
@@ -195,13 +194,13 @@ async def read_attribs(basedir: str, relpath: str):
 
 async def hash_file(basedir: str, relpath: str, chunk_size: int,
                     file_progress_func: Callable) -> Tuple[FileAttribs, List[FileChunk]]:
-    '''
+    """
     Split given file into chunks and hash them
-    :param: basedir: Base directory to search for files
+    :param basedir: Base directory to search for files
     :param relpath: Pathname to file
     :param file_progress_func: Progress reporting callback
     :return: List of FileChunk
-    '''
+    """
     assert(chunk_size > 0)
     path = os.path.join(basedir, relpath)
     st = await aiofiles.os.stat(path)
@@ -215,10 +214,10 @@ async def hash_file(basedir: str, relpath: str, chunk_size: int,
             hash=HashFunc().result()))
     else:
         async with aiofiles.open(path, 'r+b') as f:
-            map = mmap.mmap(f.fileno(), 0)
+            mm = mmap.mmap(f.fileno(), 0)
             while pos < st.st_size:
                 sz = min(chunk_size, st.st_size - pos)
-                csum = await HashFunc().update_async(map[pos:(pos+sz)])
+                csum = await HashFunc().update_async(mm[pos:(pos+sz)])
                 chunks.append(FileChunk(
                         path=relpath,
                         pos=pos, size=sz,
@@ -231,7 +230,7 @@ async def hash_file(basedir: str, relpath: str, chunk_size: int,
 
 
 async def scan_dir(basedir: str, chunk_size: int, old_batch: Optional[SyncBatch], progress_func: Callable) -> SyncBatch:
-    '''
+    """
     Scan given directory and generate a list of FileChunks of its contents. If old_chunks is provided,
     assumes contents haven't changed if mtime and size are identical.
 
@@ -240,7 +239,7 @@ async def scan_dir(basedir: str, chunk_size: int, old_batch: Optional[SyncBatch]
     :param chunk_size: Length of chunk to split files into
     :param old_batch: If given, compares dir it and skips hashing files with identical size & mtime
     :return: New list of FileChunks, or old_chunks if no changes are detected
-    '''
+    """
     fnames = []
     dirs = []
     for root, d_names, f_names in os.walk(basedir, topdown=False, onerror=None, followlinks=False):

@@ -5,6 +5,15 @@ from pathlib import Path
 from types import SimpleNamespace
 import common
 
+"""
+Integration tests. Creates some empty and non-empty directories, runs a master and several peer nodes in
+separate processes using command line arguments. Checks that sync target dirs become identical to
+source dir, and without errors in the logs.
+
+Several edge cases are tested, too, such as empty files, different sized files and overwriting some files in
+the middle of sync.
+"""
+
 TEST_DIR = './temp_test_dir'
 TEST_FILES_PER_DIR = 3
 CHUNK_SIZE = 1000
@@ -12,9 +21,9 @@ PORT_BASE = 53741
 TEST_PEER_NAMES = {0: 'peer_empty', 1: 'peer_corrupt', 2: 'peer_non_empty'}
 
 # Make sure buffers don't cover whole chunks, for realistic testing
-common.defaults.FILE_BUFFER_SIZE = int(CHUNK_SIZE * 0.7)
-common.defaults.DOWNLOAD_BUFFER_MAX = int(CHUNK_SIZE * 0.3)
-common.defaults.NETWORK_BUFFER_MIN = int(CHUNK_SIZE * 0.1)
+common.Defaults.FILE_BUFFER_SIZE = int(CHUNK_SIZE * 0.7)
+common.Defaults.DOWNLOAD_BUFFER_MAX = int(CHUNK_SIZE * 0.3)
+common.Defaults.NETWORK_BUFFER_MIN = int(CHUNK_SIZE * 0.1)
 
 
 @pytest.fixture()
@@ -33,7 +42,7 @@ def make_test_dirs(tmp_path):
 
     rnd_postfix = 0
     def rnd_name(prefix: str, postfix: str = ''):
-        nonlocal  rnd_postfix
+        nonlocal rnd_postfix
         rnd_postfix += 1
         return prefix + '%05d' % int(random.random()*1000) + '_%d'%rnd_postfix + postfix
 
@@ -57,12 +66,12 @@ def make_test_dirs(tmp_path):
                 create_file(p / '1chunk.bin', CHUNK_SIZE)
                 create_file(p / '1chunk_plus.bin', CHUNK_SIZE+2)
                 create_file(p / '3chunks.bin', CHUNK_SIZE * 3)
-                create_file(p / 'fbuf_size.bin', common.defaults.FILE_BUFFER_SIZE)
-                create_file(p / 'fbuf_size_almost.bin', common.defaults.FILE_BUFFER_SIZE-1)
-                create_file(p / 'fbuf_size_plus.bin', common.defaults.FILE_BUFFER_SIZE+1)
-                create_file(p / 'dlbuf_size.bin', common.defaults.DOWNLOAD_BUFFER_MAX)
-                create_file(p / 'dlbuf_size_almost.bin', common.defaults.DOWNLOAD_BUFFER_MAX-1)
-                create_file(p / 'dlbuf_size_plus.bin', common.defaults.DOWNLOAD_BUFFER_MAX+2)
+                create_file(p / 'fbuf_size.bin', common.Defaults.FILE_BUFFER_SIZE)
+                create_file(p / 'fbuf_size_almost.bin', common.Defaults.FILE_BUFFER_SIZE - 1)
+                create_file(p / 'fbuf_size_plus.bin', common.Defaults.FILE_BUFFER_SIZE + 1)
+                create_file(p / 'dlbuf_size.bin', common.Defaults.DOWNLOAD_BUFFER_MAX)
+                create_file(p / 'dlbuf_size_almost.bin', common.Defaults.DOWNLOAD_BUFFER_MAX - 1)
+                create_file(p / 'dlbuf_size_plus.bin', common.Defaults.DOWNLOAD_BUFFER_MAX + 2)
                 create_file(p / 'many_chunks.bin', int(CHUNK_SIZE * 5.5))
                 create_file(p / 'zeroes.bin', int(CHUNK_SIZE * 3.1), pattern=b'\0' * CHUNK_SIZE)
                 create_file(p / 'less_zeroes.bin', int(CHUNK_SIZE * 1.1), pattern=b'\0' * CHUNK_SIZE)

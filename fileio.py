@@ -4,24 +4,24 @@ from chunker import FileChunk, HashFunc
 from aiohttp import web, ClientSession
 from typing import Tuple, Optional
 from contextlib import suppress
-from common import defaults
+from common import Defaults
 import aiofiles, os, time, asyncio, aiohttp, mmap
 
 class FileIO:
-    '''
+    """
     Helper for reading and writing chunks from/to files + downloading / uploading them over network.
     Supports rate limiting and checks that file operations stay inside given base directory.
-    '''
+    """
     basedir: Path
     dl_limiter: RateLimiter
     ul_limiter: RateLimiter
 
     def __init__(self, basedir: Path, dl_rate_limit: float, ul_rate_limit: float):
-        '''
+        """
         :param basedir: Folder to limit read/write into.
         :param dl_rate_limit: Maximum download rate in Mbit/s
         :param ul_rate_limit: Maximum upload rate in Mbit/s
-        '''
+        """
         assert(isinstance(basedir, Path))
         basedir = basedir.resolve()
         if not basedir.is_dir():
@@ -31,23 +31,23 @@ class FileIO:
         self.ul_limiter = RateLimiter(ul_rate_limit * 1024 * 1024 / 8, period=1.0, burst_factor=2.0)
 
     def resolve_and_sanitize(self, relative_path, must_exist=False):
-        '''
+        """
         Check that given relative path stays inside basedir and return an absolute path string.
         :return: Absolute Path() object
-        '''
+        """
         p = (self.basedir / Path(relative_path)).resolve()
         if self.basedir not in p.parents:
             raise PermissionError(f'Filename points outside basedir: {str(relative_path)}')
         return p
 
     def open_and_seek(self, path: str, pos: int, for_write: bool = False):
-        '''
+        """
         Helper. Open file for read or write and seek/grow to given size.
         :param path: File to open
         :param pos: File position to seek/grow into
         :param for_write: If true, open for write, otherwise for read
         :return: Aiofiles file handle
-        '''
+        """
         path = self.resolve_and_sanitize(path)
         if for_write:
             mode = ('r+b' if path.is_file() else 'wb')
@@ -70,13 +70,13 @@ class FileIO:
 
     async def upload_chunk(self, chunk: FileChunk, request: web.Request)\
             -> Tuple[web.StreamResponse, Optional[float]]:
-        '''
+        """
         Read given chunk from disk and stream out as a HTTP response.
 
         :param chunk: Chunk to read
         :param request: HTTP request to answer
         :return: Tuple(Aiohttp.response, float(seconds the upload took) or None if it no progress was made)
-        '''
+        """
         response = None
         remaining = chunk.size
         start_t = time.time()
@@ -89,7 +89,7 @@ class FileIO:
                     headers={'Content-Type': 'application/octet-stream', 'Content-Disposition': 'inline'})
                 await response.prepare(request)
 
-                buff_in, buff_out = bytearray(defaults.FILE_BUFFER_SIZE), None
+                buff_in, buff_out = bytearray(Defaults.FILE_BUFFER_SIZE), None
 
                 async def read_file():
                     nonlocal buff_in, remaining, chunk
@@ -106,11 +106,11 @@ class FileIO:
                 async def write_http():
                     nonlocal buff_out
                     if not buff_out:
-                        buff_out = bytearray(defaults.FILE_BUFFER_SIZE)
+                        buff_out = bytearray(Defaults.FILE_BUFFER_SIZE)
                     else:
                         i, cnt = 0, len(buff_out)
                         while cnt > 0:
-                            limited_n = int(await self.ul_limiter.acquire(cnt, defaults.NETWORK_BUFFER_MIN))
+                            limited_n = int(await self.ul_limiter.acquire(cnt, Defaults.NETWORK_BUFFER_MIN))
                             await response.write(buff_out[i:(i + limited_n)])
                             i += limited_n
                             cnt -= limited_n
@@ -141,12 +141,12 @@ class FileIO:
 
 
     async def copy_chunk_locally(self, copy_from: FileChunk, copy_to: FileChunk) -> bool:
-        '''
+        """
         Locally copy chunk contents from one file (+position) to another.
         :param copy_from: Where to copy from
         :param copy_to: Where to copy into
         :return: True if chunk was copied ok, False if content hash didn't match anymore
-        '''
+        """
         if copy_from.path == copy_to.path and copy_from.pos == copy_to.pos:
             return True
         if copy_from.hash != copy_to.hash:
@@ -169,13 +169,13 @@ class FileIO:
 
 
     async def download_chunk(self, chunk: FileChunk, url: str, http_session: ClientSession, file_size: int= -1) -> None:
-        '''
+        """
         Download chunk from given URL and write directly into (the middle of a) file as specified by FileChunk.
         :param chunk: Specs for chunk to get
         :param url: URL to download from
         :param http_session: AioHTTP session to use for GET.
         :param file_size: Size of complete file (optional). File will be truncated to this size.
-        '''
+        """
         async with http_session.get(url) as resp:
             if resp.status != 200:  # some error
                 raise IOError(f'Unknown/unsupported HTTP status: {resp.status}')
@@ -187,7 +187,7 @@ class FileIO:
                     async def read_http():
                         nonlocal buff_in
                         limited_n = int(await self.dl_limiter.acquire(
-                            defaults.DOWNLOAD_BUFFER_MAX, defaults.NETWORK_BUFFER_MIN))
+                            Defaults.DOWNLOAD_BUFFER_MAX, Defaults.NETWORK_BUFFER_MIN))
                         buff_in = await resp.content.read(limited_n)
                         self.dl_limiter.unspend(limited_n - len(buff_in))
                         buff_in = buff_in if buff_in else None

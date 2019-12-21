@@ -76,10 +76,10 @@ class Node(ABC):
 
 
 class Transfer:
-    def __init__(self, to_node: Node, from_node: Node, hash: ChunkId, timeout: float):
+    def __init__(self, to_node: Node, from_node: Node, chunk_hash: ChunkId, timeout: float):
         self.from_node = from_node
         self.to_node = to_node
-        self.hash = hash
+        self.hash = chunk_hash
         self.timeout_secs = timeout
 
     def __repr__(self):
@@ -89,9 +89,9 @@ class Transfer:
 class SwarmCoordinator(object):
 
     def __init__(self):
-        '''
+        """
         Make an empty planner with no hashes or nodes.
-        '''
+        """
         self.all_hashes: Set[ChunkId] = set()
         self.hash_popularity = {}  # Approximately: how many copies of hashes there are in swarm
         self.nodes: List[Node] = []
@@ -188,7 +188,7 @@ class SwarmCoordinator(object):
                             # Pick the rarest hash first for best distribution
                             h = min(new_hashes, key=lambda c: self.hash_popularity[c])
                             timeout = median_time*4 if (not ul.is_master) else 9999999
-                            t = Transfer(from_node=ul, to_node=dl, hash=h, timeout=timeout)
+                            t = Transfer(from_node=ul, to_node=dl, chunk_hash=h, timeout=timeout)
                             proposed_transfers.append(t)
                             # To prevent overbooking and to help picking different hashes, assume transfer will succeed
                             self.hash_popularity[h] += 1
@@ -222,10 +222,10 @@ class SwarmCoordinator(object):
 
 
 def simulate() -> None:
-    '''
+    """
     Simulate file swarm, controlled by SwarmCoordinator.
     Prints a block diagram to stdout until all blocks are done.
-    '''
+    """
     N_HASHES = 72
     N_NODES = 38
     SEEDER_UL_SLOTS = 4

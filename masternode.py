@@ -1,9 +1,9 @@
 from aiohttp import web, WSMsgType
 from pathlib import Path
 from typing import Callable, Optional
-import asyncio, aiofiles, traceback, html
+import asyncio, traceback, html
 from chunker import scan_dir
-from common import make_human_cli_status_func, json_status_func, defaults, parse_cli_args
+from common import make_human_cli_status_func, json_status_func, Defaults, parse_cli_args
 from types import SimpleNamespace
 from contextlib import suppress
 from datetime import datetime
@@ -62,7 +62,7 @@ class MasterNode:
         async def handle_client_msg(
                 address: str, send_queue: asyncio.Queue,
                 node: Optional[planner.Node], msg) -> Optional[planner.Node]:
-            '''
+            """
             Handle received messages from clients.
 
             :param address: IP address of originating client
@@ -70,7 +70,7 @@ class MasterNode:
             :param node: planner.Node object, or None if not yet joined a swarm
             :param msg: Message from client in a dict
             :return: New Node handle if messages caused a swarm join, otherwise None
-            '''
+            """
             client_name = (node.name if node else self.file_server.hostname)
             self.status_func(log_debug=f'[{address}] Msg from {client_name}: {str(msg)}')
 
@@ -170,9 +170,9 @@ class MasterNode:
                                            traceback.format_exc(), popup=True)
 
         async def http_handler__status(request):
-            '''
+            """
             Show a HTML formatted status report.
-            '''
+            """
             self.status_func(log_debug=f"[{request.remote}] GET {request.path_qs}")
             colors = {1: 'black', 0.5: 'green', 0: 'lightgray'}
             st = self.swarm.get_status_table()
@@ -293,12 +293,12 @@ class MasterNode:
 
 
 async def run_master_server(base_dir: str,
-                            port: int = defaults.TCP_PORT,
-                            dir_scan_interval: float = defaults.DIR_SCAN_INTERVAL_MASTER,
+                            port: int = Defaults.TCP_PORT,
+                            dir_scan_interval: float = Defaults.DIR_SCAN_INTERVAL_MASTER,
                             status_func=None,
-                            ul_limit: float = defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC,
-                            concurrent_uploads: int = defaults.CONCURRENT_TRANSFERS_MASTER,
-                            chunk_size=defaults.CHUNK_SIZE,
+                            ul_limit: float = Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC,
+                            concurrent_uploads: int = Defaults.CONCURRENT_TRANSFERS_MASTER,
+                            chunk_size=Defaults.CHUNK_SIZE,
                             https_cert=None, https_key=None):
 
     server = MasterNode(status_func=status_func, chunk_size=chunk_size)

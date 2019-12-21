@@ -10,8 +10,8 @@ import common
 APP_NAME = 'Lanscatter'
 
 SETTINGS_DEFAULTS = {
-    'listen_port': common.defaults.TCP_PORT,
-    'master_url': f'ws://127.0.0.1:{common.defaults.TCP_PORT}/ws',
+    'listen_port': common.Defaults.TCP_PORT,
+    'master_url': f'ws://127.0.0.1:{common.Defaults.TCP_PORT}/ws',
     'sync_dir': './sync-target/',
     'is_master': False}
 
@@ -84,7 +84,7 @@ class SettingsDlg(wx.Dialog):
         # Port to listen
         hb = wx.BoxSizer(wx.HORIZONTAL)
         hb.Add(wx.StaticText(panel, label='Local port'), st_hor)
-        self.listen_port = wx.SpinCtrl(panel, value="1", min=1, max=65535, initial=common.defaults.TCP_PORT)
+        self.listen_port = wx.SpinCtrl(panel, value="1", min=1, max=65535, initial=common.Defaults.TCP_PORT)
         hb.Add(self.listen_port, st_hor)
         vbox.Add(hb, st_vert)
 
@@ -258,9 +258,9 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
         print(str(ex), str(tb))
 
     def spawn_sync_process(self, is_master: bool, sync_dir: str, port: int, master_url: str):
-        '''
+        """
         Start a sync client or server in separate process, forwarding stdout to given queue.
-        '''
+        """
         # Read pipe from sync_proc and delegate to given callbacks
         def comm_thread(conn):
             buff = ''

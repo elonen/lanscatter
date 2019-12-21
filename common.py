@@ -1,7 +1,8 @@
 from datetime import datetime
 import json, argparse
 
-class defaults:
+
+class Defaults:
     TCP_PORT = 10565
     CHUNK_SIZE = 64 * 1024 * 1024
     BANDWIDTH_LIMIT_MBITS_PER_SEC = 10000
@@ -23,17 +24,17 @@ def parse_cli_args(is_master: bool):
     if not is_master:
         parser.add_argument('url', help='URL to master node. E.g. ws://localhost:10565/ws ')
         parser.add_argument('--dl-rate', dest='dl_limit', type=float,
-                            default=defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC, help='Rate limit downloads, Mb/s')
+                            default=Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC, help='Rate limit downloads, Mb/s')
     parser.add_argument('--ul-rate', dest='ul_limit', type=float,
-                        default=defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC, help='Rate limit uploads, Mb/s')
+                        default=Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC, help='Rate limit uploads, Mb/s')
     parser.add_argument('-c', '--concurrent-transfers', dest='ct', type=int,
-                        default=defaults.CONCURRENT_TRANSFERS_MASTER, help='Max concurrent transfers')
-    parser.add_argument('-p', '--port', dest='port', type=int, default=defaults.TCP_PORT, help='TCP port to listen')
+                        default=Defaults.CONCURRENT_TRANSFERS_MASTER, help='Max concurrent transfers')
+    parser.add_argument('-p', '--port', dest='port', type=int, default=Defaults.TCP_PORT, help='TCP port to listen')
     parser.add_argument('-s', '--rescan-interval', dest='rescan_interval', type=float,
-                        default=defaults.DIR_SCAN_INTERVAL_MASTER, help='Seconds to wait between sync dir rescans')
+                        default=Defaults.DIR_SCAN_INTERVAL_MASTER, help='Seconds to wait between sync dir rescans')
     if is_master:
         parser.add_argument('--chunksize', dest='chunksize', type=int,
-                            default=defaults.CHUNK_SIZE, help='Chunk size for splitting files (in bytes)')
+                            default=Defaults.CHUNK_SIZE, help='Chunk size for splitting files (in bytes)')
         parser.add_argument('--sslcert', type=str, default=None, help='SSL certificate file for HTTPS (optional)')
         parser.add_argument('--sslkey', type=str, default=None, help='SSL key file for HTTPS (optional)')
 
@@ -43,7 +44,7 @@ def parse_cli_args(is_master: bool):
     return parser.parse_args()
 
 
-def make_human_cli_status_func(log_level_debug = False):
+def make_human_cli_status_func(log_level_debug=False):
 
     def func(progress: float = None, cur_status: str = None,
              log_error: str = None, log_info: str = None, log_debug: str = None, popup: bool = False):

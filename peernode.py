@@ -1,6 +1,6 @@
 from typing import Callable, Dict, Tuple, Set, Optional
 from chunker import SyncBatch, scan_dir
-from common import make_human_cli_status_func, json_status_func, defaults, parse_cli_args
+from common import make_human_cli_status_func, json_status_func, Defaults, parse_cli_args
 import asyncio, aiohttp
 from aiohttp import web, WSMsgType
 from pathlib import Path
@@ -43,9 +43,9 @@ class PeerNode:
 
 
     async def send_transfer_report(self):
-        '''
+        """
         Tell master our transfers stats to help plan chunk distribution
-        '''
+        """
         await self.server_send_queue.put({
             'action': 'report_transfers',
             'dls': len(self.incoming),
@@ -57,14 +57,14 @@ class PeerNode:
 
 
     async def local_file_fixups(self, max_recursions=4):
-        '''
+        """
         Compare local and remote batch and try to get them in sync:
          - filter out local chunks that have no useful content
          - copy chunks from already downloaded files to missing ones if possible
          - delete dangling (extraneous) files
          - set modification time to the target time when file matches remote specs (to speed up rescans)
          - set modification time to current time when file contents differ (=local file is incomplete)
-        '''
+        """
         if not self.remote_batch:
             self.status_func(log_info=f"LOCAL: Remote batch is empty or missing; will not touch local files.")
             return
@@ -159,9 +159,9 @@ class PeerNode:
 
 
     async def download_task(self, chunk_hash, url, http_session, timeout):
-        '''
+        """
         Async task to download chunk with given hash from given URL and writing it to relevant files.
-        '''
+        """
         if self.local_batch.first_chunk_with(chunk_hash):
             self.status_func(log_info=f"Aborting download of {chunk_hash}; already got it.")
             return
@@ -208,9 +208,9 @@ class PeerNode:
 
 
     async def process_server_msg(self, msg, http_session):
-        '''
+        """
         Ingest messages from websocket connection with master.
-        '''
+        """
         self.status_func(log_debug=f'Message from server: {str(msg)}')
         try:
             async def error(txt):
@@ -220,10 +220,10 @@ class PeerNode:
             action = msg.get('action')
 
             if action == 'download':
-                hash, url, timeout = msg.get('hash'), msg.get('url'), msg.get('timeout')
-                if None in (hash, url, timeout):
+                chunk_hash, url, timeout = msg.get('chunk_hash'), msg.get('url'), msg.get('timeout')
+                if None in (chunk_hash, url, timeout):
                     return error('Bad download command from server')
-                asyncio.create_task(self.download_task(hash, url, http_session, timeout))
+                asyncio.create_task(self.download_task(chunk_hash, url, http_session, timeout))
 
             elif action == 'rehash':
                 self.status_func(log_info=f'Server requested rescan: "{msg.get("message")}"')
@@ -361,9 +361,9 @@ class PeerNode:
 
 
     async def run(self, port: int, server_url: str, concurrent_transfer_limit: int):
-        '''
+        """
         Run all async loops.
-        '''
+        """
         def sig_exit():
             self.exit_trigger.set()
         try:
@@ -387,11 +387,11 @@ class PeerNode:
 
 
 async def run_file_client(base_dir: str, server_url: str, status_func=None,
-                          port: int = defaults.TCP_PORT,
-                          rescan_interval: float = defaults.DIR_SCAN_INTERVAL_MASTER,
-                          dl_limit: float = defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC,
-                          ul_limit: float = defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC,
-                          concurrent_transfer_limit: int = defaults.CONCURRENT_TRANSFERS_PEER):
+                          port: int = Defaults.TCP_PORT,
+                          rescan_interval: float = Defaults.DIR_SCAN_INTERVAL_MASTER,
+                          dl_limit: float = Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC,
+                          ul_limit: float = Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC,
+                          concurrent_transfer_limit: int = Defaults.CONCURRENT_TRANSFERS_PEER):
     pn = PeerNode(basedir=base_dir, status_func=status_func, file_rescan_interval=rescan_interval,
                   dl_limit=dl_limit, ul_limit=ul_limit)
     await pn.run(port, server_url, concurrent_transfer_limit)

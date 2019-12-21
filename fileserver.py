@@ -19,31 +19,30 @@ class FileServer:
         self.batch = new_batch
 
     def create_http_server(self, port, fileio: FileIO, https_cert=None, https_key=None, extra_routes=()):
-        '''
+        """
         Create HTTP(S) server loop.
         :param port: TCP port to listen at.
         :param fileio: FileIO object for reading chunks from disk
         :param https_cert: PEM filename or None
         :param https_key: PEM filename or None
-        :param extra_route: Additional routes for aiohttp server (see web.Application.add_routes() for details)
+        :param extra_routes: Additional routes for aiohttp server (see web.Application.add_routes() for details)
         :return: Asyncio task for the server
-        '''
-
+        """
         ip_addr = socket.gethostbyname(socket.gethostname())
         self.base_url = ('https://' if (https_cert and https_key) else 'http://') + ip_addr + ':' + str(port)
 
         self._status_func(log_info=f'Starting file server on {self.base_url}.')
 
         async def hdl__get_chunk(request):
-            '''
+            """
             HTTP GET handler that serves out a file chunk with given hash.
-            '''
+            """
             self.active_uploads += 1
             try:
                 self._status_func(log_info=f"[{request.remote}] GET {request.path_qs}")
                 h = request.match_info.get('hash')
 
-                chunk = self.batch.first_chunk_with(hash=h)
+                chunk = self.batch.first_chunk_with(chunk_hash=h)
                 if not chunk:
                     raise web.HTTPNotFound(reason=f'Chunk not on this host: {h}')
                 try:

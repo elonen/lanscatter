@@ -86,9 +86,9 @@ class RateLimiter(object):
 
 
     def report_rate(self):
-        '''
+        """
         :return: Realized consume rate since beginning (or latest reset_reporting())
-        '''
+        """
         return self.report_total_consumed / (time.time() - self.report_start_time) * self.period
 
     def reset_reporting(self):
