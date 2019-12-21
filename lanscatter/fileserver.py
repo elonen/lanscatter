@@ -1,8 +1,9 @@
 from aiohttp import web
 from typing import Callable
 import ssl, socket
-from fileio import FileIO
-from chunker import SyncBatch
+
+from .fileio import FileIO
+from .chunker import SyncBatch
 
 class FileServer:
 

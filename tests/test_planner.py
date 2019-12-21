@@ -1,5 +1,5 @@
-import planner
 import pytest
+from lanscatter import planner
 
 @pytest.mark.timeout(60)
 def test_planner(capsys):

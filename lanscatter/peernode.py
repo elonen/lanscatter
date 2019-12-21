@@ -1,14 +1,16 @@
 from typing import Callable, Dict, Tuple, Set, Optional
-from chunker import SyncBatch, scan_dir
-from common import make_human_cli_status_func, json_status_func, Defaults, parse_cli_args
 import asyncio, aiohttp
 from aiohttp import web, WSMsgType
 from pathlib import Path
-from fileserver import FileServer
 from contextlib import suppress
-from fileio import FileIO
 import traceback, time, argparse, os, collections, json
 from signal import SIGINT, SIGTERM
+
+from .chunker import SyncBatch, scan_dir
+from .common import make_human_cli_status_func, json_status_func, Defaults, parse_cli_args
+from .fileserver import FileServer
+from .fileio import FileIO
+
 
 # Client that keeps given directory synced with a master server,
 # and then serves downloaded chunks to peers for network load distribution.

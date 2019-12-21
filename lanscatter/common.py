@@ -25,7 +25,7 @@ def parse_cli_args(is_master: bool):
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('dir', help='Sync directory')
     if not is_master:
-        parser.add_argument('url', help='URL to master node. E.g. ws://localhost:10565/ws ')
+        parser.add_argument('url', help=f'URL to master node. E.g. ws://localhost:{Defaults.TCP_PORT_MASTER}/ws ')
         parser.add_argument('--dl-rate', dest='dl_limit', type=float,
                             default=Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC, help='Rate limit downloads, Mb/s')
     parser.add_argument('--ul-rate', dest='ul_limit', type=float,

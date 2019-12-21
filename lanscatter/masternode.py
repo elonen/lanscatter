@@ -2,14 +2,16 @@ from aiohttp import web, WSMsgType
 from pathlib import Path
 from typing import Callable, Optional
 import asyncio, traceback, html
-from chunker import scan_dir
-from common import make_human_cli_status_func, json_status_func, Defaults, parse_cli_args
 from types import SimpleNamespace
 from contextlib import suppress
 from datetime import datetime
-import planner
-from fileio import FileIO
-from fileserver import FileServer
+
+from . import planner
+from .fileio import FileIO
+from .fileserver import FileServer
+from .chunker import scan_dir
+from .common import make_human_cli_status_func, json_status_func, Defaults, parse_cli_args
+
 
 # Server that plans p2p distribution of sync directory files to connected clients,
 # and also works as a seed node.

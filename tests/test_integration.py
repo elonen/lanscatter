@@ -3,7 +3,8 @@ import multiprocessing as mp
 import pytest, shutil, time, os, io, random, traceback, sys, threading, filecmp
 from pathlib import Path
 from types import SimpleNamespace
-import common
+
+from lanscatter import common, masternode, peernode
 
 """
 Integration tests. Creates some empty and non-empty directories, runs a master and several peer nodes in
@@ -99,10 +100,8 @@ def sync_proc(conn, is_master, argv):
         sys.stdout, sys.stderr = out, out
         sys.argv = argv
         if is_master:
-            import masternode
             masternode.main()
         else:
-            import peernode
             peernode.main()
         conn.send((None, None))
     except Exception as e:

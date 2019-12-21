@@ -1,11 +1,12 @@
-from util.ratelimiter import RateLimiter
 from pathlib import Path
-from chunker import FileChunk, HashFunc
 from aiohttp import web, ClientSession
 from typing import Tuple, Optional
 from contextlib import suppress
-from common import Defaults
 import aiofiles, os, time, asyncio, aiohttp, mmap
+
+from .common import Defaults
+from .chunker import FileChunk, HashFunc
+from .ratelimiter import RateLimiter
 
 
 class FileIO:

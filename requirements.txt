@@ -1,4 +1,4 @@
-#PyInstaller
+# PyInstaller
 aiohttp
 aiofiles
 wxPython
@@ -6,5 +6,5 @@ wxPython
 pytest
 pytest-timeout
 
-win10toast; sys_platform == 'windows'
-pyobjc-core; sys_platform == 'darwin'
+# win10toast; sys_platform == 'windows'
+# pyobjc-core; sys_platform == 'darwin'

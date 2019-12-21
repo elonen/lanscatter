@@ -1,11 +1,11 @@
 import wx
 import wx.adv
-import os, sys, io, threading, traceback, json
+import sys, io, threading, traceback, json
 from contextlib import suppress
-from typing import Callable
 import multiprocessing as mp
 from datetime import datetime, timedelta
-import common
+
+from . import common, masternode, peernode
 
 SETTINGS_DEFAULTS = {
     'listen_port': common.Defaults.TCP_PORT_PEER,
@@ -26,10 +26,8 @@ def sync_proc(conn, is_master, argv):
         sys.stdout, sys.stderr = out, out
         sys.argv = argv
         if is_master:
-            import masternode
             masternode.main()
         else:
-            import peernode
             peernode.main()
         conn.send((None, None))
     except Exception as e:

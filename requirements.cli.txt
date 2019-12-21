@@ -1,0 +1,4 @@
+aiohttp
+aiofiles
+pytest
+pytest-timeout
