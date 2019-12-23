@@ -3,7 +3,7 @@ import asyncio, aiohttp
 from aiohttp import web, WSMsgType
 from pathlib import Path
 from contextlib import suppress
-import traceback, time, argparse, os, collections, json
+import traceback, time, argparse, os, collections, json, platform
 from signal import SIGINT, SIGTERM
 
 from .chunker import SyncBatch, scan_dir
@@ -81,84 +81,88 @@ class PeerNode:
                                   f'{len(path_diff.with_different_attribs) + len(path_diff.there_only)} altered / '
                                   f'{len(path_diff.here_only)} dangling files.')
 
-        # Create missing directories
-        for p in path_diff.there_only:
-            f = self.remote_batch.files[p]
-            if f.is_dir:
-                await self.file_io.create_folders(p)
-                await self.file_io.change_mtime(p, f.mtime)
-                self.local_batch.add(files=[f])
+        try:
+            # Create missing directories
+            for p in path_diff.there_only:
+                f = self.remote_batch.files[p]
+                if f.is_dir:
+                    await self.file_io.create_folders(p)
+                    await self.file_io.change_mtime(p, f.mtime)
+                    self.local_batch.add(files=[f])
 
-        # Check each missing chunk to see if we've already got it in another local file
-        for missing in chunk_diff.there_only:
-            dupe = self.local_batch.first_chunk_with(missing.hash)
-            if dupe:
-                self.status_func(log_info=f'LOCAL: Copying {missing.hash} from "{dupe.path}"/{dupe.pos}'
-                                          f' to "{missing.path}"/{missing.pos}')
-                if await self.file_io.copy_chunk_locally(copy_from=dupe, copy_to=missing):
-                    self.local_batch.add(chunks=(dupe,))
-                else:
-                    self.status_func(log_info=f'LOCAL: Hash {missing.hash} was not in "{dupe.path}"/{dupe.pos} '
-                                              'anymore (was probably overwritten). Forgetting it.')
-                    self.local_batch.discard(chunks=(dupe,))
-                self.full_rescan_trigger.set()  # changes to file contents, need to re-hash them
+            # Check each missing chunk to see if we've already got it in another local file
+            for missing in chunk_diff.there_only:
+                dupe = self.local_batch.first_chunk_with(missing.hash)
+                if dupe:
+                    self.status_func(log_info=f'LOCAL: Copying {missing.hash} from "{dupe.path}"/{dupe.pos}'
+                                              f' to "{missing.path}"/{missing.pos}')
+                    if await self.file_io.copy_chunk_locally(copy_from=dupe, copy_to=missing):
+                        self.local_batch.add(chunks=(dupe,))
+                    else:
+                        self.status_func(log_info=f'LOCAL: Hash {missing.hash} was not in "{dupe.path}"/{dupe.pos} '
+                                                  'anymore (was probably overwritten). Forgetting it.')
+                        self.local_batch.discard(chunks=(dupe,))
+                    self.full_rescan_trigger.set()  # changes to file contents, need to re-hash them
 
-        # Filter out chunks with no useful hashes
-        self.local_batch.discard(chunks=chunk_diff.here_only)
+            # Filter out chunks with no useful hashes
+            self.local_batch.discard(chunks=chunk_diff.here_only)
 
-        # Delete dangling files
-        path_diff = self.local_batch.file_tree_diff(self.remote_batch)
-        for path in path_diff.here_only:
-            self.status_func(log_info=f'LOCAL: Deleting dangling file: "{path}"')
-            await self.file_io.remove_file_and_paths(path)
-        self.local_batch.discard(paths=path_diff.here_only)
+            # Delete dangling files
+            path_diff = self.local_batch.file_tree_diff(self.remote_batch)
+            for path in path_diff.here_only:
+                self.status_func(log_info=f'LOCAL: Deleting dangling file: "{path}"')
+                await self.file_io.remove_file_and_paths(path)
+            self.local_batch.discard(paths=path_diff.here_only)
 
-        # Fix timestamps on complete / incomplete files
-        for f in path_diff.with_different_attribs:
-            here = self.local_batch.files[f.path]
-            there = self.remote_batch.files[f.path]
+            # Fix timestamps on complete / incomplete files
+            for f in path_diff.with_different_attribs:
+                here = self.local_batch.files[f.path]
+                there = self.remote_batch.files[f.path]
 
-            if here.is_dir != there.is_dir:
-                self.status_func(log_info=f'LOCAL: "{f.path}" is dir here and file there (or vice versa). Deleting.')
-                await self.file_io.remove_file_and_paths(f.path)
-            elif here.is_dir:
-                if here.mtime != there.mtime:
-                    self.status_func(log_info=f'LOCAL: Fixing mtime for dir "{here.path}".')
-                    await self.file_io.change_mtime(here.path, there.mtime)
-                    here.mtime = there.mtime
-            else:
-                assert(there.treehash is not None)
-                if here.treehash == there.treehash:
-                    if here.size == there.size:
-                        assert(here.mtime != there.mtime)
-                        self.status_func(log_info=f'LOCAL: File complete, setting mtime: "{here.path}"')
+                if here.is_dir != there.is_dir:
+                    self.status_func(log_info=f'LOCAL: "{f.path}" is dir here and file there (or vice versa). Deleting.')
+                    await self.file_io.remove_file_and_paths(f.path)
+                elif here.is_dir:
+                    if here.mtime != there.mtime:
+                        self.status_func(log_info=f'LOCAL: Fixing mtime for dir "{here.path}".')
                         await self.file_io.change_mtime(here.path, there.mtime)
                         here.mtime = there.mtime
-                    else:
-                        self.status_func(log_error=f'LOCAL: Hash collision or bug?? Here: {str(here)}, there: {str(there)}')
-                elif here.mtime == there.mtime:
-                    self.status_func(log_info=f'LOCAL: File "{here.path}" is has wrong content but was'
-                                              f' set to target time. Resetting it to "now".')
-                    here.mtime = time.time()
-                    await self.file_io.change_mtime(here.path, here.mtime)
+                else:
+                    assert(there.treehash is not None)
+                    if here.treehash == there.treehash:
+                        if here.size == there.size:
+                            assert(here.mtime != there.mtime)
+                            self.status_func(log_info=f'LOCAL: File complete, setting mtime: "{here.path}"')
+                            await self.file_io.change_mtime(here.path, there.mtime)
+                            here.mtime = there.mtime
+                        else:
+                            self.status_func(log_error=f'LOCAL: Hash collision or bug?? Here: {str(here)}, there: {str(there)}')
+                    elif here.mtime == there.mtime:
+                        self.status_func(log_info=f'LOCAL: File "{here.path}" is has wrong content but was'
+                                                  f' set to target time. Resetting it to "now".')
+                        here.mtime = time.time()
+                        await self.file_io.change_mtime(here.path, here.mtime)
 
-        self.status_func(log_debug=f"LOCAL: Local fixups done.")
-        self.local_batch.sanity_checks()
+            self.status_func(log_debug=f"LOCAL: Local fixups done.")
+            self.local_batch.sanity_checks()
 
-        # Are we in sync yet?
-        if self.local_batch == self.remote_batch:
-            self.status_func(log_info='Up to date.', cur_status='Up to date.', progress=-1)
-        else:
-            # If we've got all hashes, local changes and scans should get us up to date. Run multiple times if needed.
-            if self.local_batch.have_all_hashes(self.remote_batch.all_hashes()):
-                self.status_func(log_info='Have all chunks but local dir not in sync yet. Redoing local fixes.')
-                if not self.full_rescan_trigger.is_set():
-                    if max_recursions > 1:
-                        await self.local_file_fixups(max_recursions=max_recursions-1)
-                    elif max_recursions == 0:
-                        self.status_func(log_info="Several runs of local fixups failed to sync batches. Rescanning.")
-                        self.full_rescan_trigger.set()
+            # Are we in sync yet?
+            if self.local_batch == self.remote_batch:
+                self.status_func(log_info='Up to date.', cur_status='Up to date.', progress=-1)
+            else:
+                # If we've got all hashes, local changes and scans should get us up to date. Run multiple times if needed.
+                if self.local_batch.have_all_hashes(self.remote_batch.all_hashes()):
+                    self.status_func(log_info='Have all chunks but local dir not in sync yet. Redoing local fixes.')
+                    if not self.full_rescan_trigger.is_set():
+                        if max_recursions > 1:
+                            await self.local_file_fixups(max_recursions=max_recursions-1)
+                        elif max_recursions == 0:
+                            self.status_func(log_info="Several runs of local fixups failed to sync batches. Rescanning.")
+                            self.full_rescan_trigger.set()
 
+        except FileNotFoundError:
+            self.status_func(log_info="Some files disappeared while doing local_file_fixups. Rescanning.")
+            self.full_rescan_trigger.set()
 
     async def download_task(self, chunk_hash, url, http_session, timeout):
         """
@@ -249,7 +253,9 @@ class PeerNode:
 
             elif action == 'error':
                 self.status_func(log_error='Error from server:' + str(json.dumps(msg, indent=2)))
-            elif action != 'ok':
+            elif action == 'ok':
+                self.status_func(log_debug='OK from server:' + str(json.dumps(msg)))
+            else:
                 return await error(f"Unknown action '{str(action)}'")
 
         except Exception as e:
@@ -299,7 +305,7 @@ class PeerNode:
                 self.status_func(log_error=f'Websock handshake to {server_url} failed. Bad URL? Aborting.', popup=True)
                 return
 
-            except aiohttp.client_exceptions.ClientConnectorError:
+            except (aiohttp.client_exceptions.ClientConnectorError, aiohttp.client_exceptions.ClientOSError):
                 self.status_func(
                     log_error=f'HTTP/Websocket connect to server {server_url} failed. Retrying in a bit...',
                     cur_status='Connecting master...')
@@ -374,8 +380,9 @@ class PeerNode:
         def sig_exit():
             self.exit_trigger.set()
         try:
-            for sig in (SIGINT, SIGTERM):
-                asyncio.get_running_loop().add_signal_handler(sig, sig_exit)
+            if not any(platform.win32_ver()):
+                for sig in (SIGINT, SIGTERM):
+                    asyncio.get_running_loop().add_signal_handler(sig, sig_exit)
 
             # TODO: Runaway loop detection and avoidance with ratelimiter
 

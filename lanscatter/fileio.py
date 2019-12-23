@@ -1,4 +1,4 @@
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from aiohttp import web, ClientSession
 from typing import Tuple, Optional
 from contextlib import suppress
@@ -37,7 +37,8 @@ class FileIO:
         Check that given relative path stays inside basedir and return an absolute path string.
         :return: Absolute Path() object
         """
-        p = (self.basedir / Path(relative_path)).resolve()
+        assert '\\' not in str(relative_path), f"Non-posix path found: {str(relative_path)}"
+        p = (self.basedir / relative_path).resolve()
         if self.basedir not in p.parents:
             raise PermissionError(f'Filename points outside basedir: {str(relative_path)}')
         return p
@@ -126,7 +127,7 @@ class FileIO:
                 await response.write_eof()
                 return response, (time.time() - start_t)
 
-        except asyncio.exceptions.CancelledError as e:
+        except asyncio.CancelledError as e:
             # If client disconnected, predict how long upload would have taken
             try:
                 predicted_time = (time.time() - start_t) / (1-remaining/chunk.size)
@@ -161,8 +162,8 @@ class FileIO:
             if not inf:
                 raise FileNotFoundError(f'Local copy failed, no such file: {str(copy_from.path)}')
             chunk_data = await inf.read(copy_from.size)
-            csum = await HashFunc().update_async(chunk_data)
-            if csum.result() == copy_from.hash:
+            csum = (await HashFunc().update_async(chunk_data)).result()
+            if csum == copy_from.hash:
                 async with self.open_and_seek(copy_to.path, copy_to.pos, for_write=True) as outf:
                     await outf.write(chunk_data)
                 return True

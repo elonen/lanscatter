@@ -8,7 +8,7 @@ class Defaults:
 
     TCP_PORT_PEER = 10565
     TCP_PORT_MASTER = 10564
-    CHUNK_SIZE = 64 * 1024 * 1024
+    CHUNK_SIZE = 128 * 1024 * 1024
     BANDWIDTH_LIMIT_MBITS_PER_SEC = 10000
 
     FILE_BUFFER_SIZE = 256 * 1024
@@ -26,7 +26,7 @@ def parse_cli_args(is_master: bool):
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('dir', help='Sync directory')
     if not is_master:
-        parser.add_argument('url', help=f'URL to master node. E.g. ws://localhost:{Defaults.TCP_PORT_MASTER}/ws ')
+        parser.add_argument('url', help=f'URL to master node. E.g. ws://localhost:{Defaults.TCP_PORT_MASTER}/join ')
         parser.add_argument('--dl-rate', dest='dl_limit', type=float,
                             default=Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC, help='Rate limit downloads, Mb/s')
     parser.add_argument('--ul-rate', dest='ul_limit', type=float,
@@ -68,7 +68,7 @@ def make_human_cli_status_func(log_level_debug=False, print_func=print):
         if log_info is not None:
             parts.append(f"INFO    {sep} {log_info}")
         if log_level_debug and log_debug is not None:
-            parts.append(f"DEBUG    {sep} {log_debug}")
+            parts.append(f"DEBUG   {sep} {log_debug}")
 
         if parts and (''.join(parts)).strip():
             print_func(f"{dt} {sep} " + ' | '.join(parts))

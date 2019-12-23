@@ -3,7 +3,7 @@ import wx.adv
 
 import appdirs
 
-import sys, os, io, threading, traceback, json
+import sys, os, io, threading, traceback, json, platform
 from contextlib import suppress
 import multiprocessing
 from datetime import datetime, timedelta
@@ -13,8 +13,8 @@ from . import common, masternode, peernode
 
 SETTINGS_DEFAULTS = {
     'listen_port': common.Defaults.TCP_PORT_PEER,
-    'master_url': f'ws://lanscatter-master:{common.Defaults.TCP_PORT_MASTER}/ws',
-    'sync_dir': './sync-target/',
+    'master_url': f'ws://lanscatter-master:{common.Defaults.TCP_PORT_MASTER}/join',
+    'sync_dir': ('C:\\' if any(platform.win32_ver()) else '~/') + 'lanscatter-sync-dir/',
     'concurrent_transfers': common.Defaults.CONCURRENT_TRANSFERS_PEER,
     'upload_bandwidth': common.Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC,
     'rescan_interval': common.Defaults.DIR_SCAN_INTERVAL_PEER,
@@ -22,9 +22,9 @@ SETTINGS_DEFAULTS = {
 }
 
 def get_config_path(filename, create=False):
-    base = Path(appdirs.user_config_dir(common.Defaults.APP_NAME, common.Defaults.APP_VENDOR))
-    if create and not base.is_dir():
-        base.mkdir(exist_ok=True)
+    base = Path(appdirs.user_config_dir(common.Defaults.APP_NAME))
+    if create and not base.exists():
+        base.mkdir(exist_ok=True, parents=True)
     return str(base / filename)
 
 # To be run in separate process:
@@ -302,7 +302,7 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
             self.settings = ex.get_settings()
             # Save config file
             try:
-                path = get_config_path('gui.cfg')
+                path = get_config_path('gui.cfg', create=True)
                 with open(path, 'w') as f:
                     f.write(json.dumps(self.settings, indent=4))
                     print(f"Saved config as: {path}")
@@ -383,8 +383,8 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
                 with suppress(RuntimeError):
                     self.menu.SetLabel(self.MENUID_STATUS_TEXT, self.cur_progress_text + self.cur_status_text)
         except json.decoder.JSONDecodeError:
-            print("SYNCER SAID: " + str(msg))
-            wx.adv.NotificationMessage("Syncer error?", str(msg)).Show(timeout=5)
+            print("Print from sync_proc: " + str(msg))
+            wx.adv.NotificationMessage("Output from sync_proc", str(msg)).Show(timeout=5)
 
     def on_syncer_exit(self, ex, tb):
         self.write_log('\n------- syncer process exited -------\n\n')
@@ -426,7 +426,7 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
         argv.extend(['--port', str(port), '--concurrent-transfers', str(concurrent_transfers), '--json'])
         argv.extend(['--ul-rate', str(ul_rate), '--rescan-interval', str(rescan_interval)])
         cmdline = ' '.join(argv)
-        self.write_log(f'\n-------Launching "{cmdline}" -------\n\n')
+        self.write_log(f'\n------- Spawning "{cmdline}" -------\n\n')
         syncer = multiprocessing.Process(target=sync_proc, args=(conn_send, is_master, argv))
         threading.Thread(target=comm_thread, args=(conn_recv,)).start()
         syncer.start()
@@ -434,6 +434,7 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
 
 
 def main():
+    multiprocessing.freeze_support()  # Windows-only hack to allow multiprocessing to work on Pyinstaller
     app = wx.App()
     frame = wx.Frame(None)
     app.SetTopWindow(frame)
@@ -442,5 +443,4 @@ def main():
 
 
 if __name__ == '__main__':
-    multiprocessing.freeze_support()
     main()

@@ -1,7 +1,7 @@
 # Efficient large file distributor for Local Area Networks
 
 [![Build Status](https://travis-ci.com/elonen/lanscatter.svg?token=spq2kVHPBJxJyRjUkyKT&branch=master)](https://travis-ci.com/elonen/lanscatter)
-
+[![Platforms](https://img.shields.io/badge/platforms-Win%20%7C%20OSX%20%7C%20Linux-blue)]()
 
 ## Introduction
 
@@ -18,15 +18,17 @@ User who has files to distribute runs **master node** (CLI or GUI program), and 
 2. Start peers:
 
    ```
-   workstation-a:~$ lanscatter_peer ./to-dir ws://server:10564/ws
-   workstation-b:~$ lanscatter_peer ./to-dir ws://server:10564/ws
+   workstation-a:~$ lanscatter_peer ./to-dir ws://server:10564/join
+   workstation-b:~$ lanscatter_peer ./to-dir ws://server:10564/join
          ...
    ```
-   (If command line is not your thing, a systray icon GUI is also available.)
+   If command line is not your thing, a simple systray GUI is also available:
+   
+   ![LANScatter GUI](doc/gui-screenshot.png)
 
-3. Wait. LANScatter is designed for distributing folders with at least dozens of gigabytes of files, so hashing (calculating checksums) and transferring them will take a while.
+3. Wait. LANScatter is designed for distributing folders with dozens+ gigabytes of files, so hashing (calculating checksums) and transferring them will take a while.
 
-4. **[Optional]** Monitor whole swarm at `http://server:10564/` with a web browser.
+4. **[Optional]** Point a web browser to `http://server:10564/` to monitor the swarm.
 
 
 Master splits sync folder contents into _chunks_, calculates checksums, transfers them to different peers, and organizes peers to download chunks from each other optimally.

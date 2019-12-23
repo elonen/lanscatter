@@ -73,7 +73,7 @@ class MasterNode:
             :param msg: Message from client in a dict
             :return: New Node handle if messages caused a swarm join, otherwise None
             """
-            client_name = (node.name if node else self.file_server.hostname)
+            client_name = (node.name if node else address)
             self.status_func(log_debug=f'[{address}] Msg from {client_name}: {str(msg)}')
 
             async def error(txt):
@@ -217,23 +217,31 @@ class MasterNode:
                             await ws.send_json(msg)
             send_task = asyncio.create_task(send_loop())
 
-            while not self.file_server.batch:
-                await send_queue.put({'action': 'ok', 'message': "Hold on. Master is doing initial file scan."})
-                await asyncio.wait_for(self.replan_trigger.wait(), timeout=5)
+            async def welcome():
+                while not self.file_server.batch:
+                    await send_queue.put({'action': 'ok', 'message': "Hold on. Master is doing initial file scan."})
+                    with suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(self.replan_trigger.wait(), timeout=5)
 
-            welcome = self.__make_batch_msg()
-            welcome['action'] = 'initial_batch'
-            welcome['message'] = 'Welcome. Hash your files against this and join_swarm when ready to sync.'
-            await send_queue.put(welcome)
+                welcome = self.__make_batch_msg()
+                welcome['action'] = 'initial_batch'
+                welcome['message'] = 'Welcome. Hash your files against this and join_swarm when ready to sync.'
+                await send_queue.put(welcome)
+
+            welcome_task = asyncio.create_task(welcome())
 
             try:
                 # Read messages from websocket and handle them
                 async for msg in ws:
                     if msg.type == WSMsgType.TEXT:
                         try:
-                            new_node = await handle_client_msg(address, send_queue, node, msg.json())
-                            if new_node:
-                                node = new_node
+                            if welcome_task.done():
+                                new_node = await handle_client_msg(address, send_queue, node, msg.json())
+                                if new_node:
+                                    node = new_node
+                            else:
+                                await send_queue.put(
+                                    {'action': 'ok', 'message': "Hold on. Master is still doing initial file scan."})
                         except Exception as e:
                             self.status_func(log_error=f'Error ("{str(e)}") handling client msg: {msg.data}'
                                               'traceback: ' + traceback.format_exc())
@@ -255,7 +263,7 @@ class MasterNode:
         server = self.file_server.create_http_server(
             port, file_io, https_cert, https_key,
             extra_routes=[
-                web.get('/ws', http_handler__start_websocket),
+                web.get('/join', http_handler__start_websocket),
                 web.get('/', http_handler__status)
             ])
 
@@ -314,8 +322,8 @@ async def run_master_server(base_dir: str,
             # TODO: integrate with inotify (watchdog package) to avoid frequent rescans
             new_batch = await scan_dir(base_dir, chunk_size=chunk_size, old_batch=server.file_server.batch,
                                        progress_func=progress_func_adapter)
-            status_func(cur_status=f'Serving as master.')
             if new_batch != server.file_server.batch:
+                status_func(cur_status=f'New file batch. Serving as master.')
                 await server.replace_sync_batch(new_batch)
             await asyncio.sleep(dir_scan_interval)
 

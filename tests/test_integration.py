@@ -139,7 +139,7 @@ def test_actual_swarm_on_localhost(make_test_dirs):
     peers = []
     for i, name in TEST_PEER_NAMES.items():
         peers.append(spawn_sync_process(name=f'{name}', is_master=False, sync_dir=peer_dirs[i], port=PORT_BASE+1+i,
-                                        master_url=f'ws://localhost:{PORT_BASE}/ws'))
+                                        master_url=f'ws://localhost:{PORT_BASE}/join'))
         time.sleep(0.1)  # stagger peer generation a bit
         if i == 1:
             # Start server after the first two peers to test start order

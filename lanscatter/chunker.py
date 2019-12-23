@@ -1,9 +1,10 @@
 from typing import List, Set, Iterable, Dict, Tuple, Optional, Callable
 from types import SimpleNamespace
 import os, json, hashlib, asyncio, time
-import aiofiles, aiofiles.os, collections
+import aiofiles, aiofiles.os, collections, threading
 import mmap
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from contextlib import suppress
 
 # Tools for scanning files in a directory and splitting them into hashed chunks.
 # MasterNode and PeerNode both use this for maintaining and syncing their state.
@@ -39,6 +40,24 @@ class FileAttribs(HashableBase):
     @property
     def is_dir(self):
         return self.size < 0
+
+
+class HashFunc:
+    """Replaceable hash function, currently implemented as blake2b"""
+    def __init__(self):
+        self.h = hashlib.blake2b(digest_size=12)
+
+    def update(self, data):
+        self.h.update(data)
+        return self
+
+    async def update_async(self, data):
+        """Like update() but runs in a separate thread. Use for large payloads."""
+        await asyncio.get_running_loop().run_in_executor(None, lambda: self.h.update(data))
+        return self
+
+    def result(self) -> HashType:
+        return self.h.hexdigest()
 
 
 def calc_tree_hash(chunks: Iterable[FileChunk]) -> HashType:
@@ -89,7 +108,8 @@ class SyncBatch:
         illegal_dupes = [chunk for (chunk, cnt) in dupe_count.items() if cnt != 1]
         assert not illegal_dupes
         for f in self.files.values():
-            assert '\\' not in f.path  # Windows version should also use '/' as a separator
+            assert isinstance(f.path, str)
+            assert '\\' not in f.path, f"Non-posix path: {f.path}"  # Windows version must also use '/' as a separator
         for f in self.files.values():
             assert f.is_dir == f.path.endswith('/')
         for c in self.chunks:
@@ -167,28 +187,9 @@ class SyncBatch:
         return res
 
 
-class HashFunc:
-    """Replaceable hash function, currently implemented as blake2b"""
-    def __init__(self):
-        self.h = hashlib.blake2b(digest_size=12)
-
-    def update(self, data):
-        self.h.update(data)
-        return self
-
-    async def update_async(self, data):
-        await asyncio.sleep(0)  # Minimal yield -- give simultaneously started IO tasks a chance to go first
-        self.h.update(data)
-        return self
-
-    def result(self) -> HashType:
-        return self.h.hexdigest()
-
-
 async def read_attribs(basedir: str, relpath: str):
     """Read file attributes"""
-    path = os.path.join(basedir, relpath)
-    st = await aiofiles.os.stat(path)
+    st = await aiofiles.os.stat(Path(basedir)/relpath)
     return FileAttribs(path=relpath, size=st.st_size, mtime=int(st.st_mtime), treehash=None)
 
 
@@ -202,7 +203,7 @@ async def hash_file(basedir: str, relpath: str, chunk_size: int,
     :return: List of FileChunk
     """
     assert(chunk_size > 0)
-    path = os.path.join(basedir, relpath)
+    path = str(Path(basedir) / relpath)
     st = await aiofiles.os.stat(path)
 
     pos, chunks = 0, []
@@ -217,11 +218,11 @@ async def hash_file(basedir: str, relpath: str, chunk_size: int,
             mm = mmap.mmap(f.fileno(), 0)
             while pos < st.st_size:
                 sz = min(chunk_size, st.st_size - pos)
-                csum = await HashFunc().update_async(mm[pos:(pos+sz)])
+                csum = (await HashFunc().update_async(mm[pos:(pos+sz)])).result()
                 chunks.append(FileChunk(
                         path=relpath,
                         pos=pos, size=sz,
-                        hash=csum.result()))
+                        hash=csum))
                 pos += sz
                 file_progress_func(relpath, sz, pos, st.st_size)
 
@@ -242,16 +243,17 @@ async def scan_dir(basedir: str, chunk_size: int, old_batch: Optional[SyncBatch]
     """
     fnames = []
     dirs = []
+    base = Path(basedir)
     for root, d_names, f_names in os.walk(basedir, topdown=False, onerror=None, followlinks=False):
         for path in d_names:
-            dirs.append(os.path.relpath(os.path.join(root, path), basedir))
+            dirs.append(str(PurePosixPath((Path(root)/path).relative_to(base))))
         for f in f_names:
-            fnames.append(os.path.relpath(os.path.join(root, f), basedir))
+            fnames.append(str(PurePosixPath((Path(root)/f).relative_to(base))))
 
     async def file_needs_rehash(path: str):
         try:
             f = old_batch.files.get(path) if old_batch else None
-            s = await aiofiles.os.stat(os.path.join(basedir, path))
+            s = await aiofiles.os.stat(base/path)
             return f is None or f.size != s.st_size or f.mtime != int(s.st_mtime)
         except (FileNotFoundError, KeyError):
             return True
@@ -262,7 +264,7 @@ async def scan_dir(basedir: str, chunk_size: int, old_batch: Optional[SyncBatch]
         return old_batch
 
     # Prepare progress reporting
-    total_size = int(sum([(await aiofiles.os.stat(os.path.join(basedir, f))).st_size for f in fnames]))
+    total_size = int(sum([(await aiofiles.os.stat(base/f)).st_size for f in fnames]))
     total_remaining = total_size
 
     def file_progress(path, just_read, pos, file_size):
@@ -275,23 +277,29 @@ async def scan_dir(basedir: str, chunk_size: int, old_batch: Optional[SyncBatch]
     res_files, res_chunks = [], []
     for fn in fnames:
         if fn in files_needing_rehash:
-            attribs, chunks = await hash_file(basedir, fn, chunk_size, file_progress_func=file_progress)
-            res_files.append(attribs)
-            res_chunks.extend(chunks)
+            with suppress(FileNotFoundError):
+                attribs, chunks = await hash_file(basedir, fn, chunk_size, file_progress_func=file_progress)
+                res_files.append(attribs)
+                res_chunks.extend(chunks)
         else:
             res_chunks.extend([c for c in old_batch.chunks if c.path == fn])
             res_files.append(old_batch.files[fn])
             total_remaining -= res_files[-1].size
 
     # Build a minimal list of empty directories, without redundant parents
-    dirs = set(dirs) | set((str(Path(p).parent) for p in fnames)) - set('.')
+    dirs = set(dirs) | set((str(PurePosixPath(Path(p).parent)) for p in fnames)) - set('.')
     for d in dirs:
         res_files.append(FileAttribs(
             path=d+'/', size=-1, treehash=None,
-            mtime=int((Path(basedir)/d).stat().st_mtime)))
+            mtime=int((await aiofiles.os.stat(base/d)).st_mtime)))
 
     res = SyncBatch(chunk_size)
     res.add(files=res_files, chunks=res_chunks)
+
+    for x in (*res.chunks, *res.files.values()):
+        assert isinstance(x.path, str)
+        assert '\\' not in x.path, f"Non-posix path: '{x.path}'"
+
     return res
 
 
