@@ -3,7 +3,7 @@ import wx.adv
 
 import appdirs
 
-import sys, io, threading, traceback, json
+import sys, os, io, threading, traceback, json
 from contextlib import suppress
 import multiprocessing
 from datetime import datetime, timedelta
@@ -208,8 +208,17 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
 
         self.latest_progress_change = datetime.utcnow() - timedelta(seconds=60)
 
+        def resource_path(relative_path):
+            """ Get absolute path to resource, works for dev and for PyInstaller """
+            try:
+                # PyInstaller creates a temp folder and stores path in _MEIPASS
+                base_path = sys._MEIPASS
+            except Exception:
+                base_path = os.path.abspath(".")
+            return os.path.join(base_path, relative_path)
+
         self.icons = []
-        self.make_animated_icon(wx.Bitmap('hmq.png', wx.BITMAP_TYPE_ANY))
+        self.make_animated_icon(wx.Bitmap(resource_path('hmq.png'), wx.BITMAP_TYPE_ANY))
         self.SetIcon(self.icon_inactive)
 
         # Read config file or use defaults

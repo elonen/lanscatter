@@ -1,9 +1,10 @@
 import setuptools
+import pyinstaller_setuptools
 
 with open("README.md", "r") as fh:
     long_description = fh.read()
 
-setuptools.setup(
+pyinstaller_setuptools.setup(
     name='lanscatter',
 
     entry_points={
@@ -13,6 +14,7 @@ setuptools.setup(
             'lanscatter_gui = lanscatter.gui:main',
         ],
     },
+    data_files=[('bitmaps', ['hmq.png'])],
 
     version="0.1",
     author="Jarno Elonen",

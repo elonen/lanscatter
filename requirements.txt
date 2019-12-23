@@ -1,4 +1,6 @@
-# PyInstaller
+pyinstaller
+pyinstaller_setuptools
+
 aiohttp
 aiofiles
 
