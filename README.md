@@ -47,7 +47,7 @@ Notable features and differences to Bittorrent-based solutions like Btsync/Resil
 * Keeps traffic inside the LAN (doesn't connect to any third party servers).
 * Resilient against slow individual nodes. Transfers from slow peers detected, aborted and avoided after that.
 * Supports bandwidth limiting.
-* Written in Python 3.8, using asyncio for network and disk IO.
+* Written in Python 3.7, using asyncio for network and disk IO.
 
 ## Architecture
 

@@ -1,7 +1,9 @@
 # PyInstaller
 aiohttp
 aiofiles
+
 wxPython
+appdirs
 
 pytest
 pytest-timeout

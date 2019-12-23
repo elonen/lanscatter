@@ -4,6 +4,7 @@ import json, argparse
 
 class Defaults:
     APP_NAME = 'LANScatter'
+    APP_VENDOR = 'LANScatter'
 
     TCP_PORT_PEER = 10565
     TCP_PORT_MASTER = 10564
