@@ -2,10 +2,22 @@
 
 [![Build Status](https://travis-ci.com/elonen/lanscatter.svg?token=spq2kVHPBJxJyRjUkyKT&branch=master)](https://travis-ci.com/elonen/lanscatter)
 [![Platforms](https://img.shields.io/badge/platforms-Win%20%7C%20OSX%20%7C%20Linux-blue)]()
+[![Release](https://img.shields.io/github/v/release/elonen/lanscatter.svg)]()
+
 
 ## Introduction
 
 LANScatter is a P2P assisted, server-driven one-way folder synchronizer, designed for large files in reliable, private LANs.
+
+## Installing
+
+```
+python3.7 -m venv venv
+source venv/bin/activate    # Windows: CALL venv\Scripts\activate
+pip install --editable git+ssh://git@github.com/elonen/lanscatter.git#egg=lanscatter
+```
+
+...or download a [binary release](https://github.com/elonen/lanscatter/packages) (especially Gui for Windows)
 
 ## Operation
 

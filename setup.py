@@ -1,10 +1,20 @@
 import setuptools
-import pyinstaller_setuptools
 
-with open("README.md", "r") as fh:
-    long_description = fh.read()
+try:
+    from pyinstaller_setuptools import setup
+except ImportError:
+    print("WARGNING: pyinstaller_setuptools not installed. You won't be able to `./setup.py pyinstaller`")
+    from setuptools import setup
 
-pyinstaller_setuptools.setup(
+
+with open("README.md", "r") as f:
+    long_description = f.read()
+
+with open('requirements.txt') as f:
+    install_requires = f.read()
+
+
+setup(
     name='lanscatter',
 
     entry_points={
@@ -18,7 +28,7 @@ pyinstaller_setuptools.setup(
 
     version="0.1",
     author="Jarno Elonen",
-    author_email="jarno.elonen@housemarque.com",
+    author_email="elonen@iki.fi",
     description="P2P assisted large file distribution system for modern LAN environments",
     long_description=long_description,
     long_description_content_type="text/markdown",
@@ -30,5 +40,6 @@ pyinstaller_setuptools.setup(
         "Operating System :: OS Independent",
     ],
     python_requires='>=3.7',
-
+    platforms='any',
+    install_requires=install_requires
 )
