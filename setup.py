@@ -3,14 +3,14 @@ import setuptools
 try:
     from pyinstaller_setuptools import setup
 except ImportError:
-    print("WARGNING: pyinstaller_setuptools not installed. You won't be able to `./setup.py pyinstaller`")
+    print("WARNING: pyinstaller_setuptools not installed. You won't be able to `./setup.py pyinstaller`")
     from setuptools import setup
 
 
 with open("README.md", "r") as f:
     long_description = f.read()
 
-with open('requirements.txt') as f:
+with open('requirements.cli.txt') as f:
     install_requires = f.read()
 
 
@@ -32,7 +32,7 @@ setup(
     description="P2P assisted large file distribution system for modern LAN environments",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/elonennen/lanscatter",
+    url="https://github.com/elonen/lanscatter",
     packages=setuptools.find_packages(),
     classifiers=[
         "Programming Language :: Python :: 3",

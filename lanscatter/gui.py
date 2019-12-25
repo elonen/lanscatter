@@ -4,6 +4,7 @@ import wx.adv
 import appdirs
 
 import sys, os, io, threading, traceback, json, platform
+import PIL.Image, PIL.ImageOps, PIL.ImageColor
 from contextlib import suppress
 import multiprocessing
 from datetime import datetime, timedelta
@@ -12,13 +13,19 @@ from pathlib import Path
 from . import common, masternode, peernode
 
 SETTINGS_DEFAULTS = {
-    'listen_port': common.Defaults.TCP_PORT_PEER,
-    'master_url': f'ws://lanscatter-master:{common.Defaults.TCP_PORT_MASTER}/join',
-    'sync_dir': ('C:\\' if any(platform.win32_ver()) else '~/') + 'lanscatter-sync-dir/',
+    'local_peer_port': common.Defaults.TCP_PORT_PEER,
+    'local_master_port': common.Defaults.TCP_PORT_MASTER,
+
+    'remote_address': 'lanscatter-master',
+    'remote_port': common.Defaults.TCP_PORT_MASTER,
+
+    'sync_dir': ('C:\\' if any(platform.win32_ver()) else '~/') + 'lanscatter-sync-dir',
     'concurrent_transfers': common.Defaults.CONCURRENT_TRANSFERS_PEER,
     'upload_bandwidth': common.Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC,
     'rescan_interval': common.Defaults.DIR_SCAN_INTERVAL_PEER,
-    'is_master': False
+
+    'is_master': False,
+    'autostart': False
 }
 
 def get_config_path(filename, create=False):
@@ -58,90 +65,119 @@ class SettingsDlg(wx.Dialog):
         panel = wx.Panel(self)
         vbox = wx.BoxSizer(wx.VERTICAL)
 
-        st_hor = wx.SizerFlags().Border(direction=wx.LEFT | wx.RIGHT).Left()
-        st_hor_expand = wx.SizerFlags().Expand().Left().Right().Proportion(1).Border(direction=wx.LEFT | wx.RIGHT)
-        st_vert = wx.SizerFlags().Border(direction=wx.UP | wx.DOWN).Expand()
+        st_basic = wx.SizerFlags().Border(direction=wx.UP | wx.LEFT | wx.RIGHT)
+        st_expand = wx.SizerFlags().Expand().Border(direction=wx.UP | wx.LEFT | wx.RIGHT)
+        st_expand_last = wx.SizerFlags().Expand().Border(direction=wx.UP | wx.DOWN | wx.LEFT | wx.RIGHT)
+        st_prop = wx.SizerFlags().Proportion(1).Border(direction=wx.UP | wx.LEFT | wx.RIGHT)
 
-        # Radio button: client or server
+        # Mode selector
         hb = wx.BoxSizer(wx.HORIZONTAL)
-        self.is_slave = wx.RadioButton(panel, label="Peer node (sync target)", style=wx.RB_GROUP)
-        self.Bind(wx.EVT_RADIOBUTTON, self.on_radio_button, self.is_slave)
-        self.is_slave.SetValue(True)
-        hb.Add(self.is_slave, st_hor)
-        self.is_master = wx.RadioButton(panel, label="Master node (sync source)")
-        self.Bind(wx.EVT_RADIOBUTTON, self.on_radio_button, self.is_master)
-        hb.Add(self.is_master, st_hor)
-        vbox.Add(hb, st_vert)
+        vbox.Add(hb, st_basic)
+        if True:
+            # Radio button: client or server
+            self.is_slave = wx.RadioButton(panel, label="Peer mode", style=wx.RB_GROUP)
+            self.Bind(wx.EVT_RADIOBUTTON, self.on_radio_button, self.is_slave)
+            self.is_slave.SetValue(True)
+            hb.Add(self.is_slave, st_basic)
+
+            self.is_master = wx.RadioButton(panel, label="Master mode")
+            self.Bind(wx.EVT_RADIOBUTTON, self.on_radio_button, self.is_master)
+            hb.Add(self.is_master, st_basic)
 
         # Sync dir selector
         hb = wx.BoxSizer(wx.HORIZONTAL)
-        hb.Add(wx.StaticText(panel, label='Sync dir'), st_hor)
-        self.sync_dir = wx.TextCtrl(panel)
-        hb.Add(self.sync_dir, st_hor_expand)
-        btn = wx.Button(panel, label='Browse')
-        btn.Bind(wx.EVT_BUTTON, self.on_pick_dir)
-        hb.Add(btn, st_hor.Right())
-        vbox.Add(hb, st_vert)
+        vbox.Add(hb, st_expand)
+        if True:
+            hb.Add(wx.StaticText(panel, label='Sync dir'), st_basic)
+            self.sync_dir = wx.TextCtrl(panel)
+            hb.Add(self.sync_dir, st_prop)
+            btn = wx.Button(panel, label='Browse')
+            btn.Bind(wx.EVT_BUTTON, self.on_pick_dir)
+            hb.Add(btn, st_basic)
 
-        # Port to listen
-        hb = wx.BoxSizer(wx.HORIZONTAL)
-        hb.Add(wx.StaticText(panel, label='Local port'), st_hor)
-        self.listen_port = wx.SpinCtrl(panel, value='1', min=1, max=65535, initial=common.Defaults.TCP_PORT_PEER)
-        hb.Add(self.listen_port, st_hor)
-        vbox.Add(hb, st_vert)
+        peer_box = wx.StaticBox(panel, label="")
+        peer_sizer = wx.StaticBoxSizer(peer_box, wx.VERTICAL)
+        vbox.Add(peer_sizer, st_expand)
+        if True:
+            hb = wx.BoxSizer(wx.HORIZONTAL)
+            peer_sizer.Add(hb, st_expand)
+            if True:
+                hb.Add(wx.StaticText(panel, label='Server address'), st_basic)
+                self.remote_address = wx.TextCtrl(panel)
+                hb.Add(self.remote_address, st_prop)
 
-        # Max concurrent transfers
-        hb = wx.BoxSizer(wx.HORIZONTAL)
-        hb.Add(wx.StaticText(panel, label='Concurrent transfers'), st_hor)
-        self.concurrent_transfers = wx.SpinCtrl(panel, value='2', min=1, max=1000,
-                                                initial=common.Defaults.CONCURRENT_TRANSFERS_PEER)
-        hb.Add(self.concurrent_transfers, st_hor)
-        vbox.Add(hb, st_vert)
+                hb.Add(wx.StaticText(panel, label='port'), st_basic)
+                self.remote_port = wx.SpinCtrl(panel, value='1', min=1, max=65535, initial=common.Defaults.TCP_PORT_MASTER)
+                hb.Add(self.remote_port, st_basic)
 
-        # Max concurrent transfers
-        hb = wx.BoxSizer(wx.HORIZONTAL)
-        hb.Add(wx.StaticText(panel, label='Upload rate (Mbit/s)'), st_hor)
-        self.upload_bandwidth = wx.SpinCtrl(panel, value='1000', min=1, max=100000,
-                                                initial=common.Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC)
-        hb.Add(self.upload_bandwidth, st_hor)
-        vbox.Add(hb, st_vert)
+            hb = wx.BoxSizer(wx.HORIZONTAL)
+            peer_sizer.Add(hb, st_expand_last)
+            if True:
+                hb.Add(wx.StaticText(panel, label='Local port (peer)'), st_basic)
+                self.local_peer_port = wx.SpinCtrl(panel, value='1', min=1, max=65535, initial=common.Defaults.TCP_PORT_PEER)
+                hb.Add(self.local_peer_port, st_basic)
 
-        # Dir scan interval
-        hb = wx.BoxSizer(wx.HORIZONTAL)
-        hb.Add(wx.StaticText(panel, label='Sync dir rescan interval (seconds)'), st_hor)
-        self.rescan_interval = wx.SpinCtrl(panel, value='120', min=5, max=60*60*24,
-                                                initial=common.Defaults.DIR_SCAN_INTERVAL_PEER)
-        hb.Add(self.rescan_interval, st_hor)
-        vbox.Add(hb, st_vert)
+        master_box = wx.StaticBox(panel, label="")
+        master_sizer = wx.StaticBoxSizer(master_box, wx.VERTICAL)
+        vbox.Add(master_sizer, st_expand)
+        if True:
+            hb = wx.BoxSizer(wx.HORIZONTAL)
+            master_sizer.Add(hb, st_expand_last)
+            if True:
+                hb.Add(wx.StaticText(panel, label='Local port (master)'), st_basic)
+                self.local_master_port = wx.SpinCtrl(panel, value='1', min=1, max=65535, initial=common.Defaults.TCP_PORT_MASTER)
+                hb.Add(self.local_master_port, st_basic)
 
+        adv_box = wx.StaticBox(panel, label="Advanced")
+        adv_sizer = wx.StaticBoxSizer(adv_box, wx.VERTICAL)
+        gs = wx.GridSizer(4, 2, wx.SizerFlags().GetDefaultBorder(), wx.SizerFlags().GetDefaultBorder())
+        adv_sizer.Add(gs, st_basic)
+        vbox.Add(adv_sizer, st_expand)
+        if True:
+            # Max concurrent transfers
+            gs.Add(wx.StaticText(panel, label='Concurrent transfers'), st_basic)
+            self.concurrent_transfers = wx.SpinCtrl(
+                panel, value='2', min=1, max=1000, initial=common.Defaults.CONCURRENT_TRANSFERS_PEER)
+            gs.Add(self.concurrent_transfers, st_basic)
 
-        # Master server URL
-        hb = wx.BoxSizer(wx.HORIZONTAL)
-        hb.Add(wx.StaticText(panel, label='Server URL'), st_hor)
-        self.master_url = wx.TextCtrl(panel)
-        hb.Add(self.master_url, st_hor_expand)
-        vbox.Add(hb, st_vert)
+            # Max concurrent transfers
+            gs.Add(wx.StaticText(panel, label='Upload rate (Mbit/s)'), st_basic)
+            self.upload_bandwidth = wx.SpinCtrl(
+                panel, value='1000', min=1, max=100000, initial=common.Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC)
+            gs.Add(self.upload_bandwidth, st_basic)
+
+            # Dir scan interval
+            gs.Add(wx.StaticText(panel, label='File rescan frequency (sec)'), st_basic)
+            self.rescan_interval = wx.SpinCtrl(
+                panel, value='120', min=5, max=60*60*24, initial=common.Defaults.DIR_SCAN_INTERVAL_PEER)
+            gs.Add(self.rescan_interval, st_basic)
+
+            # Autotart
+            gs.Add(wx.StaticText(panel, label='Launch sync when app starts'), st_basic)
+            self.autostart = wx.CheckBox(panel, label='Autostart')
+            gs.Add(self.autostart, st_basic)
 
         vbox.AddSpacer(wx.SizerFlags().GetDefaultBorder()*3)
         vbox.AddStretchSpacer()
 
         # OK / Cancel
         hb = wx.BoxSizer(wx.HORIZONTAL)
-        hb.Add(wx.Button(panel, wx.ID_OK, label="OK"))
-        hb.Add(wx.Button(panel, wx.ID_CANCEL, label="Cancel"))
         vbox.Add(hb, wx.SizerFlags().Align(wx.ALIGN_RIGHT).Right().Border())
+        if True:
+            hb.Add(wx.Button(panel, wx.ID_OK, label="OK"))
+            hb.Add(wx.Button(panel, wx.ID_CANCEL, label="Cancel"))
 
         # Resize to fit
         vbox.AddSpacer(wx.SizerFlags().GetDefaultBorder()*6)
         panel.SetSizer(vbox)
         sz = vbox.GetMinSize()
-        self.SetMinSize(wx.Size(int(sz.x*1.5), int(sz.y)))
+        self.SetMinSize(wx.Size(int(sz.x), int(sz.y)+wx.SizerFlags().GetDefaultBorder()*2))
         self.Fit()
 
         # Set widget values from settings
         for key, default in SETTINGS_DEFAULTS.items():
-            if hasattr(self, key):
-                getattr(self, key).SetValue(self.settings.get(key, default))
+            assert hasattr(self, key), f'No corresponding widget for settings "{key}".'
+            getattr(self, key).SetValue(self.settings.get(key, default))
         self.on_radio_button(None)  # Update widget enable/disable
 
 
@@ -151,7 +187,10 @@ class SettingsDlg(wx.Dialog):
             self.sync_dir.SetValue(dlg.GetPath())
 
     def on_radio_button(self, event):
-        self.master_url.Enable(self.is_slave.GetValue())
+        self.remote_address.Enable(self.is_slave.GetValue())
+        self.remote_port.Enable(self.is_slave.GetValue())
+        self.local_peer_port.Enable(self.is_slave.GetValue())
+        self.local_master_port.Enable(not self.is_slave.GetValue())
 
     def get_settings(self):
         res = SETTINGS_DEFAULTS.copy()
@@ -168,13 +207,17 @@ class LogWindow(wx.Dialog):
         panel = wx.Panel(self, wx.ID_ANY)
         self.Bind(wx.EVT_CLOSE, self.OnClose)
 
-        self.log_widget = wx.TextCtrl(panel, wx.ID_ANY, size=(640, 240), style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL)
+        self.log_widget = wx.TextCtrl(panel, wx.ID_ANY, size=(640, 480), style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL)
         self.log_widget.SetFont(wx.Font(10, wx.MODERN, wx.NORMAL, wx.NORMAL, False, u'Courier'))
         self.log_widget.WriteText(self.systray_icon.log_text.getvalue())
 
         sizer = wx.BoxSizer(wx.VERTICAL)
         sizer.Add(self.log_widget, 1, wx.ALL | wx.EXPAND, 5)
         panel.SetSizer(sizer)
+
+        sz_x, sz_y = wx.DisplaySize()
+        self.SetMinSize(wx.Size(int(sz_x/2), int(sz_y/2)))
+        self.Fit()
         self.Centre()
 
     def OnClose(self, event):
@@ -201,6 +244,7 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
         self.cur_progress_text = ''
         self.cur_status_text = '(not running)'
         self.syncer = None
+        self.menu = None
 
         self.log_text = io.StringIO()
         self.log_win = None
@@ -218,7 +262,7 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
             return os.path.join(base_path, relative_path)
 
         self.icons = []
-        self.make_animated_icon(wx.Bitmap(resource_path('hmq.png'), wx.BITMAP_TYPE_ANY))
+        self.make_animated_icon(bgr=resource_path('gfx/icon__bgr.png'), wheel=resource_path('gfx/icon__wheel.png'))
         self.SetIcon(self.icon_inactive)
 
         # Read config file or use defaults
@@ -233,6 +277,9 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
         except IOError as e:
             print(f"Failed to load config file: {str(e)}")
 
+        if self.settings['autostart']:
+            self.on_menu_start_stop(None)
+
         # Start icon animator
         self.timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_timer_tick)
@@ -242,16 +289,26 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
             wx.adv.NotificationMessage.UseTaskBarIcon(self)
 
     # Make progress animation icons by rotating given bitmap 360 degrees
-    def make_animated_icon(self, orig_bitmap):
-        img = orig_bitmap.ConvertToImage()
+    def make_animated_icon(self, bgr, wheel):
+        dst_size = (16,16) if any(platform.win32_ver()) else (32,32)  # systray icon is 16px on Win, 32 on OSX
+        wheel = PIL.Image.open(wheel)
+
+        def pil_to_icon(image):
+            return wx.Icon(wx.Bitmap.FromBufferRGBA(image.size[0], image.size[1], image.convert('RGBA').tobytes()))
+
+        def tint(src, color):
+            r, g, b, alpha = src.split()
+            res = PIL.ImageOps.colorize(PIL.ImageOps.grayscale(src), (0,0,0,0), color)
+            res.putalpha(alpha)
+            return res
+
+        bgr = tint(PIL.Image.open(bgr).resize(dst_size, resample=PIL.Image.BICUBIC), "#D1A000")
+
         for r in range(0, 64):
-            angle = 6.28319 * (r/64.0)  # 6.28319 = 360 dg in radians
-            size = img.GetSize()
-            orig_center = wx.RealPoint(size.x, size.y) * 0.5
-            rotated = img.Rotate(angle, wx.Point(orig_center))
-            new_center = wx.RealPoint(rotated.GetSize().x, rotated.GetSize().y) * 0.5
-            rotated = rotated.Resize(size, wx.Point(orig_center-new_center))
-            self.icons.append(wx.Icon(wx.Bitmap(rotated.Scale(64, 64, wx.IMAGE_QUALITY_HIGH))))
+            angle = -360 * (r/64.0)  # 6.28319 = 360 dg in radians
+            img = wheel.rotate(angle, resample=PIL.Image.BICUBIC).resize(dst_size, resample=PIL.Image.BICUBIC)
+            img = tint(img, "#FFC300")
+            self.icons.append(pil_to_icon(PIL.Image.alpha_composite(img, bgr)))
 
         bmp = wx.Bitmap()
         bmp.CopyFromIcon(self.icons[0])
@@ -322,20 +379,18 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
     def on_menu_start_stop(self, event):
         if self.syncer:
             self.syncer.terminate()
-            self.syncer = None
-            self.SetIcon(self.icon_inactive)
-            self.icon_idx = 0
         else:
             sync_dir = self.settings['sync_dir']
             if sync_dir.upper().strip() in ('', '.', './', 'C:\\', 'C:', '/', '\\', '../', '..'):
                 wx.adv.NotificationMessage(common.Defaults.APP_NAME,
                                            f"Unsafe sync_dir: '{sync_dir}'. Refusing to start.").Show(timeout=5)
             else:
+                is_master = self.settings['is_master']
                 self.syncer = self.spawn_sync_process(
-                    is_master=self.settings['is_master'],
+                    is_master=is_master,
                     sync_dir=self.settings['sync_dir'],
-                    port=self.settings['listen_port'],
-                    master_url=self.settings['master_url'],
+                    port=self.settings['local_master_port'] if is_master else self.settings['local_peer_port'],
+                    master_addr='%s:%s' % (self.settings['remote_address'], self.settings['remote_port']),
                     ul_rate=self.settings['upload_bandwidth'],
                     concurrent_transfers=self.settings['concurrent_transfers'],
                     rescan_interval=self.settings['rescan_interval'])
@@ -380,8 +435,9 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
 
             if msg.get('cur_status'):
                 self.cur_status_text = msg.get('cur_status')
-                with suppress(RuntimeError):
-                    self.menu.SetLabel(self.MENUID_STATUS_TEXT, self.cur_progress_text + self.cur_status_text)
+                if self.menu:
+                    with suppress(RuntimeError):
+                        self.menu.SetLabel(self.MENUID_STATUS_TEXT, self.cur_progress_text + self.cur_status_text)
         except json.decoder.JSONDecodeError:
             print("Print from sync_proc: " + str(msg))
             wx.adv.NotificationMessage("Output from sync_proc", str(msg)).Show(timeout=5)
@@ -397,7 +453,11 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
         with suppress(RuntimeError):
             self.menu.SetLabel(self.MENUID_STATUS_TEXT, self.cur_status_text)
 
-    def spawn_sync_process(self, is_master: bool, sync_dir: str, port: int, master_url: str,
+        self.syncer = None
+        self.SetIcon(self.icon_inactive)
+        self.icon_idx = 0
+
+    def spawn_sync_process(self, is_master: bool, sync_dir: str, port: int, master_addr: str,
                            concurrent_transfers: int, ul_rate: int, rescan_interval: int):
         """
         Start a sync client or server in separate process, forwarding stdout to given inter-process queue.
@@ -422,7 +482,7 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
                 wx.CallAfter(self.on_syncer_exit, res[0], res[1])
 
         conn_recv, conn_send = multiprocessing.Pipe(duplex=False)  # Multi-CPU safe conn_send -> conn_recv pipe
-        argv = ['masternode', sync_dir] if is_master else ['peernode', sync_dir, master_url]
+        argv = ['masternode', sync_dir] if is_master else ['peernode', sync_dir, master_addr]
         argv.extend(['--port', str(port), '--concurrent-transfers', str(concurrent_transfers), '--json'])
         argv.extend(['--ul-rate', str(ul_rate), '--rescan-interval', str(rescan_interval)])
         cmdline = ' '.join(argv)

@@ -2,7 +2,7 @@
 
 [![Build Status](https://travis-ci.com/elonen/lanscatter.svg?token=spq2kVHPBJxJyRjUkyKT&branch=master)](https://travis-ci.com/elonen/lanscatter)
 [![Platforms](https://img.shields.io/badge/platforms-Win%20%7C%20OSX%20%7C%20Linux-blue)]()
-[![Release](https://img.shields.io/github/v/release/elonen/lanscatter.svg)]()
+[![Release](https://img.shields.io/github/v/release/elonen/lanscatter?include_prereleases)]()
 
 
 ## Introduction
@@ -17,7 +17,7 @@ source venv/bin/activate    # Windows: CALL venv\Scripts\activate
 pip install --editable git+ssh://git@github.com/elonen/lanscatter.git#egg=lanscatter
 ```
 
-...or download a [binary release](https://github.com/elonen/lanscatter/packages) (especially Gui for Windows)
+...or download a [binary release](https://github.com/elonen/lanscatter/releases) (especially Gui for Windows)
 
 ## Operation
 
@@ -25,14 +25,15 @@ User who has files to distribute runs **master node** (CLI or GUI program), and 
 
 1. Start master:
 
-   `server:~$ lanscatter_master ./from-dir`
+   `my.server:~$ lanscatter_master ./from-dir`
 
 2. Start peers:
 
    ```
-   workstation-a:~$ lanscatter_peer ./to-dir ws://server:10564/join
-   workstation-b:~$ lanscatter_peer ./to-dir ws://server:10564/join
-         ...
+   Workstation-A:~$ lanscatter_peer ./to-dir my-server
+   Workstation-B:~$ lanscatter_peer ./to-dir my-server
+   Workstation-C:~$ lanscatter_peer ./to-dir my-server
+   ...
    ```
    If command line is not your thing, a simple systray GUI is also available:
    
@@ -51,7 +52,8 @@ According to simulations (see _Testing_ below) this should yield 50% – 90% dis
 
 ## Features
 
-Notable features and differences to Bittorrent-based solutions like Btsync/Resilio:
+Notable features and differences to Bittorrent-based solutions like
+Btsync/Resilio, and Dropbox-like software:
 
 * It's a _one way synchronizer_ for distributing large folders 1-to-N, not a generic two-way syncer.
 * Keeps only a _single copy of each file_ to save space – no `.sync` dirs with duplicate files
@@ -61,7 +63,12 @@ Notable features and differences to Bittorrent-based solutions like Btsync/Resil
 * Keeps traffic inside the LAN (doesn't connect to any third party servers).
 * Resilient against slow individual nodes. Transfers from slow peers detected, aborted and avoided after that.
 * Supports bandwidth limiting.
-* Written in Python 3.7, using asyncio for network and disk IO.
+
+## Technologies
+
+Lanscatter is built on _Python 3.7_ using asyncio (aiohttp & aiofiles),
+_wxPython_ for cross-platform GUI, _Blake2b_ for hash/checksum algorithm, _pytest_ for unit/integration tests
+and _pyinstaller_ for packaging/freezing into exe files.
 
 ## Architecture
 
@@ -73,7 +80,7 @@ Notable modules:
 
 * **chunker.py**: Functions to scan a directory, split files into chunks and calculating checksums. Outputs `SyncBatch` class instances, that represent contents of scanned sync directory. Includes functions for comparing and (de)serializing them.
 
-* **fileio.py**: Functions for uploading and downloading chunks from/to files on disk. Supports bandwidth throttling and limits operations inside a base directory (syc dir) for safety.
+* **fileio.py**: Functions for uploading and downloading chunks from/to files on disk. Supports bandwidth throttling and limits operations inside a base directory (sync dir) for safety.
 
 * **fileserver.py**: HTTP(S) server base that serves out chunks of files from sync dir. Used by both master node and peer nodes.
 
@@ -138,3 +145,19 @@ Slow download. Giving up. (from N04)
 Left column is a list of node names.
 Table with hash characters and dots show which chunks each node has.
 Numbers on the right show current downloads, current uploads and average time it takes to upload one chunk from each node.
+
+## License
+
+Copyright 2019 Jarno Elonen <elonen@iki.fi>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.

@@ -116,7 +116,7 @@ def test_actual_swarm_on_localhost(make_test_dirs):
     """
     seed_dir, peer_dirs = make_test_dirs
 
-    def spawn_sync_process(name: str, is_master: bool, sync_dir: str, port: int, master_url: str):
+    def spawn_sync_process(name: str, is_master: bool, sync_dir: str, port: int, master_addr: str):
         print(f"Spawning process for '{name}'...")
         out = io.StringIO()
         def comm_thread(conn):
@@ -130,7 +130,7 @@ def test_actual_swarm_on_localhost(make_test_dirs):
                         out.write(str(o))
         conn_recv, conn_send = mp.Pipe(duplex=False)
         argv = ['masternode.py', sync_dir, '--port', str(port), '--concurrent-transfers', '1'] if is_master else \
-               ['peernode.py', sync_dir, master_url, '--port', str(port), '--rescan-interval', '3']
+               ['peernode.py', sync_dir, master_addr, '--port', str(port), '--rescan-interval', '3']
         proc = mp.Process(target=sync_proc, name='sync-worker', args=(conn_send, is_master, argv))
         threading.Thread(target=comm_thread, args=(conn_recv,)).start()
         proc.start()
@@ -139,11 +139,11 @@ def test_actual_swarm_on_localhost(make_test_dirs):
     peers = []
     for i, name in TEST_PEER_NAMES.items():
         peers.append(spawn_sync_process(name=f'{name}', is_master=False, sync_dir=peer_dirs[i], port=PORT_BASE+1+i,
-                                        master_url=f'ws://localhost:{PORT_BASE}/join'))
+                                        master_addr=f'localhost:{PORT_BASE}'))
         time.sleep(0.1)  # stagger peer generation a bit
         if i == 1:
             # Start server after the first two peers to test start order
-            master = spawn_sync_process(name=f'master', is_master=True, sync_dir=seed_dir, port=PORT_BASE, master_url='')
+            master = spawn_sync_process(name=f'master', is_master=True, sync_dir=seed_dir, port=PORT_BASE, master_addr='')
 
     # Alter files on one peer in the middle of a sync
     time.sleep(4)

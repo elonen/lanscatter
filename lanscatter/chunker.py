@@ -92,7 +92,7 @@ class SyncBatch:
         return not not (self.files or self.chunks)
 
     def __repr__(self):
-        """Unambigious, sompareable human readable string representation of batch contents"""
+        """Unambigious, comparable, human readable string representation of batch contents"""
         return json.dumps(self.to_dict(), indent=2, sort_keys=True)
 
     def __hash__(self):

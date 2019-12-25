@@ -24,15 +24,26 @@ class Defaults:
 
 def parse_cli_args(is_master: bool):
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
+    def check_server_str(value):
+        s = str(value).split(':')
+        if len(s) == 1:
+            return value + ':' + str(Defaults.TCP_PORT_MASTER)
+        elif len(s) != 2:
+            raise argparse.ArgumentTypeError("Server address must be in format <address>[:<port>]. Was: '%s'" % value)
+        return value
+
     parser.add_argument('dir', help='Sync directory')
     if not is_master:
-        parser.add_argument('url', help=f'URL to master node. E.g. ws://localhost:{Defaults.TCP_PORT_MASTER}/join ')
+        parser.add_argument('server', type=check_server_str,
+                            help=f"Master's address[:port]. E.g. 'my-server:{Defaults.TCP_PORT_MASTER}'")
         parser.add_argument('--dl-rate', dest='dl_limit', type=float,
                             default=Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC, help='Rate limit downloads, Mb/s')
     parser.add_argument('--ul-rate', dest='ul_limit', type=float,
                         default=Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC, help='Rate limit uploads, Mb/s')
     parser.add_argument('-c', '--concurrent-transfers', dest='ct', type=int,
-                        default=Defaults.CONCURRENT_TRANSFERS_MASTER, help='Max concurrent transfers')
+                        default=Defaults.CONCURRENT_TRANSFERS_MASTER if is_master else Defaults.CONCURRENT_TRANSFERS_PEER,
+                        help='Max concurrent transfers')
     default_port = Defaults.TCP_PORT_MASTER if is_master else Defaults.TCP_PORT_PEER
     parser.add_argument('-p', '--port', dest='port', type=int, default=default_port, help='TCP port to listen')
     parser.add_argument('-s', '--rescan-interval', dest='rescan_interval', type=float,

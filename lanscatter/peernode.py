@@ -307,7 +307,7 @@ class PeerNode:
 
             except (aiohttp.client_exceptions.ClientConnectorError, aiohttp.client_exceptions.ClientOSError):
                 self.status_func(
-                    log_error=f'HTTP/Websocket connect to server {server_url} failed. Retrying in a bit...',
+                    log_error=f'Websocket connect to server {server_url} failed. Retrying in a bit...',
                     cur_status='Connecting master...')
                 with suppress(asyncio.TimeoutError):
                     await asyncio.wait([self.exit_trigger.wait()], timeout=5)
@@ -415,7 +415,7 @@ def main():
     args = parse_cli_args(is_master=False)
     status_func = json_status_func if args.json else make_human_cli_status_func(log_level_debug=args.debug)
     with suppress(KeyboardInterrupt):
-        asyncio.run(run_file_client(base_dir=args.dir, server_url=args.url, port=args.port,
+        asyncio.run(run_file_client(base_dir=args.dir, server_url=f'ws://{args.server}/join', port=args.port,
                                     rescan_interval=args.rescan_interval,
                                     dl_limit=args.dl_limit, ul_limit=args.ul_limit, concurrent_transfer_limit=args.ct,
                                     status_func=status_func))
