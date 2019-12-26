@@ -1,8 +1,9 @@
-from typing import List, Set, Iterable, Dict, Tuple, Optional, Callable
+from typing import List, Set, Iterable, Dict, Tuple, Optional, Callable, Generator
 from types import SimpleNamespace
 import os, json, hashlib, asyncio, time
 import aiofiles, aiofiles.os, collections, threading
 import mmap
+from concurrent.futures import ThreadPoolExecutor, Future, as_completed, CancelledError
 from pathlib import Path, PurePosixPath
 from contextlib import suppress
 
@@ -52,7 +53,7 @@ class HashFunc:
         return self
 
     async def update_async(self, data):
-        """Like update() but runs in a separate thread. Use for large payloads."""
+        """Like update() but runs in a separate thread."""
         await asyncio.get_running_loop().run_in_executor(None, lambda: self.h.update(data))
         return self
 
@@ -187,50 +188,36 @@ class SyncBatch:
         return res
 
 
-async def read_attribs(basedir: str, relpath: str):
-    """Read file attributes"""
-    st = await aiofiles.os.stat(Path(basedir)/relpath)
-    return FileAttribs(path=relpath, size=st.st_size, mtime=int(st.st_mtime), treehash=None)
-
-
-async def hash_file(basedir: str, relpath: str, chunk_size: int,
-                    file_progress_func: Callable) -> Tuple[FileAttribs, List[FileChunk]]:
+def _hash_file(basedir: str, relpath: str, chunk_size: int, executor, progress_func: Callable) -> \
+        Generator[Future, None, None]:
     """
-    Split given file into chunks and hash them
+    Split given file into chunks and return multithreading futures that hash them.
+
+    Hashlib releases GIL so this is fast even with a ThreadPoolExecutor. Uses memory mapping
+    instead of buffers for maximum efficiency.
+
     :param basedir: Base directory to search for files
     :param relpath: Pathname to file
+    :param executor: Executor to run hash functions in.
     :param file_progress_func: Progress reporting callback
-    :return: List of FileChunk
+    :return: Generator that yields multithreading Futures that return FileChunks
     """
-    assert(chunk_size > 0)
-    path = str(Path(basedir) / relpath)
-    st = await aiofiles.os.stat(path)
-
-    pos, chunks = 0, []
-
-    if st.st_size == 0:
-        chunks.append(FileChunk(
-            path=relpath,
-            pos=0, size=0,
-            hash=HashFunc().result()))
+    path = Path(basedir) / relpath
+    files_size = path.stat().st_size
+    if files_size == 0:
+        yield executor.submit(lambda: FileChunk(path=relpath, pos=0, size=0, hash=HashFunc().result()))
     else:
-        async with aiofiles.open(path, 'r+b') as f:
+        with open(path, 'r+b') as f:
             mm = mmap.mmap(f.fileno(), 0)
-            while pos < st.st_size:
-                sz = min(chunk_size, st.st_size - pos)
-                csum = (await HashFunc().update_async(mm[pos:(pos+sz)])).result()
-                chunks.append(FileChunk(
-                        path=relpath,
-                        pos=pos, size=sz,
-                        hash=csum))
-                pos += sz
-                file_progress_func(relpath, sz, pos, st.st_size)
-
-    attribs = FileAttribs(path=relpath, size=st.st_size, mtime=int(st.st_mtime), treehash=calc_tree_hash(chunks))
-    return attribs, chunks
+            for pos in range(0, files_size, chunk_size):
+                def do_hash(p, s):
+                    progress_func(relpath, s, p, files_size)
+                    return FileChunk(path=relpath, pos=p, size=s, hash=HashFunc().update(mm[p:(p+s)]).result())
+                yield executor.submit(do_hash, pos, min(chunk_size, files_size - pos))
 
 
-async def scan_dir(basedir: str, chunk_size: int, old_batch: Optional[SyncBatch], progress_func: Callable) -> SyncBatch:
+async def scan_dir(basedir: str, chunk_size: int, old_batch: Optional[SyncBatch], progress_func: Callable) ->\
+        Tuple[SyncBatch, Iterable[str]]:
     """
     Scan given directory and generate a list of FileChunks of its contents. If old_chunks is provided,
     assumes contents haven't changed if mtime and size are identical.
@@ -239,8 +226,9 @@ async def scan_dir(basedir: str, chunk_size: int, old_batch: Optional[SyncBatch]
     :param progress_func: Progress report callback - func(cur_filename, file_progress, total_progress)
     :param chunk_size: Length of chunk to split files into
     :param old_batch: If given, compares dir it and skips hashing files with identical size & mtime
-    :return: New list of FileChunks, or old_chunks if no changes are detected
+    :return: Tuple(New list of FileChunks or old_chunks if no changes are detected, List[errors])
     """
+    errors = []
     fnames = []
     dirs = []
     base = Path(basedir)
@@ -261,37 +249,60 @@ async def scan_dir(basedir: str, chunk_size: int, old_batch: Optional[SyncBatch]
     # Return immediately if we are completely up to date:
     files_needing_rehash = set([fn for fn in fnames if await file_needs_rehash(fn)])
     if old_batch and len(fnames) == len(old_batch.files) and not files_needing_rehash:
-        return old_batch
+        return old_batch, errors
 
     # Prepare progress reporting
     total_size = int(sum([(await aiofiles.os.stat(base/f)).st_size for f in fnames]))
     total_remaining = total_size
 
+    progr_lock = threading.RLock()  # Mutex to maintain total_remaining inside file_progress()
     def file_progress(path, just_read, pos, file_size):
         nonlocal total_remaining
-        total_remaining -= just_read
-        perc = float(pos) / file_size if file_size > 0 else 1.0
-        progress_func(path, total_progress=1-float(total_remaining)/(total_size or 1), file_progress=perc)
+        with progr_lock:
+            total_remaining -= just_read
+            perc = float(pos) / file_size if file_size > 0 else 1.0
+            progress_func(path, total_progress=1-float(total_remaining)/(total_size or 1), file_progress=perc)
 
     # Hash files as needed
     res_files, res_chunks = [], []
-    for fn in fnames:
-        if fn in files_needing_rehash:
-            with suppress(FileNotFoundError):
-                attribs, chunks = await hash_file(basedir, fn, chunk_size, file_progress_func=file_progress)
-                res_files.append(attribs)
-                res_chunks.extend(chunks)
-        else:
-            res_chunks.extend([c for c in old_batch.chunks if c.path == fn])
-            res_files.append(old_batch.files[fn])
-            total_remaining -= res_files[-1].size
 
-    # Build a minimal list of empty directories, without redundant parents
+    # Copy hashes for apparently non-modified files from old_chunks:
+    for fn in (set(fnames) - files_needing_rehash):
+        res_chunks.extend([c for c in old_batch.chunks if c.path == fn])
+        res_files.append(old_batch.files[fn])
+        total_remaining -= res_files[-1].size
+
+    # Hash file contents in multiple threads
+    with ThreadPoolExecutor() as pool:
+        futures = []
+        for fn in files_needing_rehash:
+            try:
+                futures.extend(_hash_file(basedir, fn, chunk_size, pool, file_progress))
+            except (OSError, IOError) as e:
+                errors.append(f'[{fn}]: ' + str(e))
+        for f in as_completed(futures):
+            try:
+                res_chunks.append(f.result())
+            except (OSError, IOError) as e:
+                errors.append(str(e))
+
+    # Read file attributes and calculate tree hashes
+    for fn in files_needing_rehash:
+        try:
+            st = (Path(basedir) / fn).stat()
+            chunks = [c for c in res_chunks if c.path == fn]
+            res_files.append(FileAttribs(path=fn, size=st.st_size, mtime=int(st.st_mtime), treehash=calc_tree_hash(chunks)))
+        except (OSError, IOError) as e:
+            errors.append(f'[{fn}]: ' + str(e))
+
+    # Include all directories and read their file attribs
     dirs = set(dirs) | set((str(PurePosixPath(Path(p).parent)) for p in fnames)) - set('.')
     for d in dirs:
-        res_files.append(FileAttribs(
-            path=d+'/', size=-1, treehash=None,
-            mtime=int((await aiofiles.os.stat(base/d)).st_mtime)))
+        try:
+            res_files.append(FileAttribs(path=d+'/', size=-1, treehash=None,
+                                         mtime=int((await aiofiles.os.stat(base/d)).st_mtime)))
+        except (OSError, IOError) as e:
+            errors.append(f'[{d}/]: ' + str(e))
 
     res = SyncBatch(chunk_size)
     res.add(files=res_files, chunks=res_chunks)
@@ -300,7 +311,7 @@ async def scan_dir(basedir: str, chunk_size: int, old_batch: Optional[SyncBatch]
         assert isinstance(x.path, str)
         assert '\\' not in x.path, f"Non-posix path: '{x.path}'"
 
-    return res
+    return res, errors
 
 
 # ----------------------------

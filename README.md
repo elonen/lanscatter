@@ -30,9 +30,9 @@ User who has files to distribute runs **master node** (CLI or GUI program), and 
 2. Start peers:
 
    ```
-   Workstation-A:~$ lanscatter_peer ./to-dir my-server
-   Workstation-B:~$ lanscatter_peer ./to-dir my-server
-   Workstation-C:~$ lanscatter_peer ./to-dir my-server
+   Workstation-A:~$ lanscatter_peer my-server ./to-dir
+   Workstation-B:~$ lanscatter_peer my-server ./to-dir
+   Workstation-C:~$ lanscatter_peer my-server ./to-dir
    ...
    ```
    If command line is not your thing, a simple systray GUI is also available:

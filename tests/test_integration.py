@@ -126,11 +126,10 @@ def test_actual_swarm_on_localhost(make_test_dirs):
                     if isinstance(o, tuple):
                         pass  # process exit
                     else:
-                        # print(str(o))
                         out.write(str(o))
         conn_recv, conn_send = mp.Pipe(duplex=False)
         argv = ['masternode.py', sync_dir, '--port', str(port), '--concurrent-transfers', '1'] if is_master else \
-               ['peernode.py', sync_dir, master_addr, '--port', str(port), '--rescan-interval', '3']
+               ['peernode.py', master_addr, sync_dir, '--port', str(port), '--rescan-interval', '3']
         proc = mp.Process(target=sync_proc, name='sync-worker', args=(conn_send, is_master, argv))
         threading.Thread(target=comm_thread, args=(conn_recv,)).start()
         proc.start()

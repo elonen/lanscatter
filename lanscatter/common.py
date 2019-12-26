@@ -33,10 +33,11 @@ def parse_cli_args(is_master: bool):
             raise argparse.ArgumentTypeError("Server address must be in format <address>[:<port>]. Was: '%s'" % value)
         return value
 
-    parser.add_argument('dir', help='Sync directory')
     if not is_master:
         parser.add_argument('server', type=check_server_str,
                             help=f"Master's address[:port]. E.g. 'my-server:{Defaults.TCP_PORT_MASTER}'")
+    parser.add_argument('dir', help='Sync directory')
+    if not is_master:
         parser.add_argument('--dl-rate', dest='dl_limit', type=float,
                             default=Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC, help='Rate limit downloads, Mb/s')
     parser.add_argument('--ul-rate', dest='ul_limit', type=float,

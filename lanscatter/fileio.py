@@ -202,7 +202,7 @@ class FileIO:
                             csum.update_async(buff_out))
 
                     while buff_out is not None:
-                        await asyncio.gather(read_http(), write_and_csum())  # Read and write concurrently
+                        await asyncio.gather(read_http(), write_and_csum())  # Read, write and hash concurrently
                         buff_in, buff_out = buff_out, buff_in  # Swap buffers
 
                     if csum.result() != chunk.hash:

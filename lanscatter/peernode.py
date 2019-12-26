@@ -5,6 +5,7 @@ from pathlib import Path
 from contextlib import suppress
 import traceback, time, argparse, os, collections, json, platform
 from signal import SIGINT, SIGTERM
+import concurrent.futures
 
 from .chunker import SyncBatch, scan_dir
 from .common import make_human_cli_status_func, json_status_func, Defaults, parse_cli_args
@@ -185,9 +186,10 @@ class PeerNode:
             self.status_func(log_info=f'Downloading from: {url}')
             self.status_func(cur_status=f'Downloading chunks...',
                              progress=len(self.local_batch.all_hashes()) / len(self.remote_batch.all_hashes()))
-            await asyncio.wait_for(self.file_io.download_chunk(
-                chunk=target, url=url, http_session=http_session,
-                file_size=self.remote_batch.files[target.path].size), timeout=timeout)
+            await asyncio.wait([self.file_io.download_chunk(chunk=target, url=url, http_session=http_session,
+                                                            file_size=self.remote_batch.files[target.path].size),
+                                self.exit_trigger.wait(),
+                                ], timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
 
             self.local_batch.add(chunks=(target,))
             await self.server_send_queue.put({
@@ -201,10 +203,12 @@ class PeerNode:
 
         except asyncio.TimeoutError:
             self.status_func(log_info=f'Download from {url} took over timeout ({timeout}s). Aborted.')
-        except IOError as e:
+        except (IOError, OSError) as e:
             self.status_func(log_error=f'Download from {url} failed: {str(e)}')
         except aiohttp.client_exceptions.ClientError as e:
             self.status_func(log_error=f'Download from {url} failed, aiohttp ClientError: {str(e)}')
+        except (KeyboardInterrupt, concurrent.futures.CancelledError) as e:
+            pass
         except Exception as e:
             self.status_func(log_error=f'Exception in download_task: \n' + traceback.format_exc(), popup=True)
             raise e
@@ -228,7 +232,7 @@ class PeerNode:
                 chunk_hash, url, timeout = msg.get('hash'), msg.get('url'), msg.get('timeout')
                 if None in (chunk_hash, url, timeout):
                     return await error('Bad download command from server')
-                asyncio.create_task(self.download_task(chunk_hash, url, http_session, timeout))
+                await asyncio.create_task(self.download_task(chunk_hash, url, http_session, timeout))
 
             elif action == 'rehash':
                 self.status_func(log_info=f'Server requested rescan: "{msg.get("message")}"')
@@ -258,6 +262,8 @@ class PeerNode:
             else:
                 return await error(f"Unknown action '{str(action)}'")
 
+        except (KeyboardInterrupt, concurrent.futures.CancelledError) as e:
+            pass
         except Exception as e:
             #await error('Exception raised: ' + str(e))
             self.status_func(log_error=f'Error while handling server message "{str(msg)}": \n' +
@@ -283,7 +289,7 @@ class PeerNode:
                                         await ws.send_json(msg)
                             self.status_func(log_info=f'Websocket message sender terminating.')
 
-                        send_task = asyncio.create_task(send_loop())
+                        asyncio.create_task(send_loop())
 
                         # Read messages from websocket and handle them
                         async for msg in ws:
@@ -293,13 +299,15 @@ class PeerNode:
                                 try:
                                     await self.process_server_msg(msg.json(), session)
                                 except Exception as e:
-                                    await self.server_send_queue.put({
-                                        'command': 'error', 'orig_msg': msg.data, 'message': 'Exception: ' + str(e)})
                                     self.status_func(log_error=f'Error ("{str(e)}") handling server msg: {msg.data}'
                                                                 'traceback: ' + traceback.format_exc())
+                                    await self.server_send_queue.put({
+                                        'command': 'error', 'orig_msg': msg.data, 'message': 'Exception: ' + str(e)})
+                                finally:
+                                    if self.exit_trigger.is_set():
+                                        await ws.close()
 
                         self.status_func(log_info=f'Connection to master closed.')
-                        send_task.cancel()
 
             except aiohttp.client_exceptions.WSServerHandshakeError:
                 self.status_func(log_error=f'Websock handshake to {server_url} failed. Bad URL? Aborting.', popup=True)
@@ -342,9 +350,11 @@ class PeerNode:
                     self.full_rescan_trigger.clear()
 
                     self.status_func(log_debug='Rescanning local files.')
-                    new_local_batch = await scan_dir(
+                    new_local_batch, errors = await scan_dir(
                         str(self.file_io.basedir), chunk_size=self.remote_batch.chunk_size,
                         old_batch=self.local_batch, progress_func=__hash_dir_progress_func)
+                    for i,e in enumerate(errors):
+                        self.status_func(log_error=f'- Dir scan error #{i}: {e}')
                     self.status_func(log_debug='Rescan finished.')
 
                     different_from_remote = self.remote_batch != new_local_batch
@@ -374,9 +384,12 @@ class PeerNode:
 
 
     async def run(self, port: int, server_url: str, concurrent_transfer_limit: int):
-        """
-        Run all async loops.
-        """
+        """Run all async loops."""
+
+        # Mute asyncio task exceptions on KeyboardInterrupt / thread CancelledError
+        loop = asyncio.get_event_loop()
+        loop.set_exception_handler(lambda l, c: loop.default_exception_handler(c) if not self.exit_trigger.is_set() else None)
+
         def sig_exit():
             self.exit_trigger.set()
         try:
@@ -393,9 +406,11 @@ class PeerNode:
                 self.exit_trigger.wait()
             ], return_when=asyncio.FIRST_COMPLETED)
 
-        except Exception as e:
+        except (KeyboardInterrupt, concurrent.futures.CancelledError):
+            self.status_func(log_info='User exit.')
+            self.exit_trigger.set()
+        except Exception:
             self.status_func(log_error='PeerNode error:\n' + traceback.format_exc(), popup=True)
-
 
 # --------------------------------------------------------------------------------------------------------
 

@@ -1,7 +1,8 @@
 from aiohttp import web, WSMsgType
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Awaitable
 import asyncio, traceback, html
+import concurrent.futures
 from types import SimpleNamespace
 from contextlib import suppress
 from datetime import datetime
@@ -54,9 +55,9 @@ class MasterNode:
             self.status_func(log_info='No changes in sync dir.')
 
 
-    def server_loop(self, base_dir: str, port: int,
-                    ul_limit: float, concurrent_uploads: int,
-                    https_cert: Optional[str], https_key: Optional[str]):
+    def start_master_server(self, base_dir: str, port: int,
+                            ul_limit: float, concurrent_uploads: int,
+                            https_cert: Optional[str], https_key: Optional[str]) -> Awaitable:
 
         if not Path(base_dir).is_dir():
             raise NotADirectoryError(f'Path "{base_dir}" is not a directory. Cannot serve from it.')
@@ -183,7 +184,8 @@ class MasterNode:
                   f"<h1>Swarm status</h1><p>{str(datetime.now().isoformat(' ', 'seconds'))}</p>"
 
             if st['all_hashes']:
-                res += '<table><tr>' + th.format(txt='Node', colspan=1) + th.format(txt='Hashes', colspan=len(st["all_hashes"])) +\
+                res += '<table style="white-space:nowrap;"><tr>' + th.format(txt='Node', colspan=1) + \
+                       th.format(txt='Hashes', colspan=len(st["all_hashes"])) +\
                        th.format(txt='↓', colspan=1) + th.format(txt='↑', colspan=1) +\
                        th.format(txt='⧖', colspan=1) + '</tr>\n'
                 for n in st['nodes']:
@@ -311,6 +313,10 @@ async def run_master_server(base_dir: str,
                             chunk_size=Defaults.CHUNK_SIZE,
                             https_cert=None, https_key=None):
 
+    # Mute asyncio task exceptions on KeyboardInterrupt / thread CancelledError
+    kb_exit, loop = False, asyncio.get_event_loop()
+    loop.set_exception_handler(lambda l, c: loop.default_exception_handler(c) if not kb_exit else None)
+
     server = MasterNode(status_func=status_func, chunk_size=chunk_size)
 
     async def dir_scanner_loop():
@@ -320,18 +326,30 @@ async def run_master_server(base_dir: str,
                         cur_status=f'Hashing "{cur_filename}" ({int(file_progress * 100 + 0.5)}% done)')
         while True:
             # TODO: integrate with inotify (watchdog package) to avoid frequent rescans
-            new_batch = await scan_dir(base_dir, chunk_size=chunk_size, old_batch=server.file_server.batch,
+            new_batch, errors = await scan_dir(base_dir, chunk_size=chunk_size, old_batch=server.file_server.batch,
                                        progress_func=progress_func_adapter)
+            for i, e in enumerate(errors):
+                self.status_func(log_error=f'- Dir scan error #{i}: {e}')
             if new_batch != server.file_server.batch:
                 status_func(cur_status=f'New file batch. Serving as master.')
                 await server.replace_sync_batch(new_batch)
             await asyncio.sleep(dir_scan_interval)
 
-    await asyncio.gather(
-        dir_scanner_loop(),
-        server.planner_loop(),
-        server.server_loop(base_dir=base_dir, port=port, ul_limit=ul_limit, concurrent_uploads=concurrent_uploads,
-                           https_cert=https_cert, https_key=https_key))
+    try:
+        await server.start_master_server(
+            base_dir=base_dir, port=port, ul_limit=ul_limit,
+            concurrent_uploads=concurrent_uploads, https_cert=https_cert, https_key=https_key)
+        await asyncio.wait([
+            dir_scanner_loop(),
+            server.planner_loop(),
+        ], return_when=asyncio.FIRST_COMPLETED)
+        print(".")
+
+    except (KeyboardInterrupt, concurrent.futures.CancelledError):
+        status_func(log_info='User exit.')
+        kb_exit = True
+    except Exception as e:
+        status_func(log_error='MasterNode error:\n' + traceback.format_exc(), popup=True)
 
 
 def main():

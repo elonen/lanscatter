@@ -21,6 +21,7 @@ SETTINGS_DEFAULTS = {
 
     'sync_dir': ('C:\\' if any(platform.win32_ver()) else '~/') + 'lanscatter-sync-dir',
     'concurrent_transfers': common.Defaults.CONCURRENT_TRANSFERS_PEER,
+    'download_bandwidth': common.Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC,
     'upload_bandwidth': common.Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC,
     'rescan_interval': common.Defaults.DIR_SCAN_INTERVAL_PEER,
 
@@ -130,7 +131,7 @@ class SettingsDlg(wx.Dialog):
 
         adv_box = wx.StaticBox(panel, label="Advanced")
         adv_sizer = wx.StaticBoxSizer(adv_box, wx.VERTICAL)
-        gs = wx.GridSizer(4, 2, wx.SizerFlags().GetDefaultBorder(), wx.SizerFlags().GetDefaultBorder())
+        gs = wx.GridSizer(5, 2, wx.SizerFlags().GetDefaultBorder(), wx.SizerFlags().GetDefaultBorder())
         adv_sizer.Add(gs, st_basic)
         vbox.Add(adv_sizer, st_expand)
         if True:
@@ -140,7 +141,11 @@ class SettingsDlg(wx.Dialog):
                 panel, value='2', min=1, max=1000, initial=common.Defaults.CONCURRENT_TRANSFERS_PEER)
             gs.Add(self.concurrent_transfers, st_basic)
 
-            # Max concurrent transfers
+            gs.Add(wx.StaticText(panel, label='Download rate (Mbit/s)'), st_basic)
+            self.download_bandwidth = wx.SpinCtrl(
+                panel, value='1000', min=1, max=100000, initial=common.Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC)
+            gs.Add(self.download_bandwidth, st_basic)
+
             gs.Add(wx.StaticText(panel, label='Upload rate (Mbit/s)'), st_basic)
             self.upload_bandwidth = wx.SpinCtrl(
                 panel, value='1000', min=1, max=100000, initial=common.Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC)
@@ -391,6 +396,7 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
                     sync_dir=self.settings['sync_dir'],
                     port=self.settings['local_master_port'] if is_master else self.settings['local_peer_port'],
                     master_addr='%s:%s' % (self.settings['remote_address'], self.settings['remote_port']),
+                    dl_rate=self.settings['download_bandwidth'],
                     ul_rate=self.settings['upload_bandwidth'],
                     concurrent_transfers=self.settings['concurrent_transfers'],
                     rescan_interval=self.settings['rescan_interval'])
@@ -458,7 +464,7 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
         self.icon_idx = 0
 
     def spawn_sync_process(self, is_master: bool, sync_dir: str, port: int, master_addr: str,
-                           concurrent_transfers: int, ul_rate: int, rescan_interval: int):
+                           concurrent_transfers: int, dl_rate: int, ul_rate: int, rescan_interval: int):
         """
         Start a sync client or server in separate process, forwarding stdout to given inter-process queue.
         """
@@ -482,8 +488,10 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
                 wx.CallAfter(self.on_syncer_exit, res[0], res[1])
 
         conn_recv, conn_send = multiprocessing.Pipe(duplex=False)  # Multi-CPU safe conn_send -> conn_recv pipe
-        argv = ['masternode', sync_dir] if is_master else ['peernode', sync_dir, master_addr]
+        argv = ['masternode', sync_dir] if is_master else ['peernode', master_addr, sync_dir]
         argv.extend(['--port', str(port), '--concurrent-transfers', str(concurrent_transfers), '--json'])
+        if not is_master:
+            argv.extend(['--dl-rate', str(dl_rate)])
         argv.extend(['--ul-rate', str(ul_rate), '--rescan-interval', str(rescan_interval)])
         cmdline = ' '.join(argv)
         self.write_log(f'\n------- Spawning "{cmdline}" -------\n\n')
