@@ -17,9 +17,20 @@ with pip:
 ```
 python3.7 -m venv venv
 source venv/bin/activate    # Windows: CALL venv\Scripts\activate
-pip install --editable git+ssh://git@github.com/elonen/lanscatter.git#egg=lanscatter
+pip install --editable git://github.com/elonen/lanscatter.git#egg=lanscatter
 ```
 
+...or if you wish to develop:
+
+```
+git clone git+ssh://git@github.com/elonen/lanscatter.git
+cd lanscatter
+python3.7 -m venv venv
+source venv/bin/activate
+python setup.py develop
+```
+
+Either way, you can now type `lanscatter_master`, `lanscatter_peer` or `lanscatter_gui` on the command line.
 
 ## Usage
 
