@@ -3,9 +3,9 @@ pyinstaller_setuptools
 
 aiohttp
 aiofiles
-
 wxPython
 appdirs
+packaging
 
 pytest
 pytest-timeout

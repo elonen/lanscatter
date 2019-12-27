@@ -1,8 +1,10 @@
 from aiohttp import web, WSMsgType
 from pathlib import Path
 from typing import Callable, Optional, Awaitable
+from json.decoder import JSONDecodeError
 import asyncio, traceback, html
 import concurrent.futures
+import packaging.version
 from types import SimpleNamespace
 from contextlib import suppress
 from datetime import datetime
@@ -77,20 +79,39 @@ class MasterNode:
             client_name = (node.name if node else address)
             self.status_func(log_debug=f'[{address}] Msg from {client_name}: {str(msg)}')
 
-            async def error(txt):
-                self.status_func(log_error=f'[{address}] Sending error to {client_name}: {txt}')
-                await send_queue.put({'action': 'error', 'orig_msg': msg, 'message': txt})
+            async def error(txt, fatal=False):
+                self.status_func(log_error=('FATAL - ' if fatal else '') +
+                                           f'[{address}] Sending error to {client_name}: {txt}')
+                await send_queue.put({'action': 'fatal' if fatal else 'error', 'orig_msg': msg, 'message': txt})
 
             async def ok(txt):
                 await send_queue.put({'action': 'ok', 'message': txt})
 
             try:
                 action = msg.get('action')
+                if not action:
+                    return await error(f"Messages must have 'action'. Bad protocol. Goodbye.", fatal=True)
+
+                # ---------------------------------------------------
+                # Initial version check
+                # ---------------------------------------------------
+                if action == 'version':
+                    here = packaging.version.parse(Defaults.PROTOCOL_VERSION)
+                    try:
+                        there = packaging.version.parse(msg.get('protocol') or 'MISSING')
+                        if there.release[0] != here.release[0]:
+                            await send_queue.put({'action': 'fatal', 'message':
+                                                  f'Incompatible protocol. Server has {Defaults.PROTOCOL_VERSION}, '
+                                                  f'yours is {msg.get("protocol")}'})
+                    except InvalidVersion:
+                        return await error(f'Invalid protocol version {str(msg.get("protocol"))}.', fatal=True)
+                    self.status_func(log_info=f'Client "{client_name}" uses protocol version {msg.get("protocol")}, '+
+                                              f'app version {msg.get("app") or "MISSING"}')
 
                 # ---------------------------------------------------
                 # Client is ready to sync
                 # ---------------------------------------------------
-                if action == 'join_swarm':
+                elif action == 'join_swarm':
                     dl_slots = msg.get('concurrent_transfers') or 2
 
                     initial_hashes = msg.get('hashes')
@@ -124,7 +145,7 @@ class MasterNode:
                 # ---------------------------------------------------
                 # Client's got (new) chunks
                 # ---------------------------------------------------
-                if action == 'set_hashes' or action == 'add_hashes':
+                elif action == 'set_hashes' or action == 'add_hashes':
                     if not isinstance(msg.get('hashes'), list):
                         return await error("Must have list in arg 'hashes'")
                     if not node:
@@ -165,7 +186,7 @@ class MasterNode:
                 elif action == 'error':
                     self.status_func(log_info=f'Error msg from client ({client_name}): {str(msg)}')
                 else:
-                    return await error(f"Unknown action '{str(action)}'")
+                    return await error(f"Unknown action '{str(action)}'. Bad protocol. Goodbye.", fatal=True)
 
             except Exception as e:
                 await error('Exception raised: '+str(e))
@@ -218,6 +239,11 @@ class MasterNode:
                         msg = await asyncio.wait_for(send_queue.get(), timeout=1)
                         if msg and not ws.closed:
                             await ws.send_json(msg)
+                        if msg and msg.get('action') == 'fatal':
+                            self.status_func(log_info=f'Sent fatal error to client. Kicking them out: {str(msg)}"')
+                            await ws.close()
+                            break
+
             send_task = asyncio.create_task(send_loop())
 
             async def welcome():
@@ -245,10 +271,12 @@ class MasterNode:
                             else:
                                 await send_queue.put(
                                     {'action': 'ok', 'message': "Hold on. Master is still doing initial file scan."})
+                        except JSONDecodeError:
+                            await send_queue.put({'action': 'fatal', 'message': 'Protocol error. Bad JSON. Goodbye.'})
                         except Exception as e:
                             self.status_func(log_error=f'Error ("{str(e)}") handling client msg: {msg.data}'
                                               'traceback: ' + traceback.format_exc())
-                            await send_queue.put({'command': 'error', 'orig_msg': msg.data,
+                            await send_queue.put({'action': 'error', 'orig_msg': msg.data,
                                                   'message': 'Exception: ' + str(e)})
                     elif msg.type == WSMsgType.ERROR:
                         self.status_func(log_error=f'Connection for client "{node.name if node else address}" '
@@ -330,7 +358,7 @@ async def run_master_server(base_dir: str,
             new_batch, errors = await scan_dir(base_dir, chunk_size=chunk_size, old_batch=server.file_server.batch,
                                        progress_func=progress_func_adapter)
             for i, e in enumerate(errors):
-                self.status_func(log_error=f'- Dir scan error #{i}: {e}')
+                status_func(log_error=f'- Dir scan error #{i}: {e}')
             if new_batch != server.file_server.batch:
                 status_func(cur_status=f'New file batch. Serving as master.')
                 await server.replace_sync_batch(new_batch)
@@ -344,7 +372,6 @@ async def run_master_server(base_dir: str,
             dir_scanner_loop(),
             server.planner_loop(),
         ], return_when=asyncio.FIRST_COMPLETED)
-        print(".")
 
     except (KeyboardInterrupt, concurrent.futures.CancelledError):
         status_func(log_info='User exit.')

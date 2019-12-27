@@ -3,6 +3,7 @@ import asyncio, aiohttp
 from aiohttp import web, WSMsgType
 from pathlib import Path
 from contextlib import suppress
+from packaging import version
 import traceback, time, argparse, os, collections, json, platform
 from signal import SIGINT, SIGTERM
 import concurrent.futures
@@ -232,7 +233,7 @@ class PeerNode:
                 chunk_hash, url, timeout = msg.get('hash'), msg.get('url'), msg.get('timeout')
                 if None in (chunk_hash, url, timeout):
                     return await error('Bad download command from server')
-                await asyncio.create_task(self.download_task(chunk_hash, url, http_session, timeout))
+                asyncio.create_task(self.download_task(chunk_hash, url, http_session, timeout))
 
             elif action == 'rehash':
                 self.status_func(log_info=f'Server requested rescan: "{msg.get("message")}"')
@@ -257,6 +258,10 @@ class PeerNode:
 
             elif action == 'error':
                 self.status_func(log_error='Error from server:' + str(json.dumps(msg, indent=2)))
+            elif action == 'fatal':
+                self.status_func(log_error='FATAL error from server:' + str(json.dumps(msg, indent=2)), popup=True)
+                self.status_func(log_info='Exiting because of fatal error.')
+                self.exit_trigger.set()
             elif action == 'ok':
                 self.status_func(log_debug='OK from server:' + str(json.dumps(msg)))
             else:
@@ -291,8 +296,15 @@ class PeerNode:
 
                         asyncio.create_task(send_loop())
 
+                        await self.server_send_queue.put({'action': 'version',
+                                                          'protocol': Defaults.PROTOCOL_VERSION,
+                                                          'app': Defaults.APP_VERSION})
+
                         # Read messages from websocket and handle them
                         async for msg in ws:
+                            if self.exit_trigger.is_set():
+                                await ws.close()
+                                break
                             if msg.type == WSMsgType.ERROR:
                                 self.status_func(log_error=f'Connection to master closed with error: %s' % ws.exception())
                             elif msg.type == WSMsgType.TEXT:
@@ -302,10 +314,7 @@ class PeerNode:
                                     self.status_func(log_error=f'Error ("{str(e)}") handling server msg: {msg.data}'
                                                                 'traceback: ' + traceback.format_exc())
                                     await self.server_send_queue.put({
-                                        'command': 'error', 'orig_msg': msg.data, 'message': 'Exception: ' + str(e)})
-                                finally:
-                                    if self.exit_trigger.is_set():
-                                        await ws.close()
+                                        'action': 'error', 'orig_msg': msg.data, 'message': 'Exception: ' + str(e)})
 
                         self.status_func(log_info=f'Connection to master closed.')
 

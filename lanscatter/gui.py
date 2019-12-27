@@ -24,6 +24,7 @@ SETTINGS_DEFAULTS = {
     'download_bandwidth': common.Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC,
     'upload_bandwidth': common.Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC,
     'rescan_interval': common.Defaults.DIR_SCAN_INTERVAL_PEER,
+    'chunk_size_mb': common.Defaults.CHUNK_SIZE/1024/1024,
 
     'is_master': False,
     'autostart': False
@@ -129,6 +130,10 @@ class SettingsDlg(wx.Dialog):
                 self.local_master_port = wx.SpinCtrl(panel, value='1', min=1, max=65535, initial=common.Defaults.TCP_PORT_MASTER)
                 hb.Add(self.local_master_port, st_basic)
 
+                hb.Add(wx.StaticText(panel, label='Chunk size (MB)'), st_basic)
+                self.chunk_size_mb = wx.SpinCtrl(panel, value='128', min=1, max=65535, initial=common.Defaults.CHUNK_SIZE/1024/1024)
+                hb.Add(self.chunk_size_mb, st_basic)
+
         adv_box = wx.StaticBox(panel, label="Advanced")
         adv_sizer = wx.StaticBoxSizer(adv_box, wx.VERTICAL)
         gs = wx.GridSizer(5, 2, wx.SizerFlags().GetDefaultBorder(), wx.SizerFlags().GetDefaultBorder())
@@ -196,6 +201,7 @@ class SettingsDlg(wx.Dialog):
         self.remote_port.Enable(self.is_slave.GetValue())
         self.local_peer_port.Enable(self.is_slave.GetValue())
         self.local_master_port.Enable(not self.is_slave.GetValue())
+        self.chunk_size_mb.Enable(not self.is_slave.GetValue())
 
     def get_settings(self):
         res = SETTINGS_DEFAULTS.copy()
@@ -348,6 +354,7 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
         quitm = wx.MenuItem(menu, wx.ID_EXIT, 'Quit')
         menu.Bind(wx.EVT_MENU, self.on_menu_quit, id=quitm.GetId())
         menu.Append(quitm)
+
         self.menu = menu
         return menu
 
@@ -359,7 +366,8 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
 
     # "Settings" menu item selected
     def on_menu_settings(self, event):
-        ex = SettingsDlg(None, title='Settings', settings=self.settings)
+        ver = f'{common.Defaults.APP_NAME} {common.Defaults.APP_VERSION}'
+        ex = SettingsDlg(None, title='Settings - '+ver, settings=self.settings)
         if ex.ShowModal() == wx.ID_OK:
             self.settings = ex.get_settings()
             # Save config file
@@ -398,6 +406,7 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
                     master_addr='%s:%s' % (self.settings['remote_address'], self.settings['remote_port']),
                     dl_rate=self.settings['download_bandwidth'],
                     ul_rate=self.settings['upload_bandwidth'],
+                    chunk_size=self.settings['chunk_size_mb']*1024*1024,
                     concurrent_transfers=self.settings['concurrent_transfers'],
                     rescan_interval=self.settings['rescan_interval'])
                 self.SetIcon(self.icons[0])
@@ -463,7 +472,7 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
         self.SetIcon(self.icon_inactive)
         self.icon_idx = 0
 
-    def spawn_sync_process(self, is_master: bool, sync_dir: str, port: int, master_addr: str,
+    def spawn_sync_process(self, is_master: bool, sync_dir: str, port: int, master_addr: str, chunk_size: int,
                            concurrent_transfers: int, dl_rate: int, ul_rate: int, rescan_interval: int):
         """
         Start a sync client or server in separate process, forwarding stdout to given inter-process queue.
@@ -490,7 +499,9 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
         conn_recv, conn_send = multiprocessing.Pipe(duplex=False)  # Multi-CPU safe conn_send -> conn_recv pipe
         argv = ['masternode', sync_dir] if is_master else ['peernode', master_addr, sync_dir]
         argv.extend(['--port', str(port), '--concurrent-transfers', str(concurrent_transfers), '--json'])
-        if not is_master:
+        if is_master:
+            argv.extend(['--chunksize', str(chunk_size)])
+        else:
             argv.extend(['--dl-rate', str(dl_rate)])
         argv.extend(['--ul-rate', str(ul_rate), '--rescan-interval', str(rescan_interval)])
         cmdline = ' '.join(argv)

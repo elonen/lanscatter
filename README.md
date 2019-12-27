@@ -23,7 +23,7 @@ pip install --editable git+ssh://git@github.com/elonen/lanscatter.git#egg=lansca
 
 ## Usage
 
-User who has files to distribute runs **master node** (CLI or GUI program), and leechers run **peer nodes** that connect to it (with user-provided websocket URL):
+User who has files to distribute runs **master node** (CLI or GUI program), and leechers run **peer nodes** that connect to it:
 
 1. Start master:
 
@@ -43,7 +43,7 @@ User who has files to distribute runs **master node** (CLI or GUI program), and 
 
 3. Wait. LANScatter is designed for distributing folders with dozens+ gigabytes of files, so hashing (calculating checksums) and transferring them will take a while.
 
-4. **[Optional]** Point a web browser to `http://server:10564/` to monitor the swarm.
+4. Optionally, point a web browser to `http://my-server:10564/` to monitor the swarm.
 
 
 Master splits sync folder contents into _chunks_, calculates checksums, transfers them to different peers, and organizes peers to download chunks from each other optimally.
@@ -63,14 +63,14 @@ Features and notable differences to Btsync/Resilio, Syncthing and Dropbox-like s
 * Designed for _few simultaneous transfers_. This avoids unnecessary coordination traffic and overhead, assuming a reliable and fast LAN environment.
 * Keeps traffic inside the LAN (doesn't connect to any third party servers).
 * Resilient against slow individual nodes. Transfers from slow peers are detected, aborted and avoided afterwards.
-* Does _not_ preserve Unix file attributes for now, as Windows doesn't support them.
+* Does _not_ preserve Unix file attributes (for now), as Windows doesn't support them.
 * Supports bandwidth limiting.
 
 ## Technologies
 
 Lanscatter is built on _Python 3.7_ using asyncio (aiohttp & aiofiles),
-_wxPython_ for cross-platform GUI, _Blake2b_ for hash/checksum algorithm, _pytest_ for unit/integration tests
-and _pyinstaller_ for packaging/freezing into exe files.
+_wxPython_ for cross-platform GUI, _Blake2b_ algorithm for chunk hashing, _pytest_ for unit / integration tests
+and _pyinstaller_ for packaging / freezing into exe files.
 
 ## Architecture
 
@@ -98,7 +98,7 @@ The `tests` folder contains integration and unit tests using the _pytest_ framew
 
 Integration test – in short – runs a master node and several peer node simultaneously, with random sync dir contents, and makes sure they get in sync without errors.
 
-Planner is (unit)tested in isolation to make sure it terminates in a fully synced-up state. It simulates joins, drop-outs and slow peers,  with an output that looks like this:
+Planner is (unit)tested in isolation to make sure it terminates in a fully synced-up state. It simulates joins, drop-outs and slow peers, with an output that looks like this:
 
 ```
 N00 ######################################################################## 0 4   0.3
@@ -147,6 +147,8 @@ Slow download. Giving up. (from N04)
 Left column is a list of node names.
 Table with hash characters and dots show which chunks each node has.
 Numbers on the right show current downloads, current uploads and average time it takes to upload one chunk from each node.
+
+See `planner.plan_transfers()` for details on how planning algorithm works.
 
 ## License
 

@@ -24,7 +24,7 @@ efficiency compared to ideal, error-free
 multicast to all nodes.
 """
 
-ChunkId = str
+ChunkId = str  # type alias
 
 # Abstract base class for a p2p swarm node, used by the coordinator
 class Node(ABC):
@@ -167,7 +167,8 @@ class SwarmCoordinator(object):
                                   key=lambda n: len(n.hashes))
         free_uploaders = sorted((n for n in self.nodes if n.active_uploads < n.max_concurrent_uls),
                                 key=lambda n: len(n.hashes) * (n.avg_ul_time or 999))  # favor fast uploaders
-        if not free_uploaders or not free_downloaders: return ()
+        if not free_uploaders or not free_downloaders:
+            return ()
 
         # Timeout P2P downloads quickly at first, then use actual statistics as we get
         ul_times = [float(n.avg_ul_time or 0) for n in self.nodes if n.avg_ul_time]
@@ -192,8 +193,8 @@ class SwarmCoordinator(object):
                             proposed_transfers.append(t)
                             # To prevent overbooking and to help picking different hashes, assume transfer will succeed
                             self.hash_popularity[h] += 1
-                            # These are replareplaced later by client's own report of actual transfers
-                            # (on_node_report_transfers()) but we'll assume the transfers start ok (to aid planning):
+                            # These are replaced later by client's own report of actual transfers
+                            # (on_node_report_transfers()) but we'll assume the transfers start ok, to aid planning:
                             assert(h not in dl.incoming)
                             dl.incoming.add(h)
                             dl.active_downloads += 1
@@ -219,7 +220,8 @@ class SwarmCoordinator(object):
 
 
 # --------------------------------------------------------------------------------------------------------------------
-
+# << End of production code. The rest is for testing:
+# --------------------------------------------------------------------------------------------------------------------
 
 def simulate() -> None:
     """

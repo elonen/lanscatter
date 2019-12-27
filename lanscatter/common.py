@@ -21,9 +21,14 @@ class Defaults:
     CONCURRENT_TRANSFERS_PEER = 2
     DIR_SCAN_INTERVAL_PEER = 60
 
+    APP_VERSION = '0.1.0'
+    PROTOCOL_VERSION = '1.0.0'
+
 
 def parse_cli_args(is_master: bool):
-    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    desc = f"LANScatter {'master' if is_master else 'peer'} -- " \
+        f"app version {Defaults.APP_VERSION}, protocol version {Defaults.PROTOCOL_VERSION}"
+    parser = argparse.ArgumentParser(description=desc, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     def check_server_str(value):
         s = str(value).split(':')
