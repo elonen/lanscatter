@@ -184,7 +184,7 @@ class FileIO:
                 raise IOError(f'Unknown/unsupported HTTP status: {resp.status}')
             else:
                 async with self.open_and_seek(chunk.path, chunk.pos, for_write=True) as outf:
-                    csum = HashFunc()
+                    #csum = HashFunc()
                     buff_in, buff_out = None, b''
 
                     async def read_http():
@@ -197,16 +197,16 @@ class FileIO:
 
                     async def write_and_csum():
                         nonlocal buff_out
-                        await asyncio.gather(
-                            outf.write(buff_out),
-                            csum.update_async(buff_out))
+                        #await asyncio.gather(outf.write(buff_out), csum.update_async(buff_out))
+                        await outf.write(buff_out)
 
                     while buff_out is not None:
                         await asyncio.gather(read_http(), write_and_csum())  # Read, write and hash concurrently
                         buff_in, buff_out = buff_out, buff_in  # Swap buffers
 
-                    if csum.result() != chunk.hash:
-                        raise IOError(f'Checksum error verifying {chunk.hash} from {url}')
+                    # Checksumming here is actually waste of CPU time since we'll rehash the sync dir when finished
+                    #if csum.result() != chunk.hash:
+                    #    raise IOError(f'Checksum error verifying {chunk.hash} from {url}')
 
                     if file_size >= 0:
                         outf.truncate(file_size)

@@ -176,6 +176,7 @@ class MasterNode:
             """
             Show a HTML formatted status report.
             """
+            # TODO: cache this for a second or few to reduce load with multiple users
             self.status_func(log_debug=f"[{request.remote}] GET {request.path_qs}")
             colors = {1: 'black', 0.5: 'green', 0: 'lightgray'}
             st = self.swarm.get_status_table()

@@ -11,21 +11,23 @@ LANScatter is a P2P assisted, server-driven one-way folder synchronizer, designe
 
 ## Installing
 
+Download a [binary release](https://github.com/elonen/lanscatter/releases) (especially GUI for Windows) or install
+with pip:
+
 ```
 python3.7 -m venv venv
 source venv/bin/activate    # Windows: CALL venv\Scripts\activate
 pip install --editable git+ssh://git@github.com/elonen/lanscatter.git#egg=lanscatter
 ```
 
-...or download a [binary release](https://github.com/elonen/lanscatter/releases) (especially Gui for Windows)
 
-## Operation
+## Usage
 
 User who has files to distribute runs **master node** (CLI or GUI program), and leechers run **peer nodes** that connect to it (with user-provided websocket URL):
 
 1. Start master:
 
-   `my.server:~$ lanscatter_master ./from-dir`
+   `my-server:~$ lanscatter_master ./from-dir`
 
 2. Start peers:
 
@@ -52,16 +54,16 @@ According to simulations (see _Testing_ below) this should yield 50% – 90% dis
 
 ## Features
 
-Notable features and differences to Bittorrent-based solutions like
-Btsync/Resilio, and Dropbox-like software:
+Features and notable differences to Btsync/Resilio, Syncthing and Dropbox-like software:
 
 * It's a _one way synchronizer_ for distributing large folders 1-to-N, not a generic two-way syncer.
 * Keeps only a _single copy of each file_ to save space – no `.sync` dirs with duplicate files
 * Centralized coordination, distributed transfers.  Few TCP connections, no broadcasts. (Peers connect to a master via websocket, and it instructs them to make HTTP downloads from each other or the master).
-* Designed for _big chunk sizes_ to minimize coordination overhead. (Configurable, e.g. for deduplication if data is highly redudant.)
+* Designed for _big chunk sizes_ to minimize coordination overhead. (Configurable, e.g. for deduplication if data is highly redundant.)
 * Designed for _few simultaneous transfers_. This avoids unnecessary coordination traffic and overhead, assuming a reliable and fast LAN environment.
 * Keeps traffic inside the LAN (doesn't connect to any third party servers).
-* Resilient against slow individual nodes. Transfers from slow peers detected, aborted and avoided after that.
+* Resilient against slow individual nodes. Transfers from slow peers are detected, aborted and avoided afterwards.
+* Does _not_ preserve Unix file attributes for now, as Windows doesn't support them.
 * Supports bandwidth limiting.
 
 ## Technologies
