@@ -138,8 +138,7 @@ class SyncBatch:
         for path in paths:
             self.files.pop(path, None)
         self.chunks = set((c for c in self.chunks if c.path not in paths))
-        chunks = tuple(chunks)
-        for c in chunks:
+        for c in tuple(chunks):
             self.chunks.discard(c)
             if c.path in self.files:
                 self.files[c.path].treehash = None

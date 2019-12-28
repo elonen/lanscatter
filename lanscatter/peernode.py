@@ -138,7 +138,9 @@ class PeerNode:
                             await self.file_io.change_mtime(here.path, there.mtime)
                             here.mtime = there.mtime
                         else:
-                            self.status_func(log_error=f'LOCAL: Hash collision or bug?? Here: {str(here)}, there: {str(there)}')
+                            self.status_func(log_error=f'LOCAL: Treehash matches but size differs. Forgetting file. Here: {str(here)}, there: {str(there)}')
+                            self.local_batch.discard(paths=[f.path])
+
                     elif here.mtime == there.mtime:
                         self.status_func(log_info=f'LOCAL: File "{here.path}" is has wrong content but was'
                                                   f' set to target time. Resetting it to "now".')
@@ -287,10 +289,12 @@ class PeerNode:
                         # Read send_queue and pass them to websocket
                         async def send_loop():
                             self.status_func(log_info=f'Websocket message sender starting.')
-                            while not ws.closed:
+                            while not (ws.closed or self.exit_trigger.is_set()):
                                 with suppress(asyncio.TimeoutError):
                                     msg = await asyncio.wait_for(self.server_send_queue.get(), timeout=1)
-                                    if msg and not ws.closed:
+                                    if self.exit_trigger.is_set():
+                                        await ws.close()
+                                    elif msg:
                                         await ws.send_json(msg)
                             self.status_func(log_info=f'Websocket message sender terminating.')
 
@@ -302,20 +306,20 @@ class PeerNode:
 
                         # Read messages from websocket and handle them
                         async for msg in ws:
-                            if self.exit_trigger.is_set():
-                                await ws.close()
-                                break
-                            if msg.type == WSMsgType.ERROR:
-                                self.status_func(log_error=f'Connection to master closed with error: %s' % ws.exception())
-                            elif msg.type == WSMsgType.TEXT:
-                                try:
+                            try:
+                                if msg.type == WSMsgType.ERROR:
+                                    self.status_func(
+                                        log_error=f'Connection to master closed with error: %s' % ws.exception())
+                                elif msg.type == WSMsgType.TEXT:
                                     await self.process_server_msg(msg.json(), session)
-                                except Exception as e:
-                                    self.status_func(log_error=f'Error ("{str(e)}") handling server msg: {msg.data}'
-                                                                'traceback: ' + traceback.format_exc())
-                                    await self.server_send_queue.put({
-                                        'action': 'error', 'orig_msg': msg.data, 'message': 'Exception: ' + str(e)})
-
+                            except Exception as e:
+                                self.status_func(log_error=f'Error ("{str(e)}") handling server msg: {msg.data}'
+                                                            'traceback: ' + traceback.format_exc())
+                                await self.server_send_queue.put({
+                                    'action': 'error', 'orig_msg': msg.data, 'message': 'Exception: ' + str(e)})
+                            finally:
+                                if self.exit_trigger.is_set():
+                                    await ws.close()
                         self.status_func(log_info=f'Connection to master closed.')
 
             except aiohttp.client_exceptions.WSServerHandshakeError:
