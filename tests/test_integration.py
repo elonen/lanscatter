@@ -1,8 +1,9 @@
 from contextlib import suppress
 import multiprocessing as mp
-import pytest, shutil, time, os, io, random, traceback, sys, threading, filecmp
+import pytest, shutil, time, os, io, random, traceback, sys, threading, filecmp, json
 from pathlib import Path
 from types import SimpleNamespace
+import asyncio, aiohttp
 
 from lanscatter import common, masternode, peernode
 
@@ -15,10 +16,12 @@ Several edge cases are tested, too, such as empty files, different sized files a
 the middle of sync.
 """
 
+random.seed()
+
 TEST_DIR = './temp_test_dir'
 TEST_FILES_PER_DIR = 3
 CHUNK_SIZE = 1000
-PORT_BASE = 53741
+PORT_BASE = 53000 + int(2000*random.random())
 TEST_PEER_NAMES = {0: 'peer_empty', 1: 'peer_corrupt', 2: 'peer_non_empty'}
 
 # Make sure buffers don't cover whole chunks, for realistic testing
@@ -74,7 +77,9 @@ def make_test_dirs(tmp_path):
                 create_file(p / 'dlbuf_size_almost.bin', common.Defaults.DOWNLOAD_BUFFER_MAX - 1)
                 create_file(p / 'dlbuf_size_plus.bin', common.Defaults.DOWNLOAD_BUFFER_MAX + 2)
                 create_file(p / 'many_chunks.bin', int(CHUNK_SIZE * 5.5))
+                create_file(p / 'to_be_corrupted.bin', int(CHUNK_SIZE * 5.5))
                 create_file(p / 'zeroes.bin', int(CHUNK_SIZE * 3.1), pattern=b'\0' * CHUNK_SIZE)
+                create_file(p / 'zeroes_to_corrupt.bin', int(CHUNK_SIZE * 3.1), pattern=b'\0' * CHUNK_SIZE)
                 create_file(p / 'less_zeroes.bin', int(CHUNK_SIZE * 1.1), pattern=b'\0' * CHUNK_SIZE)
                 for x in range(5):
                     create_file(p / rnd_name('rnd_file', '.bin'), int(random.random() * CHUNK_SIZE * 7))
@@ -147,11 +152,55 @@ def test_actual_swarm_on_localhost(make_test_dirs):
     # Alter files on one peer in the middle of a sync
     time.sleep(4)
     print(f"Corrupting some files on '{peers[1].name}'...")
-    shutil.rmtree(peers[1].dir + '/dir2')                       # Delete a dir
-    with open(peers[1].dir+'/many_chunks.bin', 'wb') as f:      # Rewrite a file
-        f.write(b'dummycontent')
-    with open(peers[1].dir+'/zeroes.bin', 'r+b') as f:          # Overwrite beginning
-        f.write(b'dummycontent')
+    try:
+        shutil.rmtree(peers[1].dir + '/dir2')                       # Delete a dir
+        with open(peers[1].dir+'/to_be_corrupted.bin', 'wb') as f:      # Rewrite a file
+            f.write(b'dummycontent')
+        with open(peers[1].dir+'/zeroes_to_corrupt.bin', 'r+b') as f:          # Overwrite beginning
+            f.write(b'dummycontent')
+    except PermissionError as e:
+        print("WARNING: File corruption during test failed because of file locking or something: " + str(e))
+
+    # Make some non-protocol requests to the server
+    async def request_tests():
+
+        async def read_respose_msgs(ws):
+            recvd = []
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    assert 'traceback' not in msg.data.lower()
+                    recvd.append(json.loads(msg.data))
+            return recvd
+
+        async with aiohttp.ClientSession() as session:
+            print("Request: try bad message action")
+            async with session.ws_connect(f'ws://localhost:{PORT_BASE}/join') as ws:
+                await ws.send_json({'action': 'BAD_COMMAND'})
+                recvd = await read_respose_msgs(ws)
+                assert not recvd or ('fatal' in recvd[-1]['action'])
+
+            print("Request: try bad json")
+            async with session.ws_connect(f'ws://localhost:{PORT_BASE}/join') as ws:
+                await ws.send_str('INVALID_JSON')
+                recvd = await read_respose_msgs(ws)
+                assert not recvd or ('fatal' in recvd[-1]['action'])
+
+            print("Request: HTTP on websocet endpoint")
+            async with session.get(f'http://localhost:{PORT_BASE}/join') as resp:
+                assert resp.status != 200, "Websocket endpoint answered plain HTML request with 200."
+
+            print("Request: request HTML status page")
+            async with session.get(f'http://localhost:{PORT_BASE}/') as resp:
+                assert resp.status == 200, "Server status page returned HTTP error: " + str(resp.status)
+                assert '<html' in (await resp.text()).lower(), "Status query didn't return HTML."
+
+    try:
+        print("Doing request tests")
+        asyncio.new_event_loop().run_until_complete(
+            asyncio.wait_for(request_tests(), timeout=20))
+    except asyncio.TimeoutError:
+        assert False, "Request tests timed out."
+
 
     # Wait
     for x in range(8):
@@ -171,6 +220,7 @@ def test_actual_swarm_on_localhost(make_test_dirs):
             assert 'Exception' not in p.out.getvalue(), f'Exception(s) on {p.name}'
             assert 'egmentation fault' not in p.out.getvalue()
             assert p.is_master or 'Up to date' in p.out.getvalue(), 'Node never reached up-to-date state.'
+            assert 'traceback' not in str(p.out.getvalue()).lower()
             assert not cmp.diff_files, f'Differing files between {p.name} and master: {str(cmp.diff_files)}'
             assert not cmp.funny_files, f'"Funny" files between {p.name} and master: {str(cmp.funny_files)}'
             assert not cmp.left_only, f'Files found only from {p.name}: {str(cmp.left_only)}'

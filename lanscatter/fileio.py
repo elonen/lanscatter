@@ -179,37 +179,38 @@ class FileIO:
         :param http_session: AioHTTP session to use for GET.
         :param file_size: Size of complete file (optional). File will be truncated to this size.
         """
-        async with http_session.get(url) as resp:
-            if resp.status != 200:  # some error
-                raise IOError(f'Unknown/unsupported HTTP status: {resp.status}')
-            else:
-                async with self.open_and_seek(chunk.path, chunk.pos, for_write=True) as outf:
-                    #csum = HashFunc()
-                    buff_in, buff_out = None, b''
+        with suppress(RuntimeError):  # Avoid dirty exit in aiofiles when Ctrl^C (RuntimeError('Event loop is closed')
+            async with http_session.get(url) as resp:
+                if resp.status != 200:  # some error
+                    raise IOError(f'HTTP status {resp.status}')
+                else:
+                    async with self.open_and_seek(chunk.path, chunk.pos, for_write=True) as outf:
+                        #csum = HashFunc()
+                        buff_in, buff_out = None, b''
 
-                    async def read_http():
-                        nonlocal buff_in
-                        limited_n = int(await self.dl_limiter.acquire(
-                            Defaults.DOWNLOAD_BUFFER_MAX, Defaults.NETWORK_BUFFER_MIN))
-                        buff_in = await resp.content.read(limited_n)
-                        self.dl_limiter.unspend(limited_n - len(buff_in))
-                        buff_in = buff_in if buff_in else None
+                        async def read_http():
+                            nonlocal buff_in
+                            limited_n = int(await self.dl_limiter.acquire(
+                                Defaults.DOWNLOAD_BUFFER_MAX, Defaults.NETWORK_BUFFER_MIN))
+                            buff_in = await resp.content.read(limited_n)
+                            self.dl_limiter.unspend(limited_n - len(buff_in))
+                            buff_in = buff_in if buff_in else None
 
-                    async def write_and_csum():
-                        nonlocal buff_out
-                        #await asyncio.gather(outf.write(buff_out), csum.update_async(buff_out))
-                        await outf.write(buff_out)
+                        async def write_and_csum():
+                            nonlocal buff_out
+                            #await asyncio.gather(outf.write(buff_out), csum.update_async(buff_out))
+                            await outf.write(buff_out)
 
-                    while buff_out is not None:
-                        await asyncio.gather(read_http(), write_and_csum())  # Read, write and hash concurrently
-                        buff_in, buff_out = buff_out, buff_in  # Swap buffers
+                        while buff_out is not None:
+                            await asyncio.gather(read_http(), write_and_csum())  # Read, write and hash concurrently
+                            buff_in, buff_out = buff_out, buff_in  # Swap buffers
 
-                    # Checksumming here is actually waste of CPU time since we'll rehash the sync dir when finished
-                    #if csum.result() != chunk.hash:
-                    #    raise IOError(f'Checksum error verifying {chunk.hash} from {url}')
+                        # Checksuming here is actually waste of CPU since we'll rehash sync dir anyway when finished
+                        #if csum.result() != chunk.hash:
+                        #    raise IOError(f'Checksum error verifying {chunk.hash} from {url}')
 
-                    if file_size >= 0:
-                        outf.truncate(file_size)
+                        if file_size >= 0:
+                            await outf.truncate(file_size)
 
 
     async def change_mtime(self, path, mtime):

@@ -3,7 +3,7 @@ import asyncio, aiohttp
 from aiohttp import web, WSMsgType
 from pathlib import Path
 from contextlib import suppress
-from packaging import version
+import async_timeout
 import traceback, time, argparse, os, collections, json, platform
 from signal import SIGINT, SIGTERM
 import concurrent.futures
@@ -183,16 +183,24 @@ class PeerNode:
         target = self.remote_batch.first_chunk_with(chunk_hash)
         if not target:
             raise IOError(f'Bad download command from master, or old filelist? Chunk {chunk_hash} is unknown.')
+        dl_task = None
         try:
             self.incoming.add(chunk_hash)
             await self.send_transfer_report()
             self.status_func(log_info=f'Downloading from: {url}')
             self.status_func(cur_status=f'Downloading chunks...',
                              progress=len(self.local_batch.all_hashes()) / len(self.remote_batch.all_hashes()))
-            await asyncio.wait([self.file_io.download_chunk(chunk=target, url=url, http_session=http_session,
-                                                            file_size=self.remote_batch.files[target.path].size),
-                                self.exit_trigger.wait(),
-                                ], timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+
+            async with async_timeout.timeout(timeout):
+                dl_task = asyncio.create_task(
+                    self.file_io.download_chunk(chunk=target, url=url, http_session=http_session,
+                                                file_size=self.remote_batch.files[target.path].size))
+                await asyncio.wait([dl_task, asyncio.create_task(self.exit_trigger.wait())],
+                                   return_when=asyncio.FIRST_COMPLETED)
+            if not dl_task.done():
+                raise asyncio.CancelledError()
+
+            dl_task.result()  # raises exception if one happened inside the task
 
             self.local_batch.add(chunks=(target,))
             await self.server_send_queue.put({
@@ -204,18 +212,22 @@ class PeerNode:
                 self.status_func(log_info=f'All chunks apparently complete. Rescanning to make sure.')
                 self.full_rescan_trigger.set()
 
-        except asyncio.TimeoutError:
-            self.status_func(log_info=f'Download from {url} took over timeout ({timeout}s). Aborted.')
+        except asyncio.TimeoutError as e:
+            self.status_func(log_info=f'Timeout. GET {url} took over {float("%.2g" % timeout)}s.')
+        except asyncio.CancelledError as e:
+            self.status_func(log_debug=f'Program exiting. Download aborted from {url}.')
         except (IOError, OSError) as e:
-            self.status_func(log_error=f'Download from {url} failed: {str(e)}')
+            self.status_func(log_error=f'Failed download from {url}: {str(e)}')
         except aiohttp.client_exceptions.ClientError as e:
-            self.status_func(log_error=f'Download from {url} failed, aiohttp ClientError: {str(e)}')
+            self.status_func(log_error=f'Failed download from {url}, aiohttp ClientError: {str(e)}')
         except (KeyboardInterrupt, concurrent.futures.CancelledError) as e:
             pass
         except Exception as e:
             self.status_func(log_error=f'Exception in download_task: \n' + traceback.format_exc(), popup=True)
             raise e
         finally:
+            if dl_task:
+                dl_task.cancel()
             self.incoming.discard(chunk_hash)
             await self.send_transfer_report()
 

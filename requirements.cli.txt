@@ -3,3 +3,4 @@ aiofiles
 pytest
 pytest-timeout
 packaging
+async-timeout

@@ -6,6 +6,7 @@ aiofiles
 wxPython
 appdirs
 packaging
+async-timeout
 
 pytest
 pytest-timeout
