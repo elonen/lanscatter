@@ -25,9 +25,7 @@ pip install --editable git://github.com/elonen/lanscatter.git#egg=lanscatter
 ```
 git clone git+ssh://git@github.com/elonen/lanscatter.git
 cd lanscatter
-python3.7 -m venv venv
-source venv/bin/activate
-python setup.py develop
+./init-env.sh    # on Windows requires Mingw (Git Bash) or Cygwin
 ```
 
 Either way, you can now type `lanscatter_master`, `lanscatter_peer` or `lanscatter_gui` on the command line.
@@ -105,7 +103,7 @@ Notable modules:
 
 ## Testing
 
-The `tests` folder contains integration and unit tests using the _pytest_ framework.
+The `tests` folder contains integration and unit tests using the _pytest_ framework; simply the environment and run `pytest`.
 
 Integration test – in short – runs a master node and several peer node simultaneously, with random sync dir contents, and makes sure they get in sync without errors.
 
@@ -160,6 +158,11 @@ Table with hash characters and dots show which chunks each node has.
 Numbers on the right show current downloads, current uploads and average time it takes to upload one chunk from each node.
 
 See `planner.plan_transfers()` for details on how planning algorithm works.
+
+## Building
+
+Being a Python package, Lanscatter doesn't require building, but if you want to package .exe binaries for
+Windows , run `pyinstaller-build.sh` in _Git Bash_ (Mingw) or Cygwin.
 
 ## License
 
