@@ -66,7 +66,8 @@ def parse_cli_args(is_master: bool):
     return parser.parse_args()
 
 
-def make_human_cli_status_func(log_level_debug=False, print_func=print):
+def make_human_cli_status_func(log_level_debug=False, print_func=None):
+    print_func = print_func or (lambda *args: print(*args, flush=True))
 
     def func(progress: float = None, cur_status: str = None,
              log_error: str = None, log_info: str = None, log_debug: str = None, popup: bool = False):
