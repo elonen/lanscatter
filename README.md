@@ -157,7 +157,8 @@ Left column is a list of node names.
 Table with hash characters and dots show which chunks each node has.
 Numbers on the right show current downloads, current uploads and average time it takes to upload one chunk from each node.
 
-See `planner.plan_transfers()` for details on how planning algorithm works.
+See `planner.plan_transfers()` for details on how planning algorithm works. Command
+`python lanscatter/planner.py` runs the swarm simulation.
 
 ## Building
 

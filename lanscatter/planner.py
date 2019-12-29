@@ -161,18 +161,22 @@ class SwarmCoordinator(object):
         Calculates a transfer plan by pairing up nodes with free download and upload slots.
         :return: List of Transfers to initiate
         """
+        # Timeout P2P downloads quickly at first, then use actual statistics as we get
+        ul_times = [float(n.avg_ul_time or 0) for n in self.nodes if n.avg_ul_time]
+        median_time = statistics.median(ul_times) if ul_times else 1
+
+        def uploader_weight(n):
+            # Favor fast non-master nodes with few hashes
+            return len(n.hashes) * (n.avg_ul_time or median_time) * (1.5 if n.is_master else 1)
+
         # Consider nodes with least hashes first for both DL and UL, for optimal speed and network load distribution
         free_downloaders = sorted((n for n in self.nodes if n.active_downloads < n.max_concurrent_dls and
                                    len(n.hashes) < len(self.all_hashes)),
                                   key=lambda n: len(n.hashes))
         free_uploaders = sorted((n for n in self.nodes if n.active_uploads < n.max_concurrent_uls),
-                                key=lambda n: len(n.hashes) * (n.avg_ul_time or 999))  # favor fast uploaders
+                                key=uploader_weight)  # lower score is selected first
         if not free_uploaders or not free_downloaders:
             return ()
-
-        # Timeout P2P downloads quickly at first, then use actual statistics as we get
-        ul_times = [float(n.avg_ul_time or 0) for n in self.nodes if n.avg_ul_time]
-        median_time = statistics.median(ul_times) if ul_times else 1
 
         # Avoid slow peers but not completely (proportional to their speed)
         free_uploaders = [n for n in free_uploaders if n.is_master or
