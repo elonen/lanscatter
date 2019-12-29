@@ -1,4 +1,4 @@
-# Efficient large file distributor for Local Area Networks
+# LANScatter - Efficient large file distributor for Local Area Networks
 
 [![Build Status](https://travis-ci.com/elonen/lanscatter.svg?token=spq2kVHPBJxJyRjUkyKT&branch=master)](https://travis-ci.com/elonen/lanscatter)
 [![Platforms](https://img.shields.io/badge/platforms-Win%20%7C%20OSX%20%7C%20Linux-blue)]()
@@ -8,6 +8,30 @@
 ## Introduction
 
 LANScatter is a P2P assisted, server-driven one-way folder synchronizer, designed for large files in reliable, private LANs.
+
+## Usage
+
+User who has files to distribute runs a **master node** (CLI or GUI program), and downloaders run **peer nodes**:
+
+1. On your file server, run _master_:
+
+   ```
+   lanscatter_master <source-dir>
+   ```
+
+2. On workstation(s), run _peer_:
+
+   ```
+   lanscatter_peer <server-address> <dst-dir>
+   ```
+   If command line is not your thing, a systray-based GUI is also available (tested on Windows and Macos):
+   
+   ![LANScatter GUI](doc/gui-screenshot.png)
+
+3. Optionally, point a web browser to `http://<server-address>:10564/` to monitor the swarm as it syncs.
+
+4. Keep peers running until everyone's got the files. LANScatter is designed for distributing dozens of gigabytes (or more),
+   so transfers and verifications (hashing the files after transfer) will take a while.
 
 ## Installing
 
@@ -30,36 +54,14 @@ cd lanscatter
 
 Either way, you can now type `lanscatter_master`, `lanscatter_peer` or `lanscatter_gui` on the command line.
 
-## Usage
-
-User who has files to distribute runs **master node** (CLI or GUI program), and leechers run **peer nodes** that connect to it:
-
-1. Start master:
-
-   `my-server:~$ lanscatter_master ./from-dir`
-
-2. Start peers:
-
-   ```
-   Workstation-A:~$ lanscatter_peer my-server ./to-dir
-   Workstation-B:~$ lanscatter_peer my-server ./to-dir
-   Workstation-C:~$ lanscatter_peer my-server ./to-dir
-   ...
-   ```
-   If command line is not your thing, a simple systray GUI is also available:
-   
-   ![LANScatter GUI](doc/gui-screenshot.png)
-
-3. Wait. LANScatter is designed for distributing folders with dozens+ gigabytes of files, so hashing (calculating checksums) and transferring them will take a while.
-
-4. Optionally, point a web browser to `http://my-server:10564/` to monitor the swarm.
-
+## How it works
 
 Master splits sync folder contents into _chunks_, calculates checksums, transfers them to different peers, and organizes peers to download chunks from each other optimally.
 
 Changes on master's sync folder are mirrored to all connected peers, and any changes on peer sync folders are overwritten. Peers can leave and join the swarm at any time. Stopped syncs are automatically resumed.
 
 According to simulations (see _Testing_ below) this should yield 50% – 90% distribution speed compared to ideal (unrealistic) simultaneous multicast – depending on other load on the nodes and network.
+
 
 ## Features
 
@@ -80,6 +82,12 @@ Features and notable differences to Btsync/Resilio, Syncthing and Dropbox-like s
 Lanscatter is built on _Python 3.7_ using asyncio (aiohttp & aiofiles),
 _wxPython_ for cross-platform GUI, _Blake2b_ algorithm for chunk hashing, _pytest_ for unit / integration tests
 and _pyinstaller_ for packaging / freezing into exe files.
+
+## Building
+
+Being a Python package, Lanscatter doesn't require building, but if you want to package .exe binaries for
+Windows , run `./pyinstaller-build.sh` in _Git Bash_ (Mingw) or Cygwin.
+
 
 ## Architecture
 
@@ -159,11 +167,6 @@ Numbers on the right show current downloads, current uploads and average time it
 
 See `planner.plan_transfers()` for details on how planning algorithm works. Command
 `python lanscatter/planner.py` runs the swarm simulation.
-
-## Building
-
-Being a Python package, Lanscatter doesn't require building, but if you want to package .exe binaries for
-Windows , run `pyinstaller-build.sh` in _Git Bash_ (Mingw) or Cygwin.
 
 ## License
 
