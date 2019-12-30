@@ -57,8 +57,10 @@ def parse_cli_args(is_master: bool):
     if is_master:
         parser.add_argument('--chunksize', dest='chunksize', type=int,
                             default=Defaults.CHUNK_SIZE, help='Chunk size for splitting files (in bytes)')
+        '''
         parser.add_argument('--sslcert', type=str, default=None, help='SSL certificate file for HTTPS (optional)')
         parser.add_argument('--sslkey', type=str, default=None, help='SSL key file for HTTPS (optional)')
+        '''
 
     parser.add_argument('--json', dest='json', action='store_true', default=False, help='Show status as JSON (for GUI usage)')
     parser.add_argument('-d', '--debug', dest='debug', action='store_true', default=False,

@@ -386,8 +386,7 @@ def main():
     with suppress(KeyboardInterrupt):
         asyncio.run(run_master_server(
             base_dir=args.dir, port=args.port, ul_limit=args.ul_limit, concurrent_uploads=args.ct,
-            dir_scan_interval=args.rescan_interval,
-            https_cert=args.sslcert, https_key=args.sslkey,
+            dir_scan_interval=args.rescan_interval,  # https_cert=args.sslcert, https_key=args.sslkey,
             chunk_size=args.chunksize, status_func=status_func))
 
 
