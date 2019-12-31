@@ -62,19 +62,19 @@ Changes on master's sync folder are mirrored to all connected peers, and any cha
 
 According to simulations (see _Testing_ below) this should yield 50% – 90% distribution speed compared to ideal (unrealistic) simultaneous multicast – depending on other load on the nodes and network.
 
-
 ## Features
 
 Features and notable differences to Btsync/Resilio, Syncthing and Dropbox-like software:
 
 * It's a _one way synchronizer_ for distributing large folders 1-to-N, not a generic two-way syncer.
-* Keeps only a _single copy of each file_ to save space – no `.sync` dirs with duplicate files
+* Keeps only a _single copy of each file_ to save space – no `.sync` dirs with duplicate files.
 * Centralized coordination, distributed transfers.  Few TCP connections, no broadcasts. (Peers connect to a master via websocket, and it instructs them to make HTTP downloads from each other or the master).
 * Designed for _big chunk sizes_ to minimize coordination overhead. (Configurable, e.g. for deduplication if data is highly redundant.)
 * Designed for _few simultaneous transfers_. This avoids unnecessary coordination traffic and overhead, assuming a reliable and fast LAN environment.
 * Keeps traffic inside the LAN (doesn't connect to any third party servers).
 * Resilient against slow individual nodes. Transfers from slow peers are detected, aborted and avoided afterwards.
 * Does _not_ preserve Unix file attributes (for now), as Windows doesn't support them.
+* Master never modifies sync directory - it treat is as _read only_.
 * Supports bandwidth limiting.
 
 ## Technologies
@@ -82,6 +82,26 @@ Features and notable differences to Btsync/Resilio, Syncthing and Dropbox-like s
 Lanscatter is built on _Python 3.7_ using asyncio (aiohttp & aiofiles),
 _wxPython_ for cross-platform GUI, _Blake2b_ algorithm for chunk hashing, _pytest_ for unit / integration tests
 and _pyinstaller_ for packaging / freezing into exe files.
+
+## Site-to-site distribution
+
+LANScatter peers and masters can be chained into a distribution tree.
+
+Master doesn't care where the files in sync directory come from, and never modifies them, so you can run a peer node
+that downloads files directly into a master node's source directory. This kind of chained / proxy setup can be a useful if, for example,
+you want to distribute files to another site over a VPN:
+
+![Proxy setup](doc/chaining.svg)
+
+Pointing peer nodes on LAN 2 directly to master on LAN1 is a bad idea as peers on different LANs will then start doing
+P2P transfers over the slow VPN. The single swarm1 peer on LAN 2 doesn't have this problem, as swarm1 master will
+notice it's a generally slow uploader, and will then avoid using it for p2p transfers on swarm1. You could also limit
+its upload slots to 0.
+
+LANScatter CLI and GUI tools don't have any special options for this setup yet, but it's easy to setup manually.
+Master and peer already listen to different ports by default (10564 and 10565, respectively).
+
+(In the future, a convenience command, perhaps called `lanscatter_proxy`, could streamline this setup.)  
 
 ## Building
 
