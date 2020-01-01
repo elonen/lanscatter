@@ -7,6 +7,7 @@ wxPython
 appdirs
 packaging
 async-timeout
+psutil
 
 pytest
 pytest-timeout

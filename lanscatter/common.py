@@ -25,6 +25,14 @@ class Defaults:
     PROTOCOL_VERSION = '1.0.0'
 
 
+def drop_process_priority():
+    import psutil, platform, os
+    if "indows" in platform.system():
+        psutil.Process(os.getpid()).nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+    else:
+        psutil.Process(os.getpid()).nice(10)
+
+
 def parse_cli_args(is_master: bool):
     desc = f"LANScatter {'master' if is_master else 'peer'} -- " \
         f"app version {Defaults.APP_VERSION}, protocol version {Defaults.PROTOCOL_VERSION}"
@@ -65,7 +73,14 @@ def parse_cli_args(is_master: bool):
     parser.add_argument('--json', dest='json', action='store_true', default=False, help='Show status as JSON (for GUI usage)')
     parser.add_argument('-d', '--debug', dest='debug', action='store_true', default=False,
                         help='Show debug level log messages. No effect if --json is specified.')
-    return parser.parse_args()
+    parser.add_argument('--no-nice', dest='no_nice', action='store_true', default=False, help="Don't lower CPU priority")
+
+    parsed = parser.parse_args()
+
+    if not parsed.no_nice:
+        drop_process_priority()
+
+    return parsed
 
 
 def make_human_cli_status_func(log_level_debug=False, print_func=None):
