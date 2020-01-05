@@ -1,6 +1,6 @@
 from aiohttp import web, WSMsgType
 from pathlib import Path
-from typing import Callable, Optional, Awaitable
+from typing import Callable, Optional, Awaitable, Dict
 from json.decoder import JSONDecodeError
 import asyncio, traceback, html
 import concurrent.futures
@@ -238,7 +238,7 @@ class MasterNode:
                     with suppress(asyncio.TimeoutError):
                         msg = await asyncio.wait_for(send_queue.get(), timeout=1)
                         if msg and not ws.closed:
-                            await ws.send_json(msg)
+                            await ws.send_json(msg, compress=9)
                         if msg and msg.get('action') == 'fatal':
                             self.status_func(log_info=f'Sent fatal error to client. Kicking them out: {str(msg)}"')
                             await ws.close()
@@ -356,7 +356,7 @@ async def run_master_server(base_dir: str,
         while True:
             # TODO: integrate with inotify (watchdog package) to avoid frequent rescans
             new_batch, errors = await scan_dir(base_dir, chunk_size=chunk_size, old_batch=server.file_server.batch,
-                                       progress_func=progress_func_adapter)
+                                               progress_func=progress_func_adapter, test_compress=True)
             for i, e in enumerate(errors):
                 status_func(log_error=f'- Dir scan error #{i}: {e}')
             if new_batch != server.file_server.batch:

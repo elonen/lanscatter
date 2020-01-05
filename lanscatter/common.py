@@ -21,8 +21,8 @@ class Defaults:
     CONCURRENT_TRANSFERS_PEER = 2
     DIR_SCAN_INTERVAL_PEER = 60
 
-    APP_VERSION = '0.1.1'
-    PROTOCOL_VERSION = '1.0.0'
+    APP_VERSION = '0.1.2'
+    PROTOCOL_VERSION = '2.0.0'
 
 
 def drop_process_priority():

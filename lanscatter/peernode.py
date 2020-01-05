@@ -78,6 +78,7 @@ class PeerNode:
 
         # Print status report
         path_diff = self.local_batch.file_tree_diff(self.remote_batch)
+
         self.status_func(log_info=f'LOCAL: Difference stats: '
                                   f'{len(chunk_diff.there_only)} missing chunks, '
                                   f'{len(path_diff.with_different_attribs) + len(path_diff.there_only)} altered / '
@@ -99,7 +100,7 @@ class PeerNode:
                     self.status_func(log_info=f'LOCAL: Copying {missing.hash} from "{dupe.path}"/{dupe.pos}'
                                               f' to "{missing.path}"/{missing.pos}')
                     if await self.file_io.copy_chunk_locally(copy_from=dupe, copy_to=missing):
-                        self.local_batch.add(chunks=(dupe,))
+                        self.local_batch.add(chunks=(missing,))
                     else:
                         self.status_func(log_info=f'LOCAL: Hash {missing.hash} was not in "{dupe.path}"/{dupe.pos} '
                                                   'anymore (was probably overwritten). Forgetting it.')
@@ -142,7 +143,7 @@ class PeerNode:
                             self.local_batch.discard(paths=[f.path])
 
                     elif here.mtime == there.mtime:
-                        self.status_func(log_info=f'LOCAL: File "{here.path}" is has wrong content but was'
+                        self.status_func(log_info=f'LOCAL: File "{here.path}" has wrong content but was'
                                                   f' set to target time. Resetting it to "now".')
                         here.mtime = time.time()
                         await self.file_io.change_mtime(here.path, here.mtime)
@@ -259,6 +260,7 @@ class PeerNode:
                 self.status_func(log_info=f'Chunks size is {int(new_batch.chunk_size/1024/1024+0.5)} MB '
                                           f'({new_batch.chunk_size} bytes).')
                 self.remote_batch = new_batch
+                # self.status_func(log_debug='Initial sync batch:' + str(self.remote_batch))
                 self.full_rescan_trigger.set()
 
             elif action == 'new_batch':
@@ -295,7 +297,7 @@ class PeerNode:
         while not self.exit_trigger.is_set():
             try:
                 async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(server_url) as ws:
+                    async with session.ws_connect(server_url, compress=15) as ws:
                         self.status_func(log_info=f'Master server connected.')
 
                         # Read send_queue and pass them to websocket
@@ -377,11 +379,12 @@ class PeerNode:
                     self.status_func(log_debug='Rescanning local files.')
                     new_local_batch, errors = await scan_dir(
                         str(self.file_io.basedir), chunk_size=self.remote_batch.chunk_size,
-                        old_batch=self.local_batch, progress_func=__hash_dir_progress_func)
+                        old_batch=self.local_batch, progress_func=__hash_dir_progress_func, test_compress=False)
                     for i,e in enumerate(errors):
                         self.status_func(log_error=f'- Dir scan error #{i}: {e}')
                     self.status_func(log_debug='Rescan finished.')
 
+                    new_local_batch.copy_chunk_compress_ratios_from(self.remote_batch)
                     different_from_remote = self.remote_batch != new_local_batch
 
                     if not self.joined_swarm or new_local_batch != self.local_batch or different_from_remote:

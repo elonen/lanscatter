@@ -74,14 +74,14 @@ Features and notable differences to Btsync/Resilio, Syncthing and Dropbox-like s
 * Keeps traffic inside the LAN (doesn't connect to any third party servers).
 * Resilient against slow individual nodes. Transfers from slow peers are detected, aborted and avoided afterwards.
 * Does _not_ preserve Unix file attributes (for now), as Windows doesn't support them.
-* Master never modifies sync directory - it treat is as _read only_.
+* Master never modifies sync directory - it treats it as _read only_.
 * Supports bandwidth limiting.
 
 ## Technologies
 
-Lanscatter is built on _Python 3.7_ using asyncio (aiohttp & aiofiles),
-_wxPython_ for cross-platform GUI, _Blake2b_ algorithm for chunk hashing, _pytest_ for unit / integration tests
-and _pyinstaller_ for packaging / freezing into exe files.
+Lanscatter is built on **Python 3.7** using **asyncio** (aiohttp & aiofiles),
+**wxPython** for cross-platform GUI, **Blake2b** algorithm for chunk hashing, **LZ4** for in-flight compression,
+**pytest** for unit / integration tests and **pyinstaller** for packaging / freezing into exe files.
 
 ## Site-to-site distribution
 

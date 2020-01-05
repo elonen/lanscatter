@@ -203,8 +203,8 @@ def test_actual_swarm_on_localhost(make_test_dirs):
 
 
     # Wait
-    for x in range(8):
-        print(f"Waiting {8-x} seconds for nodes before terminating...")
+    for x in range(10):
+        print(f"Waiting {10-x} seconds for nodes before terminating...")
         time.sleep(1)
 
     # Kill processes

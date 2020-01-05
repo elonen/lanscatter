@@ -8,6 +8,7 @@ appdirs
 packaging
 async-timeout
 psutil
+lz4
 
 pytest
 pytest-timeout

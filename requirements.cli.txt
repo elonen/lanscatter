@@ -5,3 +5,4 @@ pytest-timeout
 packaging
 async-timeout
 psutil
+lz4

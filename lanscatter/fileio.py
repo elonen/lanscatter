@@ -3,6 +3,7 @@ from aiohttp import web, ClientSession
 from typing import Tuple, Optional
 from contextlib import suppress
 import aiofiles, os, time, asyncio, aiohttp, mmap
+import lz4.frame
 
 from .common import Defaults
 from .chunker import FileChunk, HashFunc
@@ -78,54 +79,66 @@ class FileIO:
 
         :param chunk: Chunk to read
         :param request: HTTP request to answer
+        :param use_lz4: Compress with LZ4 if client accepts it
         :return: Tuple(Aiohttp.response, float(seconds the upload took) or None if it no progress was made)
         """
+        use_lz4 = (chunk.cmpratio < 0.95) and ('lz4' in str(request.headers.get('Accept-Encoding')))
         response = None
         remaining = chunk.size
         start_t = time.time()
         try:
             async with self.open_and_seek(chunk.path, chunk.pos, for_write=False) as f:
-                # Ok, read chunk from file and stream it out
-                response = web.StreamResponse(
-                    status=200,
-                    reason='OK',
-                    headers={'Content-Type': 'application/octet-stream', 'Content-Disposition': 'inline'})
-                await response.prepare(request)
+                with lz4.frame.LZ4FrameCompressor() as lz:
+                    # Ok, read chunk from file and stream it out
+                    response = web.StreamResponse(
+                        status=200,
+                        reason='OK',
+                        headers={'Content-Type': 'application/octet-stream', 'Content-Disposition': 'inline',
+                                 'Content-Encoding': 'lz4' if use_lz4 else 'None'})
+                    await response.prepare(request)
+                    if use_lz4:
+                        await response.write(lz.begin())
 
-                buff_in, buff_out = bytearray(Defaults.FILE_BUFFER_SIZE), None
+                    buff_in, buff_out = bytearray(Defaults.FILE_BUFFER_SIZE), None
 
-                async def read_file():
-                    nonlocal buff_in, remaining, chunk
-                    if remaining > 0:
-                        if remaining < len(buff_in):
-                            buff_in = bytearray(remaining)
-                        cnt = await f.readinto(buff_in)
-                        if cnt != len(buff_in):
-                            raise web.HTTPNotFound(reason=f'Filesize mismatch / "{str(chunk.path)}" changed? Read {cnt} but expected {len(buff_in)}.')
-                        remaining -= cnt
-                    else:
-                        buff_in = None
+                    async def read_file():
+                        nonlocal buff_in, remaining, chunk
+                        if remaining > 0:
+                            if remaining < len(buff_in):
+                                buff_in = bytearray(remaining)
+                            cnt = await f.readinto(buff_in)
+                            if cnt != len(buff_in):
+                                raise web.HTTPNotFound(reason=f'Filesize mismatch / "{str(chunk.path)}" changed? Read {cnt} but expected {len(buff_in)}.')
+                            remaining -= cnt
+                        else:
+                            buff_in = None
 
-                async def write_http():
-                    nonlocal buff_out
-                    if not buff_out:
-                        buff_out = bytearray(Defaults.FILE_BUFFER_SIZE)
-                    else:
-                        i, cnt = 0, len(buff_out)
-                        while cnt > 0:
-                            limited_n = int(await self.ul_limiter.acquire(cnt, Defaults.NETWORK_BUFFER_MIN))
-                            await response.write(buff_out[i:(i + limited_n)])
-                            i += limited_n
-                            cnt -= limited_n
+                    async def write_http():
+                        nonlocal buff_out
+                        if not buff_out:
+                            buff_out = bytearray(Defaults.FILE_BUFFER_SIZE)
+                        else:
+                            i, cnt = 0, len(buff_out)
+                            while cnt > 0:
+                                limited_n = int(await self.ul_limiter.acquire(cnt, Defaults.NETWORK_BUFFER_MIN))
+                                raw = memoryview(buff_out)[i:(i + limited_n)]
+                                out = lz.compress(raw) if use_lz4 else raw
+                                await response.write(out)
+                                # await response.write(buff_out[i:(i + limited_n)])
+                                self.dl_limiter.unspend(limited_n - len(out))
+                                i += limited_n
+                                cnt -= limited_n
 
-                # Double buffered read & write
-                while remaining > 0:
-                    await asyncio.gather(read_file(), write_http())
-                    buff_in, buff_out = buff_out, buff_in  # Swap buffers
-                await write_http()  # Write once more to flush buff_out
+                    # Double buffered read & write
+                    while remaining > 0:
+                        await asyncio.gather(read_file(), write_http())
+                        buff_in, buff_out = buff_out, buff_in  # Swap buffers
+                    await write_http()  # Write once more to flush buff_out
 
-                await response.write_eof()
-                return response, (time.time() - start_t)
+                    if use_lz4:
+                        await response.write(lz.flush())
+                    await response.write_eof()
+                    return response, (time.time() - start_t)
 
         except asyncio.CancelledError as e:
             # If client disconnected, predict how long upload would have taken
@@ -180,37 +193,40 @@ class FileIO:
         :param file_size: Size of complete file (optional). File will be truncated to this size.
         """
         with suppress(RuntimeError):  # Avoid dirty exit in aiofiles when Ctrl^C (RuntimeError('Event loop is closed')
-            async with http_session.get(url) as resp:
+            async with http_session.get(url, headers={'Accept-Encoding': 'lz4'}) as resp:
                 if resp.status != 200:  # some error
                     raise IOError(f'HTTP status {resp.status}')
                 else:
-                    async with self.open_and_seek(chunk.path, chunk.pos, for_write=True) as outf:
-                        #csum = HashFunc()
-                        buff_in, buff_out = None, b''
+                    use_lz4 = 'lz4' in str(resp.headers.get('Content-Encoding'))
+                    with lz4.frame.LZ4FrameDecompressor() as lz:
+                        async with self.open_and_seek(chunk.path, chunk.pos, for_write=True) as outf:
+                            #csum = HashFunc()
+                            buff_in, buff_out = None, b''
 
-                        async def read_http():
-                            nonlocal buff_in
-                            limited_n = int(await self.dl_limiter.acquire(
-                                Defaults.DOWNLOAD_BUFFER_MAX, Defaults.NETWORK_BUFFER_MIN))
-                            buff_in = await resp.content.read(limited_n)
-                            self.dl_limiter.unspend(limited_n - len(buff_in))
-                            buff_in = buff_in if buff_in else None
+                            async def read_http():
+                                nonlocal buff_in
+                                limited_n = int(await self.dl_limiter.acquire(
+                                    Defaults.DOWNLOAD_BUFFER_MAX, Defaults.NETWORK_BUFFER_MIN))
+                                buff_in = await resp.content.read(limited_n)
+                                self.dl_limiter.unspend(limited_n - len(buff_in))
+                                buff_in = buff_in if buff_in else None
 
-                        async def write_and_csum():
-                            nonlocal buff_out
-                            #await asyncio.gather(outf.write(buff_out), csum.update_async(buff_out))
-                            await outf.write(buff_out)
+                            async def write_and_csum():
+                                nonlocal buff_out
+                                #await asyncio.gather(outf.write(buff_out), csum.update_async(buff_out))
+                                dec = lz.decompress(buff_out) if use_lz4 else buff_out
+                                await outf.write(dec)
 
-                        while buff_out is not None:
-                            await asyncio.gather(read_http(), write_and_csum())  # Read, write and hash concurrently
-                            buff_in, buff_out = buff_out, buff_in  # Swap buffers
+                            while buff_out is not None:
+                                await asyncio.gather(read_http(), write_and_csum())  # Read, write and hash concurrently
+                                buff_in, buff_out = buff_out, buff_in  # Swap buffers
 
-                        # Checksuming here is actually waste of CPU since we'll rehash sync dir anyway when finished
-                        #if csum.result() != chunk.hash:
-                        #    raise IOError(f'Checksum error verifying {chunk.hash} from {url}')
+                            # Checksuming here is actually waste of CPU since we'll rehash sync dir anyway when finished
+                            #if csum.result() != chunk.hash:
+                            #    raise IOError(f'Checksum error verifying {chunk.hash} from {url}')
 
-                        if file_size >= 0:
-                            await outf.truncate(file_size)
+                            if file_size >= 0:
+                                await outf.truncate(file_size)
 
 
     async def change_mtime(self, path, mtime):

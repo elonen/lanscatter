@@ -5,7 +5,7 @@ import aiofiles, aiofiles.os, collections, threading
 import mmap
 from concurrent.futures import ThreadPoolExecutor, Future, as_completed, CancelledError
 from pathlib import Path, PurePosixPath
-from contextlib import suppress
+import lz4.frame
 
 # Tools for scanning files in a directory and splitting them into hashed chunks.
 # MasterNode and PeerNode both use this for maintaining and syncing their state.
@@ -29,6 +29,7 @@ class FileChunk(HashableBase):
     path: str           # path + filename
     pos: int            # chunk start position in bytes
     size: int           # chunk size in bytes
+    cmpratio: float     # Compression ratio (compressed size / original size)
     hash: HashType      # Hex checksum of data contents (blake2, digest_size=12)
 
 
@@ -164,6 +165,11 @@ class SyncBatch:
             there_only=there_chunks - self.chunks,
             here_only=self.chunks - there_chunks)
 
+    def copy_chunk_compress_ratios_from(self, other):
+        """Copy (replace) chunk compression ratio values from given other FileBatch."""
+        cmp_ratios = {c.hash: c.cmpratio for c in other.chunks if c.cmpratio is not None}
+        self.chunks = set((FileChunk(path=c.path, pos=c.pos, size=c.size, hash=c.hash, cmpratio=cmp_ratios.get(c.hash)) for c in self.chunks))
+
     def all_hashes(self) -> Set[HashType]:
         """Return set of unique hashes in the batch"""
         return set((c.hash for c in self.chunks))
@@ -187,7 +193,7 @@ class SyncBatch:
         return res
 
 
-def _hash_file(basedir: str, relpath: str, chunk_size: int, executor, progress_func: Callable) -> \
+def _hash_file(basedir: str, relpath: str, chunk_size: int, executor, progress_func: Callable, test_compress: bool) -> \
         Generator[Future, None, None]:
     """
     Split given file into chunks and return multithreading futures that hash them.
@@ -204,28 +210,33 @@ def _hash_file(basedir: str, relpath: str, chunk_size: int, executor, progress_f
     path = Path(basedir) / relpath
     files_size = path.stat().st_size
     if files_size == 0:
-        yield executor.submit(lambda: FileChunk(path=relpath, pos=0, size=0, hash=HashFunc().result()))
+        yield executor.submit(lambda: FileChunk(path=relpath, pos=0, size=0, hash=HashFunc().result(), cmpratio=1.0))
     else:
         with open(path, 'r+b') as f:
             mm = mmap.mmap(f.fileno(), 0)
             for pos in range(0, files_size, chunk_size):
                 def do_hash(p, s):
                     progress_func(relpath, s, p, files_size)
-                    return FileChunk(path=relpath, pos=p, size=s, hash=HashFunc().update(mm[p:(p+s)]).result())
+                    h = HashFunc().update(mm[p:(p+s)]).result()
+                    compress_ratio = 1.0 if not test_compress else \
+                        min(1.0, float("%.2g" % (len(lz4.frame.compress(mm[p:(p+s)])) / s)))
+                    return FileChunk(path=relpath, pos=p, size=s, hash=h, cmpratio=compress_ratio)
                 yield executor.submit(do_hash, pos, min(chunk_size, files_size - pos))
 
 
-async def scan_dir(basedir: str, chunk_size: int, old_batch: Optional[SyncBatch], progress_func: Callable) ->\
+async def scan_dir(basedir: str, chunk_size: int, old_batch: Optional[SyncBatch], progress_func: Callable, test_compress: bool) ->\
         Tuple[SyncBatch, Iterable[str]]:
     """
     Scan given directory and generate a list of FileChunks of its contents. If old_chunks is provided,
-    assumes contents haven't changed if mtime and size are identical.
+    assumes contents haven't changed if mtime and size are identical. Optionally tests how compressible chunks are.
 
     :param basedir: Folders to scan
     :param progress_func: Progress report callback - func(cur_filename, file_progress, total_progress)
     :param chunk_size: Length of chunk to split files into
     :param old_batch: If given, compares dir it and skips hashing files with identical size & mtime
-    :return: Tuple(New list of FileChunks or old_chunks if no changes are detected, List[errors])
+    :param test_compress: Test for compressibility while hashing
+    :return: Tuple(New list of FileChunks or old_chunks if no changes are detected, List[errors],
+                   Dict[<hash>: compress_ratio, ...])
     """
     errors = []
     fnames = []
@@ -276,7 +287,7 @@ async def scan_dir(basedir: str, chunk_size: int, old_batch: Optional[SyncBatch]
         futures = []
         for fn in files_needing_rehash:
             try:
-                futures.extend(_hash_file(basedir, fn, chunk_size, pool, file_progress))
+                futures.extend(_hash_file(basedir, fn, chunk_size, pool, file_progress, test_compress=test_compress))
             except (OSError, IOError) as e:
                 errors.append(f'[{fn}]: ' + str(e))
         for f in as_completed(futures):
@@ -311,21 +322,3 @@ async def scan_dir(basedir: str, chunk_size: int, old_batch: Optional[SyncBatch]
         assert '\\' not in x.path, f"Non-posix path: '{x.path}'"
 
     return res, errors
-
-
-# ----------------------------
-
-async def main():
-
-    def progress(cur_filename, file_progress, total_progress):
-        print(cur_filename, file_progress, total_progress)
-
-    src = await scan_dir('sync-source/', 100*1000*1000, old_batch=None, progress_func=progress)
-    trg = await scan_dir('sync-target/', 100*1000*1000, old_batch=None, progress_func=progress)
-    fdiff = trg.file_tree_diff(src)
-    print(fdiff)
-    cdiff = trg.chunk_diff(src)
-    print(cdiff)
-
-if __name__ == "__main__":
-    asyncio.run(main())
