@@ -83,6 +83,9 @@ Lanscatter is built on **Python 3.7** using **asyncio** (aiohttp & aiofiles),
 **wxPython** for cross-platform GUI, **Blake2b** algorithm for chunk hashing, **LZ4** for in-flight compression,
 **pytest** for unit / integration tests and **pyinstaller** for packaging / freezing into exe files.
 
+It runs on Python 3.8 as well, but wxPython and pyinstaller seem to have some compatiblity issues currently
+(_Jan 2020_), so you may run into trouble with GUI and freezing on 3.8+.
+
 ## Site-to-site distribution
 
 LANScatter peers and masters can be chained into a distribution tree.
