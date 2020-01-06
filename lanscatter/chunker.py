@@ -129,6 +129,7 @@ class SyncBatch:
             if path not in self.files:
                 self.files[path] = FileAttribs(path=path, size=0, mtime=int(time.time()), treehash=None)
             self.files[path].treehash = calc_tree_hash((c for c in self.chunks if c.path == path))
+            self.files[path].size = sum((c.size for c in self.chunks if c.path == path))
 
     def discard(self, paths: Iterable[str] = (), chunks: Iterable[FileChunk] = ()):
         """
