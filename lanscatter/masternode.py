@@ -2,7 +2,7 @@ from aiohttp import web, WSMsgType
 from pathlib import Path
 from typing import Callable, Optional, Awaitable, Dict
 from json.decoder import JSONDecodeError
-import asyncio, traceback, html
+import asyncio, traceback, html, time
 import concurrent.futures
 import packaging.version
 from types import SimpleNamespace
@@ -27,6 +27,8 @@ class MasterNode:
         self.seed_node = None
         self.status_func = status_func
         self.replan_trigger = asyncio.Event()
+        self.status_page_cache_html = None
+        self.status_page_cache_timestamp = time.time()
 
         async def __on_upload_finished():
             # Let planner know how many free upload slots masternode's file server has
@@ -199,28 +201,37 @@ class MasterNode:
             """
             # TODO: cache this for a second or few to reduce load with multiple users
             self.status_func(log_debug=f"[{request.remote}] GET {request.path_qs}")
-            colors = {1: 'black', 0.5: 'green', 0: 'lightgray'}
-            st = self.swarm.get_status_table()
-            th = '<th colspan="{colspan}" style="text-align: left;">{txt}</th>'
-            res = '<html><head><meta http-equiv="refresh" content="3"></head><body>'\
-                  f"<h1>Swarm status</h1><p>{str(datetime.now().isoformat(' ', 'seconds'))}</p>"
+            if not self.status_page_cache_html or time.time() > self.status_page_cache_timestamp + 3.0:
+                colors = {1: 'black', 0.5: 'green', 0: 'lightgray'}
+                time_str = str(datetime.now().isoformat(' ', 'seconds'))
+                st = self.swarm.get_status_table()
+                th = '<th colspan="{colspan}" style="text-align: left;">{txt}</th>'
+                res = '<html ><head><meta http-equiv="refresh" content="4"></head>'\
+                      '<body style="font-family: sans-serif;">'\
+                      f"<h1>{Defaults.APP_NAME} {Defaults.APP_VERSION} – swarm status</h1><p>{time_str}</p>"
 
-            if st['all_hashes']:
-                res += '<table style="white-space:nowrap;"><tr>' + th.format(txt='Node', colspan=1) + \
-                       th.format(txt='Hashes', colspan=len(st["all_hashes"])) +\
-                       th.format(txt='↓', colspan=1) + th.format(txt='↑', colspan=1) +\
-                       th.format(txt='⧖', colspan=1) + '</tr>\n'
-                for n in st['nodes']:
-                    res += f'<tr><td>{html.escape(n["name"])}</td>'
-                    res += ''.join(['<td style="padding: 1px; background: {color}">&nbsp;</td>'.format(
-                        color=colors[c]) for c in n['hashes']])
-                    res += ''.join(f'<td>{v}</td>' for v in (int(n['dls']), int(n['uls']), '%.1f s'%n['avg_ul_time']))
-                    res += "</tr>\n"
-                res += '</table><p>↓ = active downloads, ↑ = active uploads, ⧖ = average upload time</p>\n'
-            else:
-                res += "(No content. Probably still hashing. Try again later.)"
-            res += '</body></html>'
-            return web.Response(text=res, content_type='text/html')
+                if st['all_hashes']:
+                    style = 'transform: scale(0.8); white-space:nowrap; align: left;'
+                    res += f'<table style="{style}"><tr>' + th.format(txt='Node', colspan=1) + \
+                           th.format(txt='Chunks', colspan=len(st["all_hashes"])) +\
+                           th.format(txt='↓', colspan=1) + th.format(txt='↑', colspan=1) +\
+                           th.format(txt='⧖', colspan=1) + '</tr>\n'
+                    for n in st['nodes']:
+                        res += f'<tr><td>{html.escape(n["name"])}</td>'
+                        res += ''.join(['<td style="padding: 1px; background: {color}">&nbsp;</td>'.format(
+                            color=colors[c]) for c in n['hashes']])
+                        transfer_avg = ('%.1f s' % n['avg_ul_time']) if n['avg_ul_time']>=0 else '–'
+                        res += ''.join(f'<td>{v}</td>' for v in (int(n['dls']), int(n['uls']), transfer_avg))
+                        res += "</tr>\n"
+                    res += '</table><p>↓ = active downloads, ↑ = active uploads, ⧖ = average upload time</p>\n'
+                else:
+                    res += "(No data. Master is probably still hashing. Try again later.)"
+                res += '</body></html>'
+
+                self.status_page_cache_timestamp = time.time()
+                self.status_page_cache_html = res
+
+            return web.Response(text=self.status_page_cache_html, content_type='text/html')
 
 
         async def http_handler__start_websocket(request):
