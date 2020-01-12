@@ -73,18 +73,19 @@ class FileIO:
 
 
     async def upload_chunk(self, chunk: FileChunk, request: web.Request)\
-            -> Tuple[web.StreamResponse, Optional[float]]:
+            -> Tuple[web.StreamResponse, Optional[float], Optional[float]]:
         """
         Read given chunk from disk and stream out as a HTTP response.
 
         :param chunk: Chunk to read
         :param request: HTTP request to answer
         :param use_lz4: Compress with LZ4 if client accepts it
-        :return: Tuple(Aiohttp.response, float(seconds the upload took) or None if it no progress was made)
+        :return: Tuple(Aiohttp.response, float(seconds the upload took) or None if it no progress was made, compr_ratio)
         """
         use_lz4 = (chunk.cmpratio < 0.95) and ('lz4' in str(request.headers.get('Accept-Encoding')))
         response = None
         remaining = chunk.size
+        upload_size = 0
         start_t = time.time()
         try:
             async with self.open_and_seek(chunk.path, chunk.pos, for_write=False) as f:
@@ -114,7 +115,7 @@ class FileIO:
                             buff_in = None
 
                     async def write_http():
-                        nonlocal buff_out
+                        nonlocal buff_out, upload_size
                         if not buff_out:
                             buff_out = bytearray(Defaults.FILE_BUFFER_SIZE)
                         else:
@@ -123,6 +124,7 @@ class FileIO:
                                 limited_n = int(await self.ul_limiter.acquire(cnt, Defaults.NETWORK_BUFFER_MIN))
                                 raw = memoryview(buff_out)[i:(i + limited_n)]
                                 out = lz.compress(raw) if use_lz4 else raw
+                                upload_size += len(out)
                                 await response.write(out)
                                 # await response.write(buff_out[i:(i + limited_n)])
                                 self.dl_limiter.unspend(limited_n - len(out))
@@ -138,15 +140,15 @@ class FileIO:
                     if use_lz4:
                         await response.write(lz.flush())
                     await response.write_eof()
-                    return response, (time.time() - start_t)
+                    return response, (time.time() - start_t), (upload_size / (chunk.size or 1))
 
         except asyncio.CancelledError as e:
             # If client disconnected, predict how long upload would have taken
             try:
                 predicted_time = (time.time() - start_t) / (1-remaining/chunk.size)
-                return response, predicted_time
+                return response, predicted_time, None
             except ZeroDivisionError:
-                return response, None
+                return response, None, None
 
         except PermissionError as e:
             raise web.HTTPForbidden(reason=str(e))

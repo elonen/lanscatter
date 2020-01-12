@@ -20,7 +20,7 @@ random.seed()
 
 TEST_DIR = './temp_test_dir'
 TEST_FILES_PER_DIR = 3
-CHUNK_SIZE = 1000
+CHUNK_SIZE = 10000
 PORT_BASE = 53000 + int(2000*random.random())
 TEST_PEER_NAMES = {0: 'peer_empty', 1: 'peer_corrupt', 2: 'peer_non_empty'}
 
@@ -34,7 +34,7 @@ common.Defaults.NETWORK_BUFFER_MIN = int(CHUNK_SIZE * 0.1)
 def test_dir_factory(tmp_path):
 
     def create_file(p: Path, total_size: int, pattern=None):
-        pattern = bytearray(random.getrandbits(8) for _ in range(1234)) if pattern is None else pattern
+        pattern = bytearray(random.getrandbits(8) for _ in range(50)) if pattern is None else pattern
         sz = 0
         with p.open('wb') as f:
             while sz < total_size:
@@ -111,7 +111,7 @@ def _sync_proc(conn, is_master, argv):
         conn.send((e, traceback.format_exc()))
 
 
-def _spawn_sync_process(name: str, is_master: bool, sync_dir: str, port: int, master_addr: str):
+def _spawn_sync_process(name: str, is_master: bool, sync_dir: str, port: int, master_addr: str, extra_opts=()):
     print(f"Spawning process for {'master' if is_master else 'peer'} node '{name}' at port {port}...")
     out = io.StringIO()
     def comm_thread(conn):
@@ -123,8 +123,8 @@ def _spawn_sync_process(name: str, is_master: bool, sync_dir: str, port: int, ma
                 else:
                     out.write(str(o))
     conn_recv, conn_send = mp.Pipe(duplex=False)
-    argv = ['masternode', sync_dir, '--port', str(port), '--concurrent-transfers', '1'] if is_master else \
-           ['peernode', master_addr, sync_dir, '--port', str(port), '--rescan-interval', '3']
+    argv = ['MASTER', sync_dir, '-d', '--port', str(port), '-c', '1', *extra_opts] if is_master else \
+           ['PEER', master_addr, sync_dir, '-d', '--port', str(port), '--rescan-interval', '3', *extra_opts]
     proc = mp.Process(target=_sync_proc, name='sync-worker', args=(conn_send, is_master, argv))
     threading.Thread(target=comm_thread, args=(conn_recv,)).start()
     proc.start()
@@ -164,7 +164,7 @@ def _assert_identical_dir(p1, p2):
 
 def test_minimal_downloads(test_dir_factory):
     """Test that each chunk is downloaded only once."""
-    master = _spawn_sync_process(f'seed', True, test_dir_factory('seed'), PORT_BASE, '')
+    master = _spawn_sync_process(f'seed', True, test_dir_factory('seed'), PORT_BASE, '', ['--no-compress'])
     peer = _spawn_sync_process(f'leecher', False, test_dir_factory('leecher', keep_empty=True), PORT_BASE+1, f'localhost:{PORT_BASE}')
 
     _wait_seconds(4)
@@ -177,6 +177,8 @@ def test_minimal_downloads(test_dir_factory):
     downloaded_hashes = [l.split('/')[-1] for l in dl_lines]
     for h in downloaded_hashes:
         assert downloaded_hashes.count(h) == 1, f"Hash {h} was downloaded more than once."
+
+    assert ('Compression ratio: 0.' not in master.out.getvalue()), 'Got compression stats even with --no-compress'
 
     # Also check for basic conditions
     for p in (master, peer):
@@ -267,4 +269,6 @@ def test_swarm__corruption__bad_protocol__uptodate__errors(test_dir_factory):
         _print_process_stdout(p)
         _assert_node_basics(p)
         _assert_identical_dir(p, master)
+        if p is master:
+            assert ('Compression ratio: 0.' in p.out.getvalue()), 'No compression happened'
         print(f'Peer {p.name} test ok')

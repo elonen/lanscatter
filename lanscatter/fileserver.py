@@ -41,13 +41,17 @@ class FileServer:
             self.active_uploads += 1
             try:
                 self._status_func(log_info=f"[{request.remote}] GET {request.path_qs}")
+                if 'lz4' not in str(request.headers.get('Accept-Encoding')).lower():
+                    self._status_func(log_debug=f"[{request.remote}] no 'lz4' in 'Accept-Encoding'")
                 h = request.match_info.get('hash')
 
                 chunk = self.batch.first_chunk_with(chunk_hash=h)
                 if not chunk:
                     raise web.HTTPNotFound(reason=f'Chunk not on this host: {h}')
                 try:
-                    res, ul_time = await fileio.upload_chunk(chunk, request)
+                    res, ul_time, comp_ratio = await fileio.upload_chunk(chunk, request)
+                    if comp_ratio and comp_ratio < 1.0:
+                        self._status_func(log_debug=f"Compression ratio: {float('%.3g' % comp_ratio)} (for {request.path_qs})")
                     if ul_time:
                         self.upload_times.append(ul_time)
                 except Exception as e:
