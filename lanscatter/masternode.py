@@ -23,16 +23,18 @@ class MasterNode:
 
     def __init__(self, status_func: Callable, chunk_size: int):
         self.chunk_size = chunk_size
-        self.swarm = planner.SwarmCoordinator()
         self.seed_node = None
         self.status_func = status_func
         self.replan_trigger = asyncio.Event()
         self.status_page_cache_html = None
         self.status_page_cache_timestamp = time.time()
 
+        dummy_lm = planner.LinkMapper()
+        self.swarm = planner.SwarmCoordinator(link_mapper=dummy_lm)
+
         async def __on_upload_finished():
             # Let planner know how many free upload slots masternode's file server has
-            self.seed_node.set_active_transfers((), 0, self.file_server.active_uploads)
+            self.seed_node.set_active_transfers(downloads={}, n_uploads=self.file_server.active_uploads)
             self.seed_node.update_transfer_speed(self.file_server.upload_times)
             self.file_server.upload_times.clear()
 
@@ -57,7 +59,6 @@ class MasterNode:
             self.replan_trigger.set()
         else:
             self.status_func(log_info='No changes in sync dir.')
-
 
     def start_master_server(self, base_dir: str, port: int,
                             ul_limit: float, concurrent_uploads: int,
@@ -169,18 +170,30 @@ class MasterNode:
                 # Client reports current downloads, uploads and speed
                 # ---------------------------------------------------
                 elif action == 'report_transfers':
-                    dl_count, ul_count = msg.get('dls'), msg.get('uls')
-                    incoming = msg.get('incoming')
+                    dls, ul_count = msg.get('dls'), msg.get('ul_count')
                     upload_times = msg.get('ul_times')
-                    if None in (dl_count, ul_count, incoming, upload_times):
+
+                    if None in (dls, ul_count, upload_times):
                         return await error(f"Missing args.")
                     if not node:
                         return await error("Join the swarm first.")
 
-                    node.set_active_transfers(incoming, dl_count, ul_count)
+                    cur_downloads = {}
+                    for dl in dls:
+                        chunk_id, url, mbps_limit = dl.get('hash'), dl.get('url'), dl.get('mbps_limit')
+                        if not isinstance(dl, dict) or None in (chunk_id, url, mbps_limit):
+                            return await error(f"Malformed 'dl' entry")
+                        for n in self.swarm.nodes:
+                            if n.client.dl_url.replace('{hash}', '') in dl['url']:
+                                cur_downloads[(chunk_id, n)] = mbps_limit
+                                break
+                    if len(cur_downloads) != len(dls):
+                        self.status_func(log_error=f'PROTOCOL ERROR? Could not find from_nodes for all download URLS.')
+
+                    node.set_active_transfers(downloads=cur_downloads, n_uploads=ul_count)
                     node.update_transfer_speed(upload_times)
 
-                    if ul_count < node.max_concurrent_uls or dl_count < node.max_concurrent_dls:
+                    if ul_count < node.max_concurrent_uls or len(dls) < node.max_concurrent_dls:
                         self.replan_trigger.set()
 
                     await ok('Transfer status updated')
@@ -327,7 +340,7 @@ class MasterNode:
             self.replan_trigger.clear()
 
             # Track seed file server upload performance
-            self.seed_node.set_active_transfers((), 0, self.file_server.active_uploads)
+            self.seed_node.set_active_transfers(downloads={}, n_uploads=self.file_server.active_uploads)
             self.seed_node.update_transfer_speed(self.file_server.upload_times)
             self.file_server.upload_times.clear()
 
@@ -338,6 +351,7 @@ class MasterNode:
                     'action': 'download',
                     'hash': t.hash,
                     'timeout': t.timeout_secs,
+                    'max_rate': t.max_bandwidth,
                     'url': t.from_node.client.dl_url.format(hash=t.hash)})
 
 

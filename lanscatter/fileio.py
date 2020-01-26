@@ -186,15 +186,21 @@ class FileIO:
                 return False
 
 
-    async def download_chunk(self, chunk: FileChunk, url: str, http_session: ClientSession, file_size: int= -1) -> None:
+    async def download_chunk(self, chunk: FileChunk, url: str, http_session: ClientSession,
+                             file_size: int= -1, max_rate: float = float('inf')) -> None:
         """
         Download chunk from given URL and write directly into (the middle of a) file as specified by FileChunk.
         :param chunk: Specs for chunk to get
         :param url: URL to download from
         :param http_session: AioHTTP session to use for GET.
         :param file_size: Size of complete file (optional). File will be truncated to this size.
+        :param max_rate: Maximum download rate, mbit/s
         """
         with suppress(RuntimeError):  # Avoid dirty exit in aiofiles when Ctrl^C (RuntimeError('Event loop is closed')
+            LMIN, LMAX = Defaults.DOWNLOAD_BUFFER_MAX, Defaults.NETWORK_BUFFER_MIN
+            session_limiter = RateLimiter(max_rate * 1024 * 1024 / 8, period=1.0, burst_factor=2.0)
+            limiters = (self.dl_limiter, session_limiter)
+
             async with http_session.get(url, headers={'Accept-Encoding': 'lz4'}) as resp:
                 if resp.status != 200:  # some error
                     raise IOError(f'HTTP status {resp.status}')
@@ -207,10 +213,10 @@ class FileIO:
 
                             async def read_http():
                                 nonlocal buff_in
-                                limited_n = int(await self.dl_limiter.acquire(
-                                    Defaults.DOWNLOAD_BUFFER_MAX, Defaults.NETWORK_BUFFER_MIN))
+                                limited_n = min([int(await lmt.acquire(LMIN, LMAX)) for lmt in limiters])
                                 buff_in = await resp.content.read(limited_n)
-                                self.dl_limiter.unspend(limited_n - len(buff_in))
+                                for lmt in limiters:
+                                    lmt.unspend(limited_n - len(buff_in))
                                 buff_in = buff_in if buff_in else None
 
                             async def write_and_csum():

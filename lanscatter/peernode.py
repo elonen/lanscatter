@@ -37,7 +37,7 @@ class PeerNode:
 
         self.local_batch = SyncBatch()
         self.remote_batch = SyncBatch()
-        self.incoming = set()
+        self.active_downloads: Dict[str, Tuple[str, float]] = {}  # chunk_id -> (url, max_rate)
         self.joined_swarm = False
 
         async def __on_upload_finished():
@@ -52,9 +52,10 @@ class PeerNode:
         """
         await self.server_send_queue.put({
             'action': 'report_transfers',
-            'dls': len(self.incoming),
-            'uls': self.fileserver.active_uploads,
-            'incoming': list(self.incoming),
+            'dls': [{'hash': chunk, 'url': url, 'mbps_limit': max_rate} for
+                    chunk, (url, max_rate) in self.active_downloads.items()],
+            'ul_count': self.fileserver.active_uploads,
+            'incoming': list(self.active_downloads.keys()),
             'ul_times': list(self.fileserver.upload_times)
         })
         self.fileserver.upload_times.clear()
@@ -169,7 +170,7 @@ class PeerNode:
             self.status_func(log_info="Some files disappeared while doing local_file_fixups. Rescanning.")
             self.full_rescan_trigger.set()
 
-    async def download_task(self, chunk_hash, url, http_session, timeout):
+    async def download_task(self, chunk_hash, url, http_session, timeout, max_rate):
         """
         Async task to download chunk with given hash from given URL and writing it to relevant files.
         """
@@ -177,24 +178,25 @@ class PeerNode:
             self.status_func(log_info=f"Aborting download of {chunk_hash}; already got it.")
             return
 
-        if chunk_hash in self.incoming:
-            self.status_func(log_info=f"Aborting download of {chunk_hash}; hash already in 'incoming'.")
+        if chunk_hash in self.active_downloads:
+            self.status_func(log_info=f"Aborting download of {chunk_hash}; already in active downloads.")
             return
 
+        max_rate = max_rate or float('inf')
         target = self.remote_batch.first_chunk_with(chunk_hash)
         if not target:
             raise IOError(f'Bad download command from master, or old filelist? Chunk {chunk_hash} is unknown.')
         dl_task = None
         try:
-            self.incoming.add(chunk_hash)
+            self.active_downloads[chunk_hash] = (url, max_rate)
             await self.send_transfer_report()
-            self.status_func(log_info=f'Downloading from: {url}')
+            self.status_func(log_info=f'Downloading from: {url} (lim: {int(max_rate*8/1024/1024+0.5)} Mbps)')
             self.status_func(cur_status=f'Downloading chunks...',
                              progress=len(self.local_batch.all_hashes()) / len(self.remote_batch.all_hashes()))
 
             async with async_timeout.timeout(timeout):
                 dl_task = asyncio.create_task(
-                    self.file_io.download_chunk(chunk=target, url=url, http_session=http_session,
+                    self.file_io.download_chunk(chunk=target, url=url, http_session=http_session, max_rate=max_rate,
                                                 file_size=self.remote_batch.files[target.path].size))
                 await asyncio.wait([dl_task, asyncio.create_task(self.exit_trigger.wait())],
                                    return_when=asyncio.FIRST_COMPLETED)
@@ -229,7 +231,7 @@ class PeerNode:
         finally:
             if dl_task:
                 dl_task.cancel()
-            self.incoming.discard(chunk_hash)
+            self.active_downloads.pop(chunk_hash)
             await self.send_transfer_report()
 
 
@@ -245,10 +247,11 @@ class PeerNode:
             action = msg.get('action')
 
             if action == 'download':
-                chunk_hash, url, timeout = msg.get('hash'), msg.get('url'), msg.get('timeout')
-                if None in (chunk_hash, url, timeout):
+                chunk_id, url, timeout, rate = msg.get('hash'), msg.get('url'), msg.get('timeout'), msg.get('max_rate')
+                if None in (chunk_id, url, timeout, rate):
                     return await error('Bad download command from server')
-                asyncio.create_task(self.download_task(chunk_hash, url, http_session, timeout))
+                rate = min(rate, self.file_io.dl_limiter.permits_per_sec)
+                asyncio.create_task(self.download_task(chunk_id, url, http_session, timeout, rate))
 
             elif action == 'rehash':
                 self.status_func(log_info=f'Server requested rescan: "{msg.get("message")}"')

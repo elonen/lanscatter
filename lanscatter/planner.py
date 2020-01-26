@@ -33,7 +33,7 @@ class Node(ABC):
     hashes: Set[ChunkId]            # Set of hashes the node has
     max_concurrent_dls: int         # How many concurrent downloads the node allows
     max_concurrent_uls: int         # --||-- uploads --||--
-    active_downloads: Set[Tuple[ChunkId, 'Node']]           # Bandwidth for currently ongoing downloads
+    active_downloads: Dict[Tuple[ChunkId, 'Node'], float]           # Bandwidth for currently ongoing downloads
     n_active_uploads: int           # Number of current uploads
     incoming: Set[ChunkId]          # Which hashed blobs the node is currently downloading (or rescanning)
     avg_ul_time: Optional[float]    # (Rolling) average time it has taken for the node upload one chunk
@@ -59,18 +59,18 @@ class Node(ABC):
         self.hashes.update(new_hashes)
         return ()
 
-    def set_active_transfers(self, incoming: Iterable[ChunkId], n_uploads: int,
+    def set_active_transfers(self, n_uploads: int,
                              downloads: Dict[Tuple[ChunkId, 'Node'], float]) -> None:
         """Set currently ongoing transfers on the node
         :param downloads: Currently ongoing downloads (ChunkId, from_node) -> bandwidth_limit
         :param incoming: List of new hashes the node is about to get (i.e. is downloading / rehashing)
         :param n_uploads: Number of currently active uploads
         """
-        self.incoming = set(incoming)
+        self.incoming = set([d[0] for d in downloads.keys()])
         self.n_active_uploads = n_uploads
-        self.active_downloads = set(downloads.keys())
+        self.active_downloads = downloads.copy()
         # TODO: remove this test
-        for k in self.active_downloads:
+        for k, v in self.active_downloads.items():
             assert len(k) == 2 and isinstance(k[0], ChunkId) and isinstance(k[1], Node)
 
     def update_transfer_speed(self, upload_times: Iterable[float]) -> None:
@@ -105,20 +105,18 @@ class Transfer:
         return 'Transfer'+str(self.__dict__)
 
 
-class LinkMapper(ABC):
-    @abstractmethod
+class LinkMapper:
     def links_between(self, from_node: Node, to_node: Node) -> Iterable[Hashable]:
         """
         :return: Links between path: from_node -> to_node.
         """
-        return tuple()
+        return tuple()  # dummy impl; no links
 
-    @abstractmethod
     def link_bandwidth(self, link: Hashable) -> float:
         """
         :return: Total bandwidth of given link.
         """
-        return float('inf')
+        return float('inf')    # dummy impl; infinite bandwidth
 
 
 class SwarmCoordinator(object):
@@ -132,9 +130,7 @@ class SwarmCoordinator(object):
         self.nodes: List[Node] = []
         self.all_done = False  # optimization, turns True when everyone's gat everything
         self.link_mapper = link_mapper
-
-        self.transfers_per_link: DefaultDict[Hashable, Set[Transfer]] = defaultdict(set)
-        self.active_transfers: Dict[Tuple[ChunkId, Node, Node], Transfer] = {}  # (hash, from_node, to_node) -> Transfer
+        self.current_rate_per_link: DefaultDict[Hashable, float] = defaultdict(float)
 
     def reset_hashes(self, new_hashes: Iterable[ChunkId]):
         new_hashes = set(new_hashes)
@@ -164,7 +160,7 @@ class SwarmCoordinator(object):
                 self.hashes = set()
                 self.max_concurrent_dls = concurrent_dls
                 self.max_concurrent_uls = concurrent_uls
-                self.active_downloads = set()
+                self.active_downloads = {}
                 self.n_active_uploads = 0
                 self.incoming = set()
                 self.avg_ul_time = None
@@ -175,8 +171,6 @@ class SwarmCoordinator(object):
             def destroy(self) -> None:
                 """Remove node from the swarm"""
                 swarm.nodes = [n for n in swarm.nodes if n != self]
-                swarm.active_transfers = {k: v for k, v in swarm.active_transfers.items() if
-                                          self not in (v.from_node, v.to_node)}
 
             def add_hashes(self, new_hashes: Iterable[ChunkId], clear_first=False) -> Iterable[ChunkId]:
                 new_hashes = set(new_hashes)
@@ -190,30 +184,6 @@ class SwarmCoordinator(object):
                 if len(self.hashes) == len(swarm.all_hashes):
                     swarm.all_done = all(len(n.hashes) == len(swarm.all_hashes) for n in swarm.nodes)
                 return unknown
-
-            def set_active_transfers(self, incoming: Iterable[ChunkId], n_uploads: int,
-                                     downloads: Dict[Tuple[ChunkId, 'Node'], float]) -> None:
-                # Ended transfers
-                for chunk, from_node in (self.active_downloads - set(downloads.keys())):
-                    t = swarm.active_transfers.pop((chunk, from_node, self), None)
-                    for l in (t.links if t else tuple()):
-                        swarm.transfers_per_link.get(l).discard(t)
-                    # TODO: remove this:
-                    if t is not None:
-                        for s in swarm.transfers_per_link.values():
-                            assert all([t != v for v in s])
-
-                # New transfers
-                for chunk, from_node in (set(downloads.keys()) - self.active_downloads):
-                    bw = downloads[(chunk, from_node)]
-                    links = tuple(swarm.link_mapper.links_between(from_node, self)) if swarm.link_mapper else tuple()
-                    t = Transfer(to_node=self, from_node=from_node, chunk_hash=chunk,
-                                 timeout=float('nan'), max_bandwidth=bw, links=links)
-                    swarm.active_transfers[(chunk, from_node, self)] = t
-                    for l in links:
-                        swarm.transfers_per_link[l].add(t)
-
-                super().set_active_transfers(incoming, n_uploads, downloads)
 
         n = _NodeImpl()
         self.nodes.append(n)
@@ -229,6 +199,14 @@ class SwarmCoordinator(object):
         # Timeout P2P downloads quickly at first, then use actual statistics as we get
         ul_times = [float(n.avg_ul_time or 0) for n in self.nodes if n.avg_ul_time]
         median_time = statistics.median(ul_times) if ul_times else 1
+
+        # Recalculate current network link utilization
+        self.current_rate_per_link = defaultdict(float)
+        for n in self.nodes:
+            for tr, bw in n.active_downloads.items():
+                links = self.link_mapper.links_between(from_node=tr[1], to_node=n)
+                for lnk in links:
+                    self.current_rate_per_link[lnk] += bw
 
         def uploader_weight(n):
             # Favor fast non-master nodes with few hashes
@@ -247,35 +225,36 @@ class SwarmCoordinator(object):
         free_uploaders = [n for n in free_uploaders if n.is_master or
                           not n.avg_ul_time or random.random() < (median_time/n.avg_ul_time)]
 
-        SINGLE_TRANSFER_MAX_UTILIZATION = 0.5
-        def links_and_bw(from_node, to_node) -> Tuple[Iterable[Hashable], float, float]:
-            links = self.link_mapper.links_between(from_node=from_node, to_node=to_node) if self.link_mapper else []
-            max_bw = float('inf')
+        SINGLE_TRANSFER_MAX_UTILIZATION = 0.75
+
+        def calc_links_and_bw(from_node, to_node) -> Tuple[Iterable[Hashable], float, float]:
+            links = self.link_mapper.links_between(from_node=from_node, to_node=to_node)
+            allowed_bw = float('inf')
             theoretical_max = float('inf')
-            for lnk in links:
-                link_max = self.link_mapper.link_bandwidth(lnk)
+            for l in links:
+                link_max = self.link_mapper.link_bandwidth(l)
                 theoretical_max = min(theoretical_max, link_max)
-                link_used = sum((t.max_bandwidth for t in self.transfers_per_link[lnk]))
-                max_bw = max(0, min(max_bw, (link_max - link_used) * SINGLE_TRANSFER_MAX_UTILIZATION))
-            return links, max_bw, theoretical_max
+                link_used = self.current_rate_per_link[l]
+                allowed_bw = max(0.0, min(allowed_bw, (link_max - link_used) * SINGLE_TRANSFER_MAX_UTILIZATION))
+            return links, allowed_bw, theoretical_max
 
         # Match uploaders and downloaders to transfer rarest hashes first:
         proposed_transfers = []
         for ul in free_uploaders:
             for __ in range(ul.max_concurrent_uls - ul.n_active_uploads):
-                for dl in sorted(free_downloaders, key=lambda n: links_and_bw(ul, n)[1], reverse=True):
+                for dl in sorted(free_downloaders, key=lambda n: calc_links_and_bw(ul, n)[1], reverse=True):
                     if len(dl.active_downloads) < dl.max_concurrent_dls:  # need to recheck every iteration
                         new_hashes = ul.hashes - dl.hashes - dl.incoming
                         if new_hashes:
-                            links, max_bw, theoretical_max = links_and_bw(ul, dl)
-                            if max_bw < theoretical_max * 0.1:
+                            links, allowed_bw, theoretical_max = calc_links_and_bw(ul, dl)
+                            if allowed_bw < theoretical_max * 0.1:
                                 continue
 
                             # Pick the rarest hash first for best distribution
                             h = min(new_hashes, key=lambda c: self.hash_popularity[c])
                             timeout = median_time*8 if (not ul.is_master) else 9999999
                             t = Transfer(from_node=ul, to_node=dl, chunk_hash=h, timeout=timeout,
-                                         max_bandwidth=max_bw, links=links)
+                                         max_bandwidth=allowed_bw, links=links)
                             proposed_transfers.append(t)
 
                             # To prevent overbooking and to help picking different hashes, assume transfer will succeed
@@ -285,12 +264,11 @@ class SwarmCoordinator(object):
                             # (on_node_report_transfers()) but we'll assume the transfers start ok, to aid planning:
                             assert(h not in dl.incoming)
                             dl.incoming.add(h)
-                            dl.active_downloads.add((t.hash, t.from_node))
+                            dl.active_downloads[(t.hash, t.from_node)] = t.max_bandwidth
 
                             ul.n_active_uploads += 1
-                            self.active_transfers[(t.hash, t.from_node, t.to_node)] = t
                             for lnk in links:
-                                self.transfers_per_link[lnk].add(t)
+                                self.current_rate_per_link[lnk] += allowed_bw
                             break
 
         assert (all(t.to_node != t.from_node for t in proposed_transfers))
@@ -308,7 +286,7 @@ class SwarmCoordinator(object):
                 'hashes': [(1 if c in n.hashes else (0.5 if c in n.incoming else 0)) for c in hashes],
                 'avg_ul_time': n.avg_ul_time or -1
             })
-        return {'all_hashes': hashes, 'nodes': nodes, 'links': self.transfers_per_link, 'all_done': self.all_done}
+        return {'all_hashes': hashes, 'nodes': nodes, 'all_done': self.all_done}
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -337,25 +315,32 @@ def simulate() -> None:
     SLOWDOWN_FACTOR = 100  # transfer time multiplier for "very slow" nodes
 
 
+
     class SimulatedLinkMapper(LinkMapper):
         """
         Simulated bridge mesh. Odd nodes belong to bridge 0,
         even to switch 1 and a trunk links the two bridge.
         """
+        def __init__(self):
+            self.all_links_bw = {}
+
         def links_between(self, from_node: Node, to_node: Node) -> Iterable[Hashable]:
             from_grp = int(from_node.name[1:]) % 2
             to_grp = int(to_node.name[1:]) % 2
             links = [f'{from_node.name}_BR{from_grp}']
             if from_grp != to_grp:
-                links.append('trunk')
+                links.append('trunk_BR0-BR1')
             links.append(f'{to_node.name}_BR{to_grp}')
             return links
 
         def link_bandwidth(self, link: Hashable) -> float:
-            return 4000 if ('trunk' in link) else 1000
+            res = 2000 if ('trunk' in link) else 1000
+            self.all_links_bw[link] = res
+            return res
 
 
-    swarm = SwarmCoordinator(link_mapper=SimulatedLinkMapper())
+    link_mapper = SimulatedLinkMapper()
+    swarm = SwarmCoordinator(link_mapper=link_mapper)
     swarm.reset_hashes((str(i) for i in range(N_HASHES)))
 
     plan_now_trigger = asyncio.Event()  # asyncio event to wake planner
@@ -384,13 +369,12 @@ def simulate() -> None:
     def report_transfers(node):
         dls = {(t.hash, t.from_node): t.max_bandwidth for t in node.client.simu_tfers if t.to_node is node}
         uls = [t for t in node.client.simu_tfers if t.from_node is node]
-        incoming = [t[0] for t in dls.keys()]
-        node.set_active_transfers(incoming, len(uls), dls)
+        node.set_active_transfers(len(uls), dls)
 
     async def simulate_transfer(t: Transfer):
-        rnd_time = random.uniform(TRANSFER_TIME_MIN, TRANSFER_TIME_MAX) * t.from_node.client.simu_speed_fact
-        if t.max_bandwidth < float('inf'):
-            rnd_time /= ((t.max_bandwidth/1000) or 1)
+        data_remaining = 1.0
+        base_rate = data_remaining / (random.uniform(TRANSFER_TIME_MIN, TRANSFER_TIME_MAX) * t.from_node.client.simu_speed_fact)
+        elapsed_time = 0
         try:
             if random.random() < ERROR_PROBABILITY/2: return  # simulate initialization failure sometimes
             # Mark transfer as ongoing
@@ -399,21 +383,29 @@ def simulate() -> None:
                 report_transfers(n)
 
             # Wait = simulate transfer
-            if rnd_time < t.timeout_secs:
-                await asyncio.sleep(rnd_time)
-            else:
-                await asyncio.sleep(t.timeout_secs)
-                print(f"Slow download. Giving up. (from {t.from_node.name})")
-                return
+            transfer_start = time.time()
+            sleep_start = time.time()
+            while data_remaining > 0:
+                if time.time() - transfer_start >  t.timeout_secs:
+                    print(f"Slow download. Giving up. (from {t.from_node.name})")
+                    return
+                rate = base_rate * ((min(t.max_bandwidth, 1000) / 1000) or 0.000001)
+                await asyncio.sleep(TRANSFER_TIME_MIN * 0.1)
+                sleep_end = time.time()
+                slept = sleep_end - sleep_start
+                if slept > 0:
+                    elapsed_time += slept
+                    data_remaining -= rate * slept
+                    sleep_start = sleep_end
 
-            if random.random() < ERROR_PROBABILITY / 2: return  # simulate transfer failure sometimes
+            if random.random() < ERROR_PROBABILITY / 2: return  # simulate transfer errors sometimes
 
             # Mark hash as received
             unk = t.to_node.add_hashes([t.hash])
             assert(not unk)
         finally:
-            if rnd_time is not None:
-                t.from_node.update_transfer_speed([rnd_time])
+            if data_remaining < 1.0:
+                t.from_node.update_transfer_speed([elapsed_time / (1.0-data_remaining)])
             # Cleanup
             for n in (t.to_node, t.from_node):
                 n.client.simu_tfers.discard(t)
@@ -444,6 +436,7 @@ def simulate() -> None:
         nonlocal plan_now_trigger
         plan_now_trigger = asyncio.Event()
         plan_now_trigger.set()
+        network_utilizations = []
 
         def print_status():
             print("")
@@ -452,20 +445,23 @@ def simulate() -> None:
                 uls = [t for t in n.client.simu_tfers if t.from_node == n]
                 print(n.name, ''.join(('#' if c in n.hashes else '.') for c in seeder.hashes), len(dls),
                       len(uls), '  %.1f' % (n.avg_ul_time or -1))
-            for lnk, trns in swarm.transfers_per_link.items():
-                bw = sum(t.max_bandwidth for t in trns)
-                if bw:
-                    print(lnk, swarm.link_mapper.link_bandwidth(lnk), int(bw))
 
-        start_t = time.time()
+            # Calculate efficiency
+            total_bw = sum(link_mapper.all_links_bw.values()) or 1
+            allocated_bw = sum(swarm.current_rate_per_link.values())
+            network_utilizations.append(allocated_bw / total_bw * 100)
+            print("Network utilization = %.1f%%" % network_utilizations[-1])
+            print("Used bandwidth per link:", ", ".join([str(f'({lnk} {int(bw_use)})') for lnk, bw_use in sorted(swarm.current_rate_per_link.items()) if bw_use>0]))
+
         asyncio.create_task(planner_loop())
         while not swarm.all_done:
             print_status()
             await asyncio.sleep(0.5)
         print_status()
 
-        best_t = (TRANSFER_TIME_MIN+TRANSFER_TIME_MAX)/2 * N_HASHES / min(SEEDER_UL_SLOTS, NODE_UL_SLOT)
-        print("ALL DONE. Efficiency vs. ideal multicast = %.1f%%" % (best_t / (time.time() - start_t) * 100))
+        import statistics
+        print("ALL DONE. Median network utilization = %.1f%% (max: %.1f%%)" %
+              (statistics.median(network_utilizations), max(network_utilizations)))
 
     asyncio.run(runner())
 
