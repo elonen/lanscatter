@@ -199,7 +199,6 @@ class MasterNode:
             """
             Show a HTML formatted status report.
             """
-            # TODO: cache this for a second or few to reduce load with multiple users
             self.status_func(log_debug=f"[{request.remote}] GET {request.path_qs}")
             if not self.status_page_cache_html or time.time() > self.status_page_cache_timestamp + 3.0:
                 colors = {1: 'black', 0.5: 'green', 0: 'lightgray'}
