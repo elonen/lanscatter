@@ -6,6 +6,7 @@ import mmap
 from concurrent.futures import ThreadPoolExecutor, Future, as_completed, CancelledError
 from pathlib import Path, PurePosixPath
 import lz4.frame
+from .common import Defaults
 
 # Tools for scanning files in a directory and splitting them into hashed chunks.
 # MasterNode and PeerNode both use this for maintaining and syncing their state.
@@ -213,16 +214,23 @@ def _hash_file(basedir: str, relpath: str, chunk_size: int, executor, progress_f
     if files_size == 0:
         yield executor.submit(lambda: FileChunk(path=relpath, pos=0, size=0, hash=HashFunc().result(), cmpratio=1.0))
     else:
+        def do_hash(mm, p, s):
+            progress_func(relpath, s, p, files_size)
+            i, h = p, HashFunc()
+            with lz4.frame.LZ4FrameCompressor() as lz:
+                compressed_size = len(lz.begin())
+                while i < p+s:
+                    end = min(i+Defaults.FILE_BUFFER_SIZE, p+s)
+                    h.update(mm[i:end])
+                    compressed_size += len(lz.compress(mm[i:end])) if test_compress else 0
+                    i = end
+            compress_ratio = 1.0 if not test_compress else min(1.0, float("%.2g" % (compressed_size / s)))
+            return FileChunk(path=relpath, pos=p, size=s, hash=h.result(), cmpratio=compress_ratio)
+
         with open(path, 'r+b') as f:
             mm = mmap.mmap(f.fileno(), 0)
             for pos in range(0, files_size, chunk_size):
-                def do_hash(p, s):
-                    progress_func(relpath, s, p, files_size)
-                    h = HashFunc().update(mm[p:(p+s)]).result()
-                    compress_ratio = 1.0 if not test_compress else \
-                        min(1.0, float("%.2g" % (len(lz4.frame.compress(mm[p:(p+s)])) / s)))
-                    return FileChunk(path=relpath, pos=p, size=s, hash=h, cmpratio=compress_ratio)
-                yield executor.submit(do_hash, pos, min(chunk_size, files_size - pos))
+                yield executor.submit(do_hash, mm, pos, min(chunk_size, files_size - pos))
 
 
 async def scan_dir(basedir: str, chunk_size: int, old_batch: Optional[SyncBatch], progress_func: Callable, test_compress: bool) ->\
