@@ -355,7 +355,7 @@ class PeerNode:
         self.status_func(log_info=f'Server connection loop exiting.')
 
 
-    async def file_rescan_loop(self, concurrent_transfer_limit: int):
+    async def file_rescan_loop(self, concurrent_transfer_limit: int, executor):
         self.status_func(log_info=f'File scanner loop starting.')
 
         def __hash_dir_progress_func(cur_filename, file_progress, total_progress):
@@ -379,7 +379,8 @@ class PeerNode:
                     self.status_func(log_debug='Rescanning local files.')
                     new_local_batch, errors = await scan_dir(
                         str(self.file_io.basedir), chunk_size=self.remote_batch.chunk_size,
-                        old_batch=self.local_batch, progress_func=__hash_dir_progress_func, test_compress=False)
+                        old_batch=self.local_batch, progress_func=__hash_dir_progress_func, test_compress=False,
+                        executor=executor)
                     for i,e in enumerate(errors):
                         self.status_func(log_error=f'- Dir scan error #{i}: {e}')
                     self.status_func(log_debug='Rescan finished.')
@@ -411,12 +412,14 @@ class PeerNode:
                     timeout=4, return_when=asyncio.FIRST_COMPLETED)
 
 
-    async def run(self, port: int, server_url: str, concurrent_transfer_limit: int):
+    async def run(self, port: int, server_url: str, concurrent_transfer_limit: int, max_workers: int):
         """Run all async loops."""
 
         # Mute asyncio task exceptions on KeyboardInterrupt / thread CancelledError
         loop = asyncio.get_event_loop()
         loop.set_exception_handler(lambda l, c: loop.default_exception_handler(c) if not self.exit_trigger.is_set() else None)
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+        loop.set_default_executor(executor)
 
         def sig_exit():
             self.exit_trigger.set()
@@ -429,7 +432,7 @@ class PeerNode:
 
             await self.fileserver.create_http_server(port=port, fileio=self.file_io)
             await asyncio.wait([
-                self.file_rescan_loop(concurrent_transfer_limit),
+                self.file_rescan_loop(concurrent_transfer_limit, executor),
                 self.server_connection_loop(server_url),
                 self.exit_trigger.wait()
             ], return_when=asyncio.FIRST_COMPLETED)
@@ -448,10 +451,11 @@ async def run_file_client(base_dir: str, server_url: str, status_func=None,
                           rescan_interval: float = Defaults.DIR_SCAN_INTERVAL_MASTER,
                           dl_limit: float = Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC,
                           ul_limit: float = Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC,
+                          max_workers: int = Defaults.MAX_WORKERS,
                           concurrent_transfer_limit: int = Defaults.CONCURRENT_TRANSFERS_PEER):
     pn = PeerNode(basedir=base_dir, status_func=status_func, file_rescan_interval=rescan_interval,
                   dl_limit=dl_limit, ul_limit=ul_limit)
-    await pn.run(port, server_url, concurrent_transfer_limit)
+    await pn.run(port, server_url, concurrent_transfer_limit, max_workers)
 
 
 def main():
@@ -461,6 +465,7 @@ def main():
         asyncio.run(run_file_client(base_dir=args.dir, server_url=f'ws://{args.server}/join', port=args.port,
                                     rescan_interval=args.rescan_interval,
                                     dl_limit=args.dl_limit, ul_limit=args.ul_limit, concurrent_transfer_limit=args.ct,
+                                    max_workers=args.max_workers,
                                     status_func=status_func))
 
 

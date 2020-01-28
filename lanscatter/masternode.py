@@ -350,11 +350,14 @@ async def run_master_server(base_dir: str,
                             ul_limit: float = Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC,
                             concurrent_uploads: int = Defaults.CONCURRENT_TRANSFERS_MASTER,
                             chunk_size=Defaults.CHUNK_SIZE, disable_lz4=False,
+                            max_workers=Defaults.MAX_WORKERS,
                             https_cert=None, https_key=None):
 
     # Mute asyncio task exceptions on KeyboardInterrupt / thread CancelledError
     kb_exit, loop = False, asyncio.get_event_loop()
     loop.set_exception_handler(lambda l, c: loop.default_exception_handler(c) if not kb_exit else None)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+    loop.set_default_executor(executor)
 
     server = MasterNode(status_func=status_func, chunk_size=chunk_size)
 
@@ -366,7 +369,8 @@ async def run_master_server(base_dir: str,
         while True:
             # TODO: integrate with inotify (watchdog package) to avoid frequent rescans
             new_batch, errors = await scan_dir(base_dir, chunk_size=chunk_size, old_batch=server.file_server.batch,
-                                               progress_func=progress_func_adapter, test_compress=(not disable_lz4))
+                                               progress_func=progress_func_adapter, test_compress=(not disable_lz4),
+                                               executor=executor)
             for i, e in enumerate(errors):
                 status_func(log_error=f'- Dir scan error #{i}: {e}')
             if new_batch != server.file_server.batch:
@@ -397,7 +401,7 @@ def main():
         asyncio.run(run_master_server(
             base_dir=args.dir, port=args.port, ul_limit=args.ul_limit, concurrent_uploads=args.ct,
             dir_scan_interval=args.rescan_interval,  # https_cert=args.sslcert, https_key=args.sslkey,
-            disable_lz4=args.no_compress,
+            disable_lz4=args.no_compress, max_workers=args.max_workers,
             chunk_size=args.chunksize, status_func=status_func))
 
 

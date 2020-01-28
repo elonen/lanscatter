@@ -21,6 +21,8 @@ class Defaults:
     CONCURRENT_TRANSFERS_PEER = 2
     DIR_SCAN_INTERVAL_PEER = 60
 
+    MAX_WORKERS = 8
+
     APP_VERSION = '0.1.2'
     PROTOCOL_VERSION = '2.0.0'
 
@@ -72,6 +74,10 @@ def parse_cli_args(is_master: bool):
         parser.add_argument('--sslcert', type=str, default=None, help='SSL certificate file for HTTPS (optional)')
         parser.add_argument('--sslkey', type=str, default=None, help='SSL key file for HTTPS (optional)')
         '''
+
+    parser.add_argument('-w', '--max-workers', dest='max_workers', type=int,
+                        default=Defaults.MAX_WORKERS, help='Max thread workers to allocate.')
+
 
     parser.add_argument('--json', dest='json', action='store_true', default=False, help='Show status as JSON (for GUI usage)')
     parser.add_argument('-d', '--debug', dest='debug', action='store_true', default=False,

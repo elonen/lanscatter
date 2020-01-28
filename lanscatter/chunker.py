@@ -233,7 +233,8 @@ def _hash_file(basedir: str, relpath: str, chunk_size: int, executor, progress_f
                 yield executor.submit(do_hash, mm, pos, min(chunk_size, files_size - pos))
 
 
-async def scan_dir(basedir: str, chunk_size: int, old_batch: Optional[SyncBatch], progress_func: Callable, test_compress: bool) ->\
+async def scan_dir(basedir: str, chunk_size: int, old_batch: Optional[SyncBatch],
+                   progress_func: Callable, test_compress: bool, executor: ThreadPoolExecutor) ->\
         Tuple[SyncBatch, Iterable[str]]:
     """
     Scan given directory and generate a list of FileChunks of its contents. If old_chunks is provided,
@@ -244,6 +245,7 @@ async def scan_dir(basedir: str, chunk_size: int, old_batch: Optional[SyncBatch]
     :param chunk_size: Length of chunk to split files into
     :param old_batch: If given, compares dir it and skips hashing files with identical size & mtime
     :param test_compress: Test for compressibility while hashing
+    :param executor: ThreadPoolExecutor to use for hashing
     :return: Tuple(New list of FileChunks or old_chunks if no changes are detected, List[errors],
                    Dict[<hash>: compress_ratio, ...])
     """
@@ -292,18 +294,17 @@ async def scan_dir(basedir: str, chunk_size: int, old_batch: Optional[SyncBatch]
         total_remaining -= res_files[-1].size
 
     # Hash file contents in multiple threads
-    with ThreadPoolExecutor() as pool:
-        futures = []
-        for fn in files_needing_rehash:
-            try:
-                futures.extend(_hash_file(basedir, fn, chunk_size, pool, file_progress, test_compress=test_compress))
-            except (OSError, IOError) as e:
-                errors.append(f'[{fn}]: ' + str(e))
-        for f in as_completed(futures):
-            try:
-                res_chunks.append(f.result())
-            except (OSError, IOError) as e:
-                errors.append(str(e))
+    futures = []
+    for fn in files_needing_rehash:
+        try:
+            futures.extend(_hash_file(basedir, fn, chunk_size, executor, file_progress, test_compress=test_compress))
+        except (OSError, IOError) as e:
+            errors.append(f'[{fn}]: ' + str(e))
+    for f in as_completed(futures):
+        try:
+            res_chunks.append(f.result())
+        except (OSError, IOError) as e:
+            errors.append(str(e))
 
     # Read file attributes and calculate tree hashes
     for fn in files_needing_rehash:
