@@ -20,8 +20,11 @@ class RateLimiter(object):
         :param period: Permit generation period
         :param burst_factor: Allow bursts of max 'burst_factor' x 'rate_limit'.
         """
-        assert(period > 0)
+        assert(period >= 0)
         assert(rate_limit >= 0)
+        if period == 0:
+            rate_limit = float('inf')
+            period = 1
 
         self.permits_per_sec = rate_limit / period
         self.period = period
@@ -47,11 +50,13 @@ class RateLimiter(object):
         :param n_min: Don't return until at least this many permits become available.
         :return: Number of permits acquired. Always at most n_permits, and at least n_min. (or False if wait=False)
         """
+        n_min = n_min if (n_min > 0) else n_permits
         while True:
             used = self.try_acquire(n_permits, n_min)
             if used is None:
-                time_until_enough = (n_min - self.cur_permits) / self.permits_per_sec
-                await asyncio.sleep(time_until_enough - (time.time() - self.last_refill))
+                time_until_enough = max(0, (n_min - self.cur_permits)) / self.permits_per_sec
+                sleep_t = time_until_enough - (time.time() - self.last_refill)
+                await asyncio.sleep(sleep_t)
             else:
                 return used
 
