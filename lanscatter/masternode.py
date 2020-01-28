@@ -204,20 +204,19 @@ class MasterNode:
                 colors = {1: 'black', 0.5: 'green', 0: 'lightgray'}
                 time_str = str(datetime.now().isoformat(' ', 'seconds'))
                 st = self.swarm.get_status_table()
-                th = '<th colspan="{colspan}" style="text-align: left;">{txt}</th>'
-                res = '<html ><head><meta http-equiv="refresh" content="4"></head>'\
-                      '<body style="font-family: sans-serif;">'\
-                      f"<h1>{Defaults.APP_NAME} {Defaults.APP_VERSION} – swarm status</h1><p>{time_str}</p>"
-
+                th = '<th>{txt}</th>\n'
+                res = '<html ><head><meta http-equiv="refresh" content="4"></head>\n'\
+                      '<body style="font-family: sans-serif; text-align: left;">\n'\
+                      f"<h1>{Defaults.APP_NAME} {Defaults.APP_VERSION} – swarm status</h1><p>{time_str}</p>\n"
                 if st['all_hashes']:
-                    style = 'transform: scale(0.8); white-space:nowrap; align: left;'
-                    res += f'<table style="{style}"><tr>' + th.format(txt='Node', colspan=1) + \
-                           th.format(txt='Chunks', colspan=len(st["all_hashes"])) +\
-                           th.format(txt='↓', colspan=1) + th.format(txt='↑', colspan=1) +\
-                           th.format(txt='⧖', colspan=1) + '</tr>\n'
+                    style = 'transform: scale(0.7); transform-origin: top left; white-space:nowrap; align: left;'
+                    res += f'<table style="{style}"><tr>' + th.format(txt='Node') + \
+                           th.format(txt='')*len(st["all_hashes"]) +\
+                           th.format(txt='↓') + th.format(txt='↑') +\
+                           th.format(txt='⧖') + '</tr>\n'
                     for n in st['nodes']:
-                        res += f'<tr><td>{html.escape(n["name"])}</td>'
-                        res += ''.join(['<td style="padding: 1px; background: {color}">&nbsp;</td>'.format(
+                        res += f'\n<tr><td>{html.escape(n["name"])}</td>'
+                        res += ''.join(['<td style="background: {color}">&nbsp;</td>\n'.format(
                             color=colors[c]) for c in n['hashes']])
                         transfer_avg = ('%.1f s' % n['avg_ul_time']) if n['avg_ul_time']>=0 else '–'
                         res += ''.join(f'<td>{v}</td>' for v in (int(n['dls']), int(n['uls']), transfer_avg))
@@ -368,14 +367,20 @@ async def run_master_server(base_dir: str,
                         cur_status=f'Hashing "{cur_filename}" ({int(file_progress * 100 + 0.5)}% done)')
         while True:
             # TODO: integrate with inotify (watchdog package) to avoid frequent rescans
-            new_batch, errors = await scan_dir(base_dir, chunk_size=chunk_size, old_batch=server.file_server.batch,
-                                               progress_func=progress_func_adapter, test_compress=(not disable_lz4),
-                                               executor=executor)
-            for i, e in enumerate(errors):
-                status_func(log_error=f'- Dir scan error #{i}: {e}')
-            if new_batch != server.file_server.batch:
-                status_func(cur_status=f'New file batch. Serving as master.')
-                await server.replace_sync_batch(new_batch)
+            def scandir_blocking():
+                return asyncio.run(scan_dir(
+                    base_dir, chunk_size=chunk_size, old_batch=server.file_server.batch,
+                    progress_func=progress_func_adapter, test_compress=(not disable_lz4), executor=executor))
+            try:
+                new_batch, errors = await loop.run_in_executor(None, scandir_blocking)
+                for i, e in enumerate(errors):
+                    status_func(log_error=f'- Dir scan error #{i}: {e}')
+                if new_batch != server.file_server.batch:
+                    status_func(cur_status=f'New file batch. Serving as master.')
+                    await server.replace_sync_batch(new_batch)
+            except FileNotFoundError as e:
+                status_func(log_info=f'NOTE: Dir scan failed as file suddenly vanished (trying again in a bit): {e}')
+
             await asyncio.sleep(dir_scan_interval)
 
     try:

@@ -377,12 +377,20 @@ class PeerNode:
                     self.full_rescan_trigger.clear()
 
                     self.status_func(log_debug='Rescanning local files.')
-                    new_local_batch, errors = await scan_dir(
-                        str(self.file_io.basedir), chunk_size=self.remote_batch.chunk_size,
-                        old_batch=self.local_batch, progress_func=__hash_dir_progress_func, test_compress=False,
-                        executor=executor)
-                    for i,e in enumerate(errors):
-                        self.status_func(log_error=f'- Dir scan error #{i}: {e}')
+
+                    try:
+                        def scandir_blocking():
+                            return asyncio.run(scan_dir(
+                                str(self.file_io.basedir), chunk_size=self.remote_batch.chunk_size,
+                                old_batch=self.local_batch, progress_func=__hash_dir_progress_func, test_compress=False,
+                                executor=executor))
+                        loop = asyncio.get_event_loop()
+                        new_local_batch, errors = await loop.run_in_executor(None, scandir_blocking)
+                        for i, e in enumerate(errors):
+                            self.status_func(log_error=f'- Dir scan error #{i}: {e}')
+                    except FileNotFoundError as e:
+                        self.status_func(log_info=f'NOTE: Dir scan failed, trying again in a bit: {e}')
+
                     self.status_func(log_debug='Rescan finished.')
 
                     new_local_batch.copy_chunk_compress_ratios_from(self.remote_batch)
