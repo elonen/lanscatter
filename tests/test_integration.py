@@ -20,7 +20,7 @@ random.seed()
 
 TEST_DIR = './temp_test_dir'
 TEST_FILES_PER_DIR = 3
-CHUNK_SIZE = 10000
+CHUNK_SIZE = 100000
 PORT_BASE = 53000 + int(2000*random.random())
 TEST_PEER_NAMES = {0: 'peer_empty', 1: 'peer_corrupt', 2: 'peer_non_empty'}
 
