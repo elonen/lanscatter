@@ -253,7 +253,8 @@ class FileIO:
         :param file_size: Size of complete file (optional). File will be truncated to this size.
         """
         with suppress(RuntimeError):  # Avoid dirty exit in aiofiles when Ctrl^C (RuntimeError('Event loop is closed')
-            async with http_session.get(url, headers={'Accept-Encoding': 'lz4'}) as resp:
+            aio_timeout = aiohttp.ClientTimeout(connect=Defaults.TIMEOUT_WHEN_NO_PROGRESS, sock_connect=Defaults.TIMEOUT_WHEN_NO_PROGRESS)
+            async with http_session.get(url, headers={'Accept-Encoding': 'lz4'}, timeout=aio_timeout) as resp:
                 if resp.status != 200:  # some error
                     raise IOError(f'HTTP status {resp.status}')
                 else:
