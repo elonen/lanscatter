@@ -449,7 +449,8 @@ class PeerNode:
             self.status_func(log_info='User exit.')
             self.exit_trigger.set()
         except Exception:
-            self.status_func(log_error='PeerNode error:\n' + traceback.format_exc(), popup=True)
+            self.status_func(log_error='PeerNode exited with errors. See log for details.', popup=True)
+            self.status_func(log_error='PeerNode error in run():\n' + traceback.format_exc())
 
 # --------------------------------------------------------------------------------------------------------
 
