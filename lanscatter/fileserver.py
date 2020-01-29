@@ -54,9 +54,11 @@ class FileServer:
                         self._status_func(log_debug=f"Compression ratio: {float('%.3g' % comp_ratio)} (for {request.path_qs})")
                     if ul_time:
                         self.upload_times.append(ul_time)
+                    return res
                 except Exception as e:
+                    self._status_func(log_error=f"Upload error on [{request.remote}] GET {request.path_qs} "
+                                                f"({type(e).__name__}) {str(e)}")
                     raise e
-                return res
             finally:
                 self.active_uploads -= 1
                 await self._on_upload_finished()

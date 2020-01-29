@@ -22,6 +22,7 @@ class Defaults:
     DIR_SCAN_INTERVAL_PEER = 60
 
     MAX_WORKERS = 8
+    TIMEOUT_WHEN_NO_PROGRESS = 8
 
     APP_VERSION = '0.1.2'
     PROTOCOL_VERSION = '2.0.0'
