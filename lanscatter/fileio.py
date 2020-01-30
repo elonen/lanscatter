@@ -1,63 +1,13 @@
 from pathlib import Path, PurePosixPath
 from aiohttp import web, ClientSession
-from typing import Tuple, Optional, Callable, Iterable
+from typing import Tuple, Optional
 from contextlib import suppress
 import aiofiles, os, time, asyncio, aiohttp, mmap
 import lz4.frame
 
-from .common import Defaults
+from .common import Defaults, process_multibuffer_io
 from .chunker import FileChunk, HashFunc
 from .ratelimiter import RateLimiter
-
-
-async def _buffered_async_in_out(producer: Callable, consumer: Callable, initial_buffers: Iterable, timeout=999999):
-    """
-    Buffered async producer/consumer loop framework, with optional timeout.
-    Timeout guard raises a TimeoutError if neither producer nor consumer do any work in 'timeout' seconds.
-
-    :param producer: Async function that takes a buffer, writes stuff to it and returns the buffer or None if all done.
-    :param consumer: Async function that takes a buffer and does something with the data (or not)
-    :param initial_buffers: Arbitrary number of pre-create buffers to use for IO.
-    :param timeout: Timeout after this many seconds if no progress is made.
-    """
-    end_trigger = asyncio.Event()
-    last_progress_t = time.time()
-
-    free_buffers, full_buffers = asyncio.Queue(), asyncio.Queue()
-    for b in initial_buffers:
-        await free_buffers.put(b)
-
-    async def producer_loop():
-        nonlocal last_progress_t
-        while True:
-            b = await free_buffers.get()
-            b = await producer(b)
-            await full_buffers.put(b)  # Signal end for consumer with None
-            last_progress_t = time.time()
-            if b is None:
-                break
-
-    async def consumer_loop():
-        nonlocal last_progress_t
-        while True:
-            b = await full_buffers.get()
-            if b is None:
-                end_trigger.set()  # let no_progress_timeout_guard() know we're done
-                break
-            else:
-                await consumer(b)
-                await free_buffers.put(b)
-                last_progress_t = time.time()
-
-    async def no_progress_timeout_guard():
-        nonlocal end_trigger, last_progress_t
-        while not end_trigger.is_set():
-            with suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(end_trigger.wait(), timeout=timeout/4)
-            if time.time() - last_progress_t > timeout:
-                raise TimeoutError(f"Timeout. No progress in {Defaults.TIMEOUT_WHEN_NO_PROGRESS} seconds.")
-
-    await asyncio.gather(producer_loop(), consumer_loop(), no_progress_timeout_guard())
 
 
 class FileIO:
@@ -69,7 +19,7 @@ class FileIO:
     dl_limiter: RateLimiter
     ul_limiter: RateLimiter
 
-    def __init__(self, basedir: Path, dl_rate_limit: float, ul_rate_limit: float):
+    def __init__(self, basedir: Path, dl_rate_limit: float = 99999999, ul_rate_limit: float = 99999999):
         """
         :param basedir: Folder to limit read/write into.
         :param dl_rate_limit: Maximum download rate in Mbit/s
@@ -118,7 +68,10 @@ class FileIO:
                 await self.f.seek(pos)
                 return self.f
             async def __aexit__(self, exc_type, exc, tb):
-                self.f.close()
+                if for_write:
+                    await self.f.flush()
+                    os.fsync(self.f.fileno())
+                await self.f.close()
         return _TempAsyncMgr()
 
 
@@ -174,7 +127,7 @@ class FileIO:
                             i += limited_n
                             cnt -= limited_n
 
-                    await _buffered_async_in_out(
+                    await process_multibuffer_io(
                         producer=read_file, consumer=write_http, timeout=Defaults.TIMEOUT_WHEN_NO_PROGRESS,
                         initial_buffers=[bytearray(Defaults.FILE_BUFFER_SIZE) for i in range(5)])
 
@@ -237,9 +190,9 @@ class FileIO:
                 async def write_and_csum(buff):
                     await asyncio.gather(outf.write(buff), csum.update_async(buff))
 
-            await _buffered_async_in_out(
-                producer=read_file, consumer=write_and_csum,
-                initial_buffers=[bytearray(Defaults.FILE_BUFFER_SIZE) for i in range(5)])
+                await process_multibuffer_io(
+                    producer=read_file, consumer=write_and_csum,
+                    initial_buffers=[bytearray(Defaults.FILE_BUFFER_SIZE) for i in range(5)])
 
             return csum.result() == copy_from.hash
 
@@ -274,7 +227,7 @@ class FileIO:
                                 #await asyncio.gather(outf.write(buff), csum.update_async(buff))
                                 await outf.write(lz.decompress(buff) if use_lz4 else buff)
 
-                            await _buffered_async_in_out(
+                            await process_multibuffer_io(
                                 producer=read_http, consumer=write_and_csum, timeout=Defaults.TIMEOUT_WHEN_NO_PROGRESS,
                                 initial_buffers=[True for i in range(5)])
 

@@ -1,6 +1,7 @@
 from datetime import datetime
-import json, argparse
-
+from typing import Callable, Iterable
+import json, argparse, asyncio, time
+from contextlib import suppress
 
 class Defaults:
     APP_NAME = 'LANScatter'
@@ -21,7 +22,7 @@ class Defaults:
     CONCURRENT_TRANSFERS_PEER = 2
     DIR_SCAN_INTERVAL_PEER = 60
 
-    MAX_WORKERS = 8
+    MAX_WORKERS = 16
     TIMEOUT_WHEN_NO_PROGRESS = 8
 
     APP_VERSION = '0.1.2'
@@ -132,3 +133,53 @@ def json_status_func(progress: float = None, cur_status: str = None,
             'log_debug': log_debug,
             'popup': popup
         }))
+
+
+async def process_multibuffer_io(producer: Callable, consumer: Callable, initial_buffers: Iterable, timeout=999999):
+    """
+    Buffered async producer/consumer loop framework, with optional timeout.
+    Timeout guard raises a TimeoutError if neither producer nor consumer do any work in 'timeout' seconds.
+
+    :param producer: Async function that takes a buffer, writes stuff to it and returns the buffer or None if all done.
+    :param consumer: Async function that takes a buffer and does something with the data (or not)
+    :param initial_buffers: Arbitrary number of pre-create buffers to use for IO.
+    :param timeout: Timeout after this many seconds if no progress is made.
+    """
+    end_trigger = asyncio.Event()
+    last_progress_t = time.time()
+
+    free_buffers, full_buffers = asyncio.Queue(), asyncio.Queue()
+    for b in initial_buffers:
+        await free_buffers.put(b)
+
+    async def producer_loop():
+        nonlocal last_progress_t
+        while True:
+            b = await free_buffers.get()
+            b = await producer(b)
+            await full_buffers.put(b)  # Signal end for consumer with None
+            last_progress_t = time.time()
+            if b is None:
+                break
+
+    async def consumer_loop():
+        nonlocal last_progress_t
+        while True:
+            b = await full_buffers.get()
+            if b is None:
+                end_trigger.set()  # let no_progress_timeout_guard() know we're done
+                break
+            else:
+                await consumer(b)
+                await free_buffers.put(b)
+                last_progress_t = time.time()
+
+    async def no_progress_timeout_guard():
+        nonlocal end_trigger, last_progress_t
+        while not end_trigger.is_set():
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(end_trigger.wait(), timeout=timeout/4)
+            if time.time() - last_progress_t > timeout:
+                raise TimeoutError(f"Timeout. No progress in {Defaults.TIMEOUT_WHEN_NO_PROGRESS} seconds.")
+
+    await asyncio.gather(producer_loop(), consumer_loop(), no_progress_timeout_guard())
