@@ -3,7 +3,7 @@ import wx.adv
 
 import appdirs
 
-import sys, os, io, threading, traceback, json, platform
+import sys, os, io, threading, traceback, json, platform, time
 import PIL.Image, PIL.ImageOps, PIL.ImageColor
 from contextlib import suppress
 import multiprocessing
@@ -261,6 +261,9 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
         self.log_win = None
         self.log_formatter = common.make_human_cli_status_func(print_func=lambda txt: self.write_log(txt + '\n'))
 
+        self.min_popup_interval = 2.0
+        self.last_popup_time = 0.0
+
         self.latest_progress_change = datetime.utcnow() - timedelta(seconds=60)
 
         def resource_path(relative_path):
@@ -446,7 +449,9 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
 
             if msg.get('popup'):
                 txt = ((msg.get('log_error') or '') + '\n' + (msg.get('log_info') or '')).strip()
-                wx.adv.NotificationMessage(common.Defaults.APP_NAME, txt).Show(timeout=5)
+                if time.time() > self.last_popup_time + self.min_popup_interval:
+                    self.last_popup_time = time.time()
+                    wx.adv.NotificationMessage(common.Defaults.APP_NAME, txt).Show(timeout=5)
 
             if msg.get('cur_status'):
                 self.cur_status_text = msg.get('cur_status')
@@ -455,7 +460,9 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
                         self.menu.SetLabel(self.MENUID_STATUS_TEXT, self.cur_progress_text + self.cur_status_text)
         except json.decoder.JSONDecodeError:
             print("Print from sync_proc: " + str(msg))
-            wx.adv.NotificationMessage("Output from sync_proc", str(msg)).Show(timeout=5)
+            if time.time() > self.last_popup_time + self.min_popup_interval:
+                self.last_popup_time = time.time()
+                wx.adv.NotificationMessage("Unexpected output (see log)", str(msg)).Show(timeout=5)
 
     def on_syncer_exit(self, ex, tb):
         self.write_log('\n------- syncer process exited -------\n\n')

@@ -165,8 +165,12 @@ class PeerNode:
                             self.status_func(log_info="Several runs of local fixups failed to sync batches. Rescanning.")
                             self.full_rescan_trigger.set()
 
+
         except FileNotFoundError:
             self.status_func(log_info="Some files disappeared while doing local_file_fixups. Rescanning.")
+            self.full_rescan_trigger.set()
+        except OSError as e:
+            self.status_func(log_error=f"OSError while doing local fixups: ({type(e).__name__}) '{str(e)}'. Rescanning.")
             self.full_rescan_trigger.set()
 
     async def download_task(self, chunk_hash, url, http_session, timeout):
