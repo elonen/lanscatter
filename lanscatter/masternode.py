@@ -234,7 +234,7 @@ class MasterNode:
 
         async def http_handler__start_websocket(request):
             self.status_func(log_info=f"[{request.remote}] HTTP GET {request.path_qs}. Upgrading to websocket.")
-            ws = web.WebSocketResponse(heartbeat=30)
+            ws = web.WebSocketResponse(heartbeat=20, autoping=True, receive_timeout=60)
             await ws.prepare(request)
 
             address = str(request.remote)
@@ -270,7 +270,16 @@ class MasterNode:
 
             try:
                 # Read messages from websocket and handle them
-                async for msg in ws:
+                while True:
+                    try:
+                        msg = await ws.__anext__()
+                    except StopAsyncIteration:
+                        break
+                    except asyncio.CancelledError:
+                        self.status_func(log_info=f'Websocket heartbeat lost on "{node.name if node else address}"')
+                        await ws.close()
+                        continue
+
                     if msg.type == WSMsgType.TEXT:
                         try:
                             if welcome_task.done():
@@ -290,9 +299,15 @@ class MasterNode:
                     elif msg.type == WSMsgType.ERROR:
                         self.status_func(log_error=f'Connection for client "{node.name if node else address}" '
                                                     'closed with err: %s' % ws.exception())
-                self.status_func(log_info=f'Connection closed from "{node.name if node else address}"')
+
+                self.status_func(log_info=f'Websocket closed from "{node.name if node else address}"')
+
+            except Exception as e:
+                self.status_func(log_info=f'Exception while reading from ws:\n"{traceback.format_exc()}"')
+                raise e
             finally:
                 if node:
+                    self.status_func(log_info=f'Destroying node "{node.name if node else address}"')
                     node.destroy()
 
             send_task.cancel()

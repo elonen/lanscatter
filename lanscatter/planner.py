@@ -94,7 +94,7 @@ class SwarmCoordinator(object):
         """
         self.all_hashes: Set[ChunkId] = set()
         self.hash_popularity = {}  # Approximately: how many copies of hashes there are in swarm
-        self.nodes: List[Node] = []
+        self.nodes: Set[Node] = set()
         self.all_done = False  # optimization, turns True when everyone's gat everything
 
     def reset_hashes(self, new_hashes: Iterable[ChunkId]):
@@ -135,7 +135,10 @@ class SwarmCoordinator(object):
 
             def destroy(self) -> None:
                 """Remove node from the swarm"""
-                swarm.nodes = [n for n in swarm.nodes if n != self]
+                swarm.nodes.discard(self)
+                for c in self.hashes:
+                    if c in swarm.hash_popularity:
+                        swarm.hash_popularity[c] -= 1
 
             def add_hashes(self, new_hashes: Iterable[ChunkId], clear_first=False) -> Iterable[ChunkId]:
                 new_hashes = set(new_hashes)
@@ -151,7 +154,7 @@ class SwarmCoordinator(object):
                 return unknown
 
         n = _NodeImpl()
-        self.nodes.append(n)
+        self.nodes.add(n)
         self.all_done &= (len(n.hashes) == self.all_hashes)
         return n
 

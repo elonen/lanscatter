@@ -200,7 +200,7 @@ class FileIO:
             raise web.HTTPInternalServerError(reason=str(e))
         finally:
             if response is not None:
-                with suppress(ConnectionResetError):
+                with suppress(Exception):
                     await response.write_eof()  # Close chunked response despite possible errors
 
 
