@@ -4,6 +4,7 @@ from typing import Tuple, Optional
 from contextlib import suppress
 import aiofiles, os, time, asyncio, aiohttp, mmap
 import lz4.frame
+from types import SimpleNamespace
 
 from .common import Defaults, process_multibuffer_io
 from .chunker import FileChunk, HashFunc
@@ -33,7 +34,7 @@ class FileIO:
         self.dl_limiter = RateLimiter(dl_rate_limit * 1024 * 1024 / 8, period=1.0, burst_factor=2.0)
         self.ul_limiter = RateLimiter(ul_rate_limit * 1024 * 1024 / 8, period=1.0, burst_factor=2.0)
 
-    def resolve_and_sanitize(self, relative_path, must_exist=False):
+    def resolve_and_sanitize(self, relative_path, must_exist=False) -> Path:
         """
         Check that given relative path stays inside basedir and return an absolute path string.
         :return: Absolute Path() object
@@ -42,6 +43,8 @@ class FileIO:
         p = (self.basedir / relative_path).resolve()
         if self.basedir not in p.parents:
             raise PermissionError(f'Filename points outside basedir: {str(relative_path)}')
+        if must_exist and not p.exists():
+            raise FileNotFoundError(f"Required path does not exist: {str(p)}")
         return p
 
     def open_and_seek(self, path: str, pos: int, for_write: bool = False):
@@ -248,10 +251,9 @@ class FileIO:
         path = self.resolve_and_sanitize(path)
         os.makedirs(path, exist_ok=True)
 
-    async def size_and_mtime(self, path):
+    async def stat(self, path) -> SimpleNamespace:
         path = self.resolve_and_sanitize(path)
-        s = await aiofiles.os.stat(str(path))
-        return s.st_size, s.st_mtime
+        return await aiofiles.os.stat(str(path))
 
     async def remove_file_and_paths(self, path):
         path = self.resolve_and_sanitize(path)

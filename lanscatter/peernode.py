@@ -385,7 +385,7 @@ class PeerNode:
                     try:
                         def scandir_blocking():
                             return asyncio.run(scan_dir(
-                                str(self.file_io.basedir), chunk_size=self.remote_batch.chunk_size,
+                                self.file_io, chunk_size=self.remote_batch.chunk_size,
                                 old_batch=self.local_batch, progress_func=__hash_dir_progress_func, test_compress=False,
                                 executor=executor))
                         loop = asyncio.get_event_loop()

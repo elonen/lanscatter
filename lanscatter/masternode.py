@@ -380,11 +380,13 @@ async def run_master_server(base_dir: str,
         def progress_func_adapter(cur_filename, file_progress, total_progress):
             status_func(progress=total_progress,
                         cur_status=f'Hashing "{cur_filename}" ({int(file_progress * 100 + 0.5)}% done)')
+
+        fio = FileIO(Path(base_dir))
         while True:
             # TODO: integrate with inotify (watchdog package) to avoid frequent rescans
             def scandir_blocking():
                 return asyncio.run(scan_dir(
-                    base_dir, chunk_size=chunk_size, old_batch=server.file_server.batch,
+                    fio, chunk_size=chunk_size, old_batch=server.file_server.batch,
                     progress_func=progress_func_adapter, test_compress=(not disable_lz4), executor=executor))
             try:
                 new_batch, errors = await loop.run_in_executor(None, scandir_blocking)

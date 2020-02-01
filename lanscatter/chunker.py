@@ -11,8 +11,6 @@ from .common import Defaults, process_multibuffer_io
 # Tools for scanning files in a directory and splitting them into hashed chunks.
 # MasterNode and PeerNode both use this for maintaining and syncing their state.
 
-# TODO: convert to use fileio.py instead of directly os.*
-
 HashType = str
 
 class HashableBase:
@@ -195,7 +193,7 @@ class SyncBatch:
         return res
 
 
-def _hash_file(basedir: str, relpath: str, chunk_size: int, executor, progress_func: Callable, test_compress: bool) -> \
+def hash_file(basedir: str, relpath: str, chunk_size: int, executor, progress_func: Callable, test_compress: bool) -> \
         Generator[Future, None, None]:
     """
     Split given file into chunks and return multithreading futures that hash them.
@@ -256,14 +254,14 @@ def _hash_file(basedir: str, relpath: str, chunk_size: int, executor, progress_f
             yield executor.submit(do_hash, pos, min(chunk_size, files_size - pos))
 
 
-async def scan_dir(basedir: str, chunk_size: int, old_batch: Optional[SyncBatch],
+async def scan_dir(fio, chunk_size: int, old_batch: Optional[SyncBatch],
                    progress_func: Callable, test_compress: bool, executor: ThreadPoolExecutor) ->\
         Tuple[SyncBatch, Iterable[str]]:
     """
     Scan given directory and generate a list of FileChunks of its contents. If old_chunks is provided,
     assumes contents haven't changed if mtime and size are identical. Optionally tests how compressible chunks are.
 
-    :param basedir: Folders to scan
+    :param fio: FileIO with basedir on folder to scan
     :param progress_func: Progress report callback - func(cur_filename, file_progress, total_progress)
     :param chunk_size: Length of chunk to split files into
     :param old_batch: If given, compares dir it and skips hashing files with identical size & mtime
@@ -275,31 +273,30 @@ async def scan_dir(basedir: str, chunk_size: int, old_batch: Optional[SyncBatch]
     errors = []
     fnames = []
     dirs = []
-    base = Path(basedir)
-    for root, d_names, f_names in os.walk(basedir, topdown=False, onerror=None, followlinks=False):
+    for root, d_names, f_names in os.walk(str(fio.basedir), topdown=False, onerror=None, followlinks=False):
         for path in d_names:
-            dirs.append(str(PurePosixPath((Path(root)/path).relative_to(base))))
+            dirs.append(str(PurePosixPath((Path(root)/path).relative_to(fio.basedir))))
         for f in f_names:
-            fnames.append(str(PurePosixPath((Path(root)/f).relative_to(base))))
+            fnames.append(str(PurePosixPath((Path(root)/f).relative_to(PurePosixPath(fio.basedir)))))
 
-    async def file_needs_rehash(path: str):
+    async def file_needs_rehash(p: str):
         try:
-            f = old_batch.files.get(path) if old_batch else None
-            s = await aiofiles.os.stat(base/path)
-            return f is None or f.size != s.st_size or f.mtime != int(s.st_mtime)
+            f = old_batch.files.get(p) if old_batch else None
+            s = await fio.stat(p)
+            return f is None or f.size != s.st_size or f.mtime != s.st_mtime
         except (FileNotFoundError, KeyError):
             return True
 
     # Return immediately if we are completely up to date:
     files_needing_rehash = set([fn for fn in fnames if await file_needs_rehash(fn)])
-    if old_batch and len(fnames) == len(old_batch.files) and not files_needing_rehash:
+    if old_batch and not files_needing_rehash and len(fnames) == len(old_batch.files):
         return old_batch, errors
 
     # Prepare progress reporting
-    total_size = int(sum([(await aiofiles.os.stat(base/f)).st_size for f in fnames]))
+    total_size = int(sum([(await fio.stat(f)).st_size for f in fnames]))
     total_remaining = total_size
+    progr_lock = threading.RLock()  # Mutex to maintain integrity of total_remaining inside file_progress()
 
-    progr_lock = threading.RLock()  # Mutex to maintain total_remaining inside file_progress()
     def file_progress(path, just_read, pos, file_size):
         nonlocal total_remaining
         with progr_lock:
@@ -320,7 +317,7 @@ async def scan_dir(basedir: str, chunk_size: int, old_batch: Optional[SyncBatch]
     futures = []
     for fn in files_needing_rehash:
         try:
-            futures.extend(_hash_file(basedir, fn, chunk_size, executor, file_progress, test_compress=test_compress))
+            futures.extend(hash_file(fio.basedir, fn, chunk_size, executor, file_progress, test_compress=test_compress))
         except (OSError, IOError) as e:
             errors.append(f'[{fn}]: ' + str(e))
     for f in as_completed(futures):
@@ -332,9 +329,9 @@ async def scan_dir(basedir: str, chunk_size: int, old_batch: Optional[SyncBatch]
     # Read file attributes and calculate tree hashes
     for fn in files_needing_rehash:
         try:
-            st = (Path(basedir) / fn).stat()
+            s = await fio.stat(fn)
             chunks = [c for c in res_chunks if c.path == fn]
-            res_files.append(FileAttribs(path=fn, size=st.st_size, mtime=int(st.st_mtime), treehash=calc_tree_hash(chunks)))
+            res_files.append(FileAttribs(path=fn, size=s.st_size, mtime=int(s.st_mtime), treehash=calc_tree_hash(chunks)))
         except (OSError, IOError) as e:
             errors.append(f'[{fn}]: ' + str(e))
 
@@ -343,7 +340,7 @@ async def scan_dir(basedir: str, chunk_size: int, old_batch: Optional[SyncBatch]
     for d in dirs:
         try:
             res_files.append(FileAttribs(path=d+'/', size=-1, treehash=None,
-                                         mtime=int((await aiofiles.os.stat(base/d)).st_mtime)))
+                                         mtime=int((await fio.stat(d)).st_mtime)))
         except (OSError, IOError) as e:
             errors.append(f'[{d}/]: ' + str(e))
 
