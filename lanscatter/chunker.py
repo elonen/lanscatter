@@ -6,7 +6,7 @@ import mmap
 from concurrent.futures import ThreadPoolExecutor, Future, as_completed, CancelledError
 from pathlib import Path, PurePosixPath
 import lz4.frame
-from .common import Defaults, process_multibuffer_io
+from .common import Defaults, process_multibuffer_io, file_read_producer
 
 # Tools for scanning files in a directory and splitting them into hashed chunks.
 # MasterNode and PeerNode both use this for maintaining and syncing their state.
@@ -193,7 +193,7 @@ class SyncBatch:
         return res
 
 
-def hash_file(basedir: str, relpath: str, chunk_size: int, executor, progress_func: Callable, test_compress: bool) -> \
+async def hash_file(fio, relpath: str, chunk_size: int, executor, progress_func: Callable, test_compress: bool) -> \
         Generator[Future, None, None]:
     """
     Split given file into chunks and return multithreading futures that hash them.
@@ -201,54 +201,37 @@ def hash_file(basedir: str, relpath: str, chunk_size: int, executor, progress_fu
     Hashlib releases GIL so this is fast even with a ThreadPoolExecutor. Uses memory mapping
     instead of buffers for maximum efficiency.
 
-    :param basedir: Base directory to search for files
+    :param fio: FileIO object to read from
     :param relpath: Pathname to file
     :param executor: Executor to run hash functions in.
     :param file_progress_func: Progress reporting callback
     :return: Generator that yields multithreading Futures that return FileChunks
     """
-    path = Path(basedir) / relpath
-    files_size = path.stat().st_size
+    files_size = (await fio.stat(relpath)).st_size
     if files_size == 0:
         yield executor.submit(lambda: FileChunk(path=relpath, pos=0, size=0, hash=HashFunc().result(), cmpratio=1.0))
     else:
-        def do_hash(p, s):
-            progress_func(relpath, s, p, files_size)
+        def do_hash(pos, size):
+            progress_func(relpath, size, pos, files_size)
             h = HashFunc()
             with lz4.frame.LZ4FrameCompressor() as lz:
                 compressed_size = len(lz.begin())
-                remaining = s
 
                 async def io_loop():
-                    inf = await aiofiles.open(path, mode="rb")
-                    try:
-                        async def read_file(buff: bytearray):
-                            nonlocal remaining
-                            if remaining > 0:
-                                if remaining < len(buff):
-                                    buff = bytearray(remaining)
-                                cnt = await inf.readinto(buff)
-                                if cnt != len(buff):
-                                    raise IOError(f'Filesize mismatch. Changed during hashing?')
-                                remaining -= cnt
-                                return buff
-
+                    async with fio.open_and_seek(relpath, pos, for_write=False) as inf:
                         async def hash_buff(buff: bytearray):
                             nonlocal compressed_size
                             await h.update_async(buff)
                             compressed_size += len(lz.compress(buff)) if test_compress else 0
 
-                        await inf.seek(p)
                         await process_multibuffer_io(
-                            producer=read_file, consumer=hash_buff,
+                            producer=file_read_producer(inf, size), consumer=hash_buff,
                             initial_buffers=[bytearray(Defaults.FILE_BUFFER_SIZE) for i in range(5)])
-                    finally:
-                        await inf.close()
 
                 asyncio.run(io_loop())
 
-            compress_ratio = 1.0 if not test_compress else min(1.0, float("%.2g" % (compressed_size / s)))
-            return FileChunk(path=relpath, pos=p, size=s, hash=h.result(), cmpratio=compress_ratio)
+            compress_ratio = 1.0 if not test_compress else min(1.0, float("%.2g" % (compressed_size / size)))
+            return FileChunk(path=relpath, pos=pos, size=size, hash=h.result(), cmpratio=compress_ratio)
 
         for pos in range(0, files_size, chunk_size):
             yield executor.submit(do_hash, pos, min(chunk_size, files_size - pos))
@@ -317,7 +300,8 @@ async def scan_dir(fio, chunk_size: int, old_batch: Optional[SyncBatch],
     futures = []
     for fn in files_needing_rehash:
         try:
-            futures.extend(hash_file(fio.basedir, fn, chunk_size, executor, file_progress, test_compress=test_compress))
+            async for ft in hash_file(fio, fn, chunk_size, executor, file_progress, test_compress=test_compress):
+                futures.append(ft)
         except (OSError, IOError) as e:
             errors.append(f'[{fn}]: ' + str(e))
     for f in as_completed(futures):

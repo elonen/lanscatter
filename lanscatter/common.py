@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Callable, Iterable
-import json, argparse, asyncio, time
+import json, argparse, asyncio, time, aiofiles
 from contextlib import suppress
 
 class Defaults:
@@ -183,3 +183,23 @@ async def process_multibuffer_io(producer: Callable, consumer: Callable, initial
                 raise TimeoutError(f"Timeout. No progress in {Defaults.TIMEOUT_WHEN_NO_PROGRESS} seconds.")
 
     await asyncio.gather(producer_loop(), consumer_loop(), no_progress_timeout_guard())
+
+
+def file_read_producer(inf, size: int) -> Callable:
+    """Turn async file handle into a process_multibuffer_io() compatible producer"""
+    remaining = size
+
+    async def read_file(buff: bytearray):
+        """Producer for producer/consumer loop."""
+        nonlocal remaining
+        if remaining > 0:
+            if remaining < len(buff):
+                buff = bytearray(remaining)
+            cnt = await inf.readinto(buff)
+            if cnt != len(buff):
+                raise IOError(f'Filesize mismatch; "{str(inf.name if hasattr(inf, "name") else str(inf))}" '
+                              f'changed? Expected {len(buff)} bytes but got {cnt}.')
+            remaining -= cnt
+            return buff
+
+    return read_file

@@ -6,7 +6,7 @@ import aiofiles, os, time, asyncio, aiohttp, mmap
 import lz4.frame
 from types import SimpleNamespace
 
-from .common import Defaults, process_multibuffer_io
+from .common import Defaults, process_multibuffer_io, file_read_producer
 from .chunker import FileChunk, HashFunc
 from .ratelimiter import RateLimiter
 
@@ -69,11 +69,12 @@ class FileIO:
             async def __aenter__(self):
                 self.f = await aiofiles.open(path, mode=mode)
                 await self.f.seek(pos)
+                self.f.name = path
                 return self.f
             async def __aexit__(self, exc_type, exc, tb):
                 if for_write:
                     await self.f.flush()
-                    os.fsync(self.f.fileno())
+                    await asyncio.get_running_loop().run_in_executor(None, os.fsync, self.f.fileno())
                 await self.f.close()
         return _TempAsyncMgr()
 
@@ -90,11 +91,10 @@ class FileIO:
         """
         use_lz4 = (chunk.cmpratio < 0.95) and ('lz4' in str(request.headers.get('Accept-Encoding')))
         response = None
-        remaining = chunk.size
         upload_size = 0
         start_t = time.time()
         try:
-            async with self.open_and_seek(chunk.path, chunk.pos, for_write=False) as f:
+            async with self.open_and_seek(chunk.path, chunk.pos, for_write=False) as inf:
                 with lz4.frame.LZ4FrameCompressor() as lz:
                     # Ok, read chunk from file and stream it out
                     response = web.StreamResponse(
@@ -105,17 +105,6 @@ class FileIO:
                     await response.prepare(request)
                     if use_lz4:
                         await response.write(lz.begin())
-
-                    async def read_file(buff: bytearray):
-                        nonlocal remaining, chunk
-                        if remaining > 0:
-                            if remaining < len(buff):
-                                buff = bytearray(remaining)
-                            cnt = await f.readinto(buff)
-                            if cnt != len(buff):
-                                raise web.HTTPNotFound(reason=f'Filesize mismatch / "{str(chunk.path)}" changed? Read {cnt} but expected {len(buff)}.')
-                            remaining -= cnt
-                            return buff
 
                     async def write_http(buff: bytearray):
                         nonlocal upload_size
@@ -131,7 +120,7 @@ class FileIO:
                             cnt -= limited_n
 
                     await process_multibuffer_io(
-                        producer=read_file, consumer=write_http, timeout=Defaults.TIMEOUT_WHEN_NO_PROGRESS,
+                        producer=file_read_producer(inf, chunk.size), consumer=write_http, timeout=Defaults.TIMEOUT_WHEN_NO_PROGRESS,
                         initial_buffers=[bytearray(Defaults.FILE_BUFFER_SIZE) for i in range(5)])
 
                     if use_lz4:
@@ -179,22 +168,11 @@ class FileIO:
                 remaining = copy_from.size
                 csum = HashFunc()
 
-                async def read_file(buff: bytearray):
-                    nonlocal remaining
-                    if remaining > 0:
-                        if remaining < len(buff):
-                            buff = bytearray(remaining)
-                        cnt = await inf.readinto(buff)
-                        if cnt != len(buff):
-                            raise IOError(f'Filesize mismatch / "{str(copy_from.path)}" changed? Read {cnt} but expected {len(buff)}.')
-                        remaining -= cnt
-                        return buff
-
                 async def write_and_csum(buff):
                     await asyncio.gather(outf.write(buff), csum.update_async(buff))
 
                 await process_multibuffer_io(
-                    producer=read_file, consumer=write_and_csum,
+                    producer=file_read_producer(inf, copy_from.size), consumer=write_and_csum,
                     initial_buffers=[bytearray(Defaults.FILE_BUFFER_SIZE) for i in range(5)])
 
             return csum.result() == copy_from.hash
