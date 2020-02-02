@@ -16,13 +16,13 @@ HashType = str
 
 class HashableBase:
     def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
+        self.__dict__.update({k: kwargs[k] for k in sorted(kwargs)})
     def __repr__(self):
-        return self.__class__.__name__ + str(self.__dict__)
+        return self.__class__.__name__ + str({k: self.__dict__[k] for k in sorted(self.__dict__)})
     def __hash__(self):
         return hash(self.__repr__())
     def __eq__(self, other):
-        return self.__repr__() == other.__repr__()
+        return self.__dict__ == other.__dict__
 
 
 class FileChunk(HashableBase):
@@ -30,14 +30,13 @@ class FileChunk(HashableBase):
     pos: int            # chunk start position in bytes
     size: int           # chunk size in bytes
     cmpratio: float     # Compression ratio (compressed size / original size)
-    hash: HashType      # Hex checksum of data contents (blake2, digest_size=12)
-
+    hash: HashType      # Chain hash of subchunks
 
 class FileAttribs(HashableBase):
     path: str
     size: int                      # size of complete file in bytes
     mtime: int                     # last modified (unix timestamp)
-    treehash: Optional[HashType]   # combine hash for whole file (hash of concatenated chunk hashes)
+    chain_hash: Optional[HashType]  # Combine hash for whole file (hash of concatenated chunk hashes)
 
     @property
     def is_dir(self):
@@ -62,14 +61,14 @@ class HashFunc:
         return self.h.hexdigest()
 
 
-def calc_tree_hash(chunks: Iterable[FileChunk]) -> HashType:
+def calc_chain_hash(chunks: Iterable[FileChunk]) -> HashType:
     """
-    Sort given chunks by position in file and calculate a combined (tree) hash for them
+    Sort given chunks by position in file and calculate a combined (chain) hash for them
     """
     path = None
     csum = HashFunc().result()
     for c in sorted(chunks, key=lambda c: c.pos):
-        csum = HashFunc().update((str(csum) + str(c.hash)).encode('utf-8')).result()
+        csum = HashFunc().update((csum + c.hash).encode('utf-8')).result()
         assert(c.path == path or path is None)
         path = c.path
     return csum
@@ -80,14 +79,16 @@ class SyncBatch:
     Represents sync folder contents and provides tools for comparing them
     """
     chunk_size: int
+    sub_chunk_size: int
     chunks: Set[FileChunk]
     files: Dict[str, FileAttribs]
 
-    def __init__(self, chunk_size: int = 0, chunks=(), files=()):
+    def __init__(self, chunk_size: int = 0, sub_chunk_size: int = 0):
+        assert chunk_size >= sub_chunk_size
         self.chunk_size = chunk_size
+        self.sub_chunk_size = sub_chunk_size
         self.chunks = set()
         self.files = {}
-        self.add(files, chunks)
 
     def __bool__(self):
         """True if batch is not empty"""
@@ -120,21 +121,21 @@ class SyncBatch:
     def add(self, files: Iterable[FileAttribs] = (), chunks: Iterable[FileChunk] = ()):
         """
         Add given file attributes and chunks to batch, if not there already.
-        Recalculates file tree hashes for files that got new chunks.
+        Recalculates file chain hashes for files that got new chunks.
         """
         chunks = tuple(chunks)
         self.files.update({a.path: a for a in files})
         self.chunks.update(chunks)
         for path in set((c.path for c in chunks)):
             if path not in self.files:
-                self.files[path] = FileAttribs(path=path, size=0, mtime=int(time.time()), treehash=None)
-            self.files[path].treehash = calc_tree_hash((c for c in self.chunks if c.path == path))
+                self.files[path] = FileAttribs(path=path, size=0, mtime=int(time.time()), chain_hash=None)
+            self.files[path].chain_hash = calc_chain_hash((c for c in self.chunks if c.path == path))
             self.files[path].size = sum((c.size for c in self.chunks if c.path == path))
 
     def discard(self, paths: Iterable[str] = (), chunks: Iterable[FileChunk] = ()):
         """
         Remove given paths and chunks from current batch.
-        Deletes hashes for deleted paths, and invalidates (doesn't recalc) treehashes for paths with removed chunks.
+        Deletes hashes for deleted paths, and invalidates (doesn't recalc) chain hashes for paths with removed chunks.
         """
         paths = set(paths)
         for path in paths:
@@ -143,7 +144,7 @@ class SyncBatch:
         for c in tuple(chunks):
             self.chunks.discard(c)
             if c.path in self.files:
-                self.files[c.path].treehash = None
+                self.files[c.path].chain_hash = None
 
     def first_chunk_with(self, chunk_hash: HashType) -> Optional[FileChunk]:
         """Return first chunk with given content (hash)"""
@@ -161,10 +162,9 @@ class SyncBatch:
 
     def chunk_diff(self, there: 'SyncBatch'):
         """Compare this and given batches for content (chunk list) changes"""
-        there_chunks = there.chunks
         return SimpleNamespace(
-            there_only=there_chunks - self.chunks,
-            here_only=self.chunks - there_chunks)
+            there_only=there.chunks - self.chunks,
+            here_only=self.chunks - there.chunks)
 
     def copy_chunk_compress_ratios_from(self, other):
         """Copy (replace) chunk compression ratio values from given other FileBatch."""
@@ -183,70 +183,58 @@ class SyncBatch:
         """Turn batch object into a serializable dictionary"""
         return {
             'chunk_size': self.chunk_size,
+            'sub_chunk_size': self.sub_chunk_size,
             'files': [f.__dict__ for f in sorted(list(self.files.values()), key=lambda f: f.path)],
             'chunks': [c.__dict__ for c in sorted(list(self.chunks), key=lambda c: c.path + f'{c.pos:016}')]}
 
     @staticmethod
     def from_dict(data: Dict) -> 'SyncBatch':
-        res = SyncBatch(chunk_size=data['chunk_size'])
+        res = SyncBatch(chunk_size=data['chunk_size'], sub_chunk_size=data['sub_chunk_size'])
         res.add(files=(FileAttribs(**d) for d in data['files']),
                 chunks=(FileChunk(**d) for d in data['chunks']))
         return res
 
 
-async def hash_file(fio, relpath: str, chunk_size: int, executor, progress_func: Callable, test_compress: bool) -> \
-        Generator[Future, None, None]:
-    """
-    Split given file into chunks and return multithreading futures that hash them.
+class SubChunkHashTask(HashableBase):
+    chunk: FileChunk    # Chunk this sub-part belongs to
+    pos: int            # start position in bytes
+    size: int           # chunk size in bytes
+    pos_perc: float     # pos / total_file_size (for progress reporting)
+    cmpr_size: int      # Compressed size
+    result: HashType    # Hex checksum of data contents (blake2, digest_size=12)
 
-    Hashlib releases GIL so this is fast even with a ThreadPoolExecutor. Uses memory mapping
-    instead of buffers for maximum efficiency.
+
+async def file_to_hash_tasks(fio, relpath: str, max_chunk_size: int, max_sub_chunk_size: int) -> \
+        Tuple[List[FileChunk], List[SubChunkHashTask]]:
+    """
+    Split file into chunks and chunks further into hash tasks.
+    Chunk hash will be a chain hash of sub chunk hashes (and later, file hash a chain hash of chunk hashes).
 
     :param fio: FileIO object to read from
     :param relpath: Pathname to file
-    :param executor: Executor to run hash functions in.
-    :param file_progress_func: Progress reporting callback
-    :return: Generator that yields multithreading Futures that return FileChunks
+    :param max_chunk_size: Maximum chunk size in bytes
+    :param max_sub_chunk_size: Maximum hash task size in bytes
     """
-    files_size = (await fio.stat(relpath)).st_size
-    if files_size == 0:
-        yield executor.submit(lambda: FileChunk(path=relpath, pos=0, size=0, hash=HashFunc().result(), cmpratio=1.0))
+    res_chunks, res_sub_chunks = [], []
+    assert max_chunk_size >= max_sub_chunk_size
+    file_size = (await fio.stat(relpath)).st_size
+    if file_size == 0:
+        res_chunks = [FileChunk(path=relpath, pos=0, cmpratio=1, hash='', size=0)]
+        res_sub_chunks = [SubChunkHashTask(chunk=res_chunks[0], pos=0, cmpr_size=0, result=None, pos_perc=0, size=0)]
     else:
-        def do_hash(pos, size):
-            h = HashFunc()
-            with lz4.frame.LZ4FrameCompressor() as lz:
-                prog_rate = RateLimiter(1.0, 3.0)
-                compressed_size = len(lz.begin())
-                report_pos = pos
-
-                async def io_loop():
-                    nonlocal report_pos
-                    async with fio.open_and_seek(relpath, pos, for_write=False) as inf:
-
-                        async def hash_buff(buff: bytearray):
-                            nonlocal report_pos, compressed_size
-                            await h.update_async(buff)
-                            compressed_size += len(lz.compress(buff)) if test_compress else 0
-                            report_pos += len(buff)
-                            if prog_rate.try_acquire(1.0):
-                                progress_func(relpath, 0, report_pos, files_size)
-
-                        await process_multibuffer_io(
-                            producer=file_read_producer(inf, size), consumer=hash_buff,
-                            initial_buffers=[bytearray(Defaults.FILE_BUFFER_SIZE) for i in range(5)])
-
-                asyncio.run(io_loop())
-                progress_func(relpath, size, report_pos, files_size)
-
-            compress_ratio = 1.0 if not test_compress else min(1.0, float("%.2g" % (compressed_size / size)))
-            return FileChunk(path=relpath, pos=pos, size=size, hash=h.result(), cmpratio=compress_ratio)
-
-        for pos in range(0, files_size, chunk_size):
-            yield executor.submit(do_hash, pos, min(chunk_size, files_size - pos))
+        for chunk_pos in range(0, file_size, max_chunk_size):
+            chunk = FileChunk(path=relpath, pos=chunk_pos, cmpratio=0, hash='',
+                              size=min(max_chunk_size, file_size - chunk_pos))
+            res_chunks.append(chunk)
+            for ht_pos in range(chunk.pos, chunk.pos+chunk.size, max_sub_chunk_size):
+                res_sub_chunks.append(SubChunkHashTask(
+                    chunk=chunk, pos=ht_pos, cmpr_size=None, result=None, pos_perc=float(ht_pos)/file_size,
+                    size=min(max_sub_chunk_size, (chunk.pos + chunk.size) - ht_pos)))
+    return res_chunks, res_sub_chunks
 
 
-async def scan_dir(fio, chunk_size: int, old_batch: Optional[SyncBatch],
-                   progress_func: Callable, test_compress: bool, executor: ThreadPoolExecutor) ->\
+async def scan_dir(fio, max_chunk_size: int, max_sub_chunk_size: int, old_batch: Optional[SyncBatch],
+                   progress_func: Callable, test_compress: bool) ->\
         Tuple[SyncBatch, Iterable[str]]:
     """
     Scan given directory and generate a list of FileChunks of its contents. If old_chunks is provided,
@@ -254,10 +242,10 @@ async def scan_dir(fio, chunk_size: int, old_batch: Optional[SyncBatch],
 
     :param fio: FileIO with basedir on folder to scan
     :param progress_func: Progress report callback - func(cur_filename, file_progress, total_progress)
-    :param chunk_size: Length of chunk to split files into
+    :param max_chunk_size: Length of chunk to split files into
+    :param max_sub_chunk_size: Block size to hash at a time (chunk has is a chain hash of sub chunks)
     :param old_batch: If given, compares dir it and skips hashing files with identical size & mtime
     :param test_compress: Test for compressibility while hashing
-    :param executor: ThreadPoolExecutor to use for hashing
     :return: Tuple(New list of FileChunks or old_chunks if no changes are detected, List[errors],
                    Dict[<hash>: compress_ratio, ...])
     """
@@ -288,12 +276,11 @@ async def scan_dir(fio, chunk_size: int, old_batch: Optional[SyncBatch],
     total_remaining = total_size
     progr_lock = threading.RLock()  # Mutex to maintain integrity of total_remaining inside file_progress()
 
-    def file_progress(path, just_read, pos, file_size):
+    def file_progress(path, just_read, file_perc):
         nonlocal total_remaining
         with progr_lock:
             total_remaining -= just_read
-            perc = float(pos) / file_size if file_size > 0 else 1.0
-            progress_func(path, total_progress=1-float(total_remaining)/(total_size or 1), file_progress=perc)
+            progress_func(path, total_progress=1-float(total_remaining)/(total_size or 1), file_progress=file_perc)
 
     # Hash files as needed
     res_files, res_chunks = [], []
@@ -304,26 +291,70 @@ async def scan_dir(fio, chunk_size: int, old_batch: Optional[SyncBatch],
         res_files.append(old_batch.files[fn])
         total_remaining -= res_files[-1].size
 
-    # Hash file contents in multiple threads
-    futures = []
+    # Split files into chunks and sub chunks (hash tasks)
+    new_chunks = []
+    hash_tasks_pending = asyncio.Queue()
+    hash_tasks_done = []
     for fn in files_needing_rehash:
+        chs, sub_chs = await file_to_hash_tasks(fio, fn, max_chunk_size, max_sub_chunk_size)
+        new_chunks.extend(chs)
+        for ht in sub_chs:
+            hash_tasks_pending.put_nowait(ht)
+
+    # Hash files (process SubChunkHashTask) using multiple threads
+    if True:
+        async def hash_and_compress(buff):
+            hash_task, data = buff
+            def do_it():
+                file_progress(hash_task.chunk.path, hash_task.size, hash_task.pos_perc)
+                with lz4.frame.LZ4FrameCompressor() as lz:
+                    return HashFunc().update(data).result(),\
+                           (len(lz.begin()) + len(lz.compress(data)) + len(lz.flush())) if test_compress else len(data)
+            loop = asyncio.get_running_loop()
+            hash_task.result, hash_task.cmpr_size = await loop.run_in_executor(None, do_it)
+            hash_tasks_done.append(hash_task)
+
+        fh = None
+        async def read_file_sub_chunks(__):
+            """Producer for producer/consumer loop."""
+            nonlocal fh
+            if hash_tasks_pending.empty():
+                return None
+            else:
+                ht = hash_tasks_pending.get_nowait()
+                # Reuse current file handle if possible
+                if not fh or fh.name != ht.chunk.path or await fh.tell() != ht.pos:
+                    if fh: await fh.close()
+                    fh = await fio.open_and_seek(ht.chunk.path, ht.pos, for_write=False).__aenter__()
+                return ht, await fh.read(ht.size)
+
         try:
-            async for ft in hash_file(fio, fn, chunk_size, executor, file_progress, test_compress=test_compress):
-                futures.append(ft)
+            await process_multibuffer_io(
+                producer=read_file_sub_chunks, consumer=hash_and_compress, parallel_consumers=True,
+                initial_buffers=[(True, True) for __ in range(Defaults.MAX_WORKERS)])
         except (OSError, IOError) as e:
-            errors.append(f'[{fn}]: ' + str(e))
-    for f in as_completed(futures):
-        try:
-            res_chunks.append(f.result())
-        except (OSError, IOError) as e:
-            errors.append(str(e))
+            errors.append(f'Hashing failed: ' + str(e))
+        finally:
+            if fh: await fh.close()
+
+    # Combine SubChunkHashTasks results in Chunks
+    # (multithread processed SubChunkHashTasks may be out of order; sort them by pos to get correct chain hashes)
+    hash_tasks_done = sorted(hash_tasks_done, key=lambda ht: ht.chunk.path + '\0' + '\0' + "%016d" % ht.pos)
+    for ht in hash_tasks_done:
+        ht.chunk.cmpratio += ht.cmpr_size  # temporarily accumulate size, we'll calculate ratio later
+        ht.chunk.hash = HashFunc().update((ht.chunk.hash + ht.result).encode('utf-8')).result()
+        assert ht.chunk in new_chunks
+    for c in new_chunks:
+        c.cmpratio = min(1.0, float("%.2g" % (c.cmpratio / (c.size or 1))))
+    res_chunks.extend(new_chunks)
 
     # Read file attributes and calculate tree hashes
     for fn in files_needing_rehash:
         try:
             s = await fio.stat(fn)
             chunks = [c for c in res_chunks if c.path == fn]
-            res_files.append(FileAttribs(path=fn, size=s.st_size, mtime=int(s.st_mtime), treehash=calc_tree_hash(chunks)))
+            assert fn not in (fa.path for fa in res_files)
+            res_files.append(FileAttribs(path=fn, size=s.st_size, mtime=int(s.st_mtime), chain_hash=calc_chain_hash(chunks)))
         except (OSError, IOError) as e:
             errors.append(f'[{fn}]: ' + str(e))
 
@@ -331,16 +362,12 @@ async def scan_dir(fio, chunk_size: int, old_batch: Optional[SyncBatch],
     dirs = set(dirs) | set((str(PurePosixPath(Path(p).parent)) for p in fnames)) - set('.')
     for d in dirs:
         try:
-            res_files.append(FileAttribs(path=d+'/', size=-1, treehash=None,
+            res_files.append(FileAttribs(path=d+'/', size=-1, chain_hash=None,
                                          mtime=int((await fio.stat(d)).st_mtime)))
         except (OSError, IOError) as e:
             errors.append(f'[{d}/]: ' + str(e))
 
-    res = SyncBatch(chunk_size)
+    res = SyncBatch(max_chunk_size, max_sub_chunk_size)
     res.add(files=res_files, chunks=res_chunks)
-
-    for x in (*res.chunks, *res.files.values()):
-        assert isinstance(x.path, str)
-        assert '\\' not in x.path, f"Non-posix path: '{x.path}'"
 
     return res, errors

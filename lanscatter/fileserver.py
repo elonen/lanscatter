@@ -8,7 +8,7 @@ from .chunker import SyncBatch
 class FileServer:
 
     def __init__(self, status_func: Callable, upload_finished_func=None):
-        self.batch = SyncBatch(0)
+        self.batch = SyncBatch()
         self.base_url: str = '(server not running)'
         self.hostname = socket.gethostname()
         self.upload_times = []              # List of how long each upload took (for tracking speed)

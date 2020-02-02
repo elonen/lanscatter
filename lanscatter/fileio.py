@@ -7,7 +7,7 @@ import lz4.frame
 from types import SimpleNamespace
 
 from .common import Defaults, process_multibuffer_io, file_read_producer
-from .chunker import FileChunk, HashFunc
+from .chunker import FileChunk
 from .ratelimiter import RateLimiter
 
 
@@ -47,7 +47,7 @@ class FileIO:
             raise FileNotFoundError(f"Required path does not exist: {str(p)}")
         return p
 
-    def open_and_seek(self, path: str, pos: int, for_write: bool = False):
+    def open_and_seek(self, rel_path: str, pos: int, for_write: bool = False):
         """
         Helper. Open file for read or write and seek/grow to given size.
         :param path: File to open
@@ -55,7 +55,7 @@ class FileIO:
         :param for_write: If true, open for write, otherwise for read
         :return: Aiofiles file handle
         """
-        path = self.resolve_and_sanitize(path)
+        path = self.resolve_and_sanitize(rel_path)
         if for_write:
             mode = ('r+b' if path.is_file() else 'wb')
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -69,7 +69,7 @@ class FileIO:
             async def __aenter__(self):
                 self.f = await aiofiles.open(path, mode=mode)
                 await self.f.seek(pos)
-                self.f.name = path
+                self.f.name = rel_path
                 return self.f
             async def __aexit__(self, exc_type, exc, tb):
                 if for_write:
@@ -154,7 +154,6 @@ class FileIO:
         Locally copy chunk contents from one file (+position) to another.
         :param copy_from: Where to copy from
         :param copy_to: Where to copy into
-        :return: True if chunk was copied ok, False if content hash didn't match anymore
         """
         if copy_from.path == copy_to.path and copy_from.pos == copy_to.pos:
             return True
@@ -165,17 +164,13 @@ class FileIO:
             if not inf:
                 raise FileNotFoundError(f'Local copy failed, no such file: {str(copy_from.path)}')
             async with self.open_and_seek(copy_to.path, copy_to.pos, for_write=True) as outf:
-                remaining = copy_from.size
-                csum = HashFunc()
 
-                async def write_and_csum(buff):
-                    await asyncio.gather(outf.write(buff), csum.update_async(buff))
+                async def write_file(buff):
+                    await outf.write(buff)
 
                 await process_multibuffer_io(
-                    producer=file_read_producer(inf, copy_from.size), consumer=write_and_csum,
+                    producer=file_read_producer(inf, copy_from.size), consumer=write_file,
                     initial_buffers=[bytearray(Defaults.FILE_BUFFER_SIZE) for i in range(5)])
-
-            return csum.result() == copy_from.hash
 
 
     async def download_chunk(self, chunk: FileChunk, url: str, http_session: ClientSession, file_size: int, progr_func) -> None:
@@ -196,19 +191,17 @@ class FileIO:
                     use_lz4 = 'lz4' in str(resp.headers.get('Content-Encoding'))
                     with lz4.frame.LZ4FrameDecompressor() as lz:
                         async with self.open_and_seek(chunk.path, chunk.pos, for_write=True) as outf:
-                            #csum = HashFunc()
                             progr_timer = RateLimiter(1.0, 2.0)
 
-                            async def read_http(buff_dummy):
+                            async def read_http(__):
                                 limited_n = int(await self.dl_limiter.acquire(
                                     Defaults.DOWNLOAD_BUFFER_MAX, Defaults.NETWORK_BUFFER_MIN))
                                 new_buff = await resp.content.read(limited_n)
                                 self.dl_limiter.unspend(limited_n - len(new_buff))
                                 return new_buff or None
 
-                            async def write_and_csum(buff):
+                            async def write_file(buff):
                                 nonlocal total_dl
-                                #await asyncio.gather(outf.write(buff), csum.update_async(buff))
                                 data = lz.decompress(buff) if use_lz4 else buff
                                 total_dl += len(data)
                                 if progr_timer.try_acquire(1.0):
@@ -216,13 +209,9 @@ class FileIO:
                                 await outf.write(data)
 
                             await process_multibuffer_io(
-                                producer=read_http, consumer=write_and_csum, timeout=Defaults.TIMEOUT_WHEN_NO_PROGRESS,
+                                producer=read_http, consumer=write_file, timeout=Defaults.TIMEOUT_WHEN_NO_PROGRESS,
                                 initial_buffers=[True for i in range(5)])
                             progr_func(total_dl, file_size)
-
-                            # Checksuming here is actually waste of CPU since we'll rehash sync dir anyway when finished
-                            #if csum.result() != chunk.hash:
-                            #    raise IOError(f'Checksum error verifying {chunk.hash} from {url}')
 
                             if file_size >= 0:
                                 await outf.truncate(file_size)

@@ -370,8 +370,7 @@ async def run_master_server(base_dir: str,
     # Mute asyncio task exceptions on KeyboardInterrupt / thread CancelledError
     kb_exit, loop = False, asyncio.get_event_loop()
     loop.set_exception_handler(lambda l, c: loop.default_exception_handler(c) if not kb_exit else None)
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
-    loop.set_default_executor(executor)
+    loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=max_workers))
 
     server = MasterNode(status_func=status_func, chunk_size=chunk_size)
 
@@ -386,8 +385,9 @@ async def run_master_server(base_dir: str,
             # TODO: integrate with inotify (watchdog package) to avoid frequent rescans
             def scandir_blocking():
                 return asyncio.run(scan_dir(
-                    fio, chunk_size=chunk_size, old_batch=server.file_server.batch,
-                    progress_func=progress_func_adapter, test_compress=(not disable_lz4), executor=executor))
+                    fio, max_chunk_size=chunk_size, old_batch=server.file_server.batch,
+                    max_sub_chunk_size=int(chunk_size / Defaults.HASH_TASKS_PER_CHUNK),
+                    progress_func=progress_func_adapter, test_compress=(not disable_lz4)))
             try:
                 new_batch, errors = await loop.run_in_executor(None, scandir_blocking)
                 for i, e in enumerate(errors):

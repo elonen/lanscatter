@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Callable, Iterable
+from typing import Callable, Iterable, List
 import json, argparse, asyncio, time, aiofiles
 from contextlib import suppress
 
@@ -9,8 +9,10 @@ class Defaults:
 
     TCP_PORT_PEER = 10565
     TCP_PORT_MASTER = 10564
-    CHUNK_SIZE = 128 * 1024 * 1024
     BANDWIDTH_LIMIT_MBITS_PER_SEC = 10000
+
+    CHUNK_SIZE = 128 * 1024 * 1024
+    HASH_TASKS_PER_CHUNK = 8  # How many parts to split chunks when tree-hashing it
 
     FILE_BUFFER_SIZE = 256 * 1024
     DOWNLOAD_BUFFER_MAX = 256 * 1024
@@ -22,11 +24,11 @@ class Defaults:
     CONCURRENT_TRANSFERS_PEER = 2
     DIR_SCAN_INTERVAL_PEER = 60
 
-    MAX_WORKERS = 16
+    MAX_WORKERS = 8
     TIMEOUT_WHEN_NO_PROGRESS = 8
 
     APP_VERSION = '0.1.2'
-    PROTOCOL_VERSION = '2.0.0'
+    PROTOCOL_VERSION = '3.0.0'
 
 
 def drop_process_priority():
@@ -135,15 +137,21 @@ def json_status_func(progress: float = None, cur_status: str = None,
         }))
 
 
-async def process_multibuffer_io(producer: Callable, consumer: Callable, initial_buffers: Iterable, timeout=999999):
+async def process_multibuffer_io(producer: Callable, consumer: Callable, initial_buffers: Iterable,
+                                 timeout=float('inf'), parallel_consumers=False):
     """
     Buffered async producer/consumer loop framework, with optional timeout.
     Timeout guard raises a TimeoutError if neither producer nor consumer do any work in 'timeout' seconds.
+
+    By default, consumer processes buffers in linear order, which is usually fine/required for IO tasks.
+    If parallel_consumers=True, it runs multiple threads and requires consumer() to be able to process
+    buffers in arbitrary order. Useful for CPU bound tasks.
 
     :param producer: Async function that takes a buffer, writes stuff to it and returns the buffer or None if all done.
     :param consumer: Async function that takes a buffer and does something with the data (or not)
     :param initial_buffers: Arbitrary number of pre-create buffers to use for IO.
     :param timeout: Timeout after this many seconds if no progress is made.
+    :param parallel_consumers: If true, consumer loop will use multithreading in arbitrary order.
     """
     end_trigger = asyncio.Event()
     last_progress_t = time.time()
@@ -162,17 +170,32 @@ async def process_multibuffer_io(producer: Callable, consumer: Callable, initial
             if b is None:
                 break
 
-    async def consumer_loop():
+    async def consumer_task(buff):
         nonlocal last_progress_t
-        while True:
-            b = await full_buffers.get()
-            if b is None:
-                end_trigger.set()  # let no_progress_timeout_guard() know we're done
-                break
-            else:
-                await consumer(b)
-                await free_buffers.put(b)
-                last_progress_t = time.time()
+        await consumer(buff)
+        await free_buffers.put(buff)
+        last_progress_t = time.time()
+
+    async def consumer_loop():
+        tasks: List[asyncio.Task] = []
+        try:
+            while True:
+                b = await full_buffers.get()
+                tasks = [t for t in tasks if not t.done()]
+
+                if b is None:  # None = loop termination from producer
+                    await asyncio.gather(*tasks)
+                    end_trigger.set()  # Let no_progress_timeout_guard() know we're done
+                    break
+                else:
+                    if parallel_consumers:
+                        tasks.append(asyncio.create_task(consumer_task(b)))
+                    else:
+                        await consumer_task(b)
+        finally:
+            for t in (t for t in tasks if not t.done()):
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def no_progress_timeout_guard():
         nonlocal end_trigger, last_progress_t
@@ -194,7 +217,7 @@ def file_read_producer(inf, size: int) -> Callable:
         nonlocal remaining
         if remaining > 0:
             if remaining < len(buff):
-                buff = bytearray(remaining)
+                buff = memoryview(buff)[:remaining]
             cnt = await inf.readinto(buff)
             if cnt != len(buff):
                 raise IOError(f'Filesize mismatch; "{str(inf.name if hasattr(inf, "name") else str(inf))}" '
