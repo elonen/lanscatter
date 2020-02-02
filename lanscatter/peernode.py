@@ -192,14 +192,17 @@ class PeerNode:
         try:
             self.incoming.add(chunk_hash)
             await self.send_transfer_report()
-            self.status_func(log_info=f'Downloading from: {url}')
-            self.status_func(cur_status=f'Downloading chunks...',
-                             progress=len(self.local_batch.all_hashes()) / len(self.remote_batch.all_hashes()))
+
+            def progress(got, total):
+                self.status_func(cur_status=f'Downloading...',
+                                 log_info=f'From {url} ({int(float(got) / (total or 1) * 100 + 0.5)}%)',
+                                 progress=len(self.local_batch.all_hashes()) / len(self.remote_batch.all_hashes()))
 
             async with async_timeout.timeout(timeout):
                 dl_task = asyncio.create_task(
                     self.file_io.download_chunk(chunk=target, url=url, http_session=http_session,
-                                                file_size=self.remote_batch.files[target.path].size))
+                                                file_size=self.remote_batch.files[target.path].size,
+                                                progr_func=progress))
                 await asyncio.wait([dl_task, asyncio.create_task(self.exit_trigger.wait())],
                                    return_when=asyncio.FIRST_COMPLETED)
             if not dl_task.done():
@@ -364,7 +367,7 @@ class PeerNode:
 
         def __hash_dir_progress_func(cur_filename, file_progress, total_progress):
             self.status_func(progress=total_progress,
-                             cur_status=f'Hashing ({cur_filename} / {int(file_progress*100+0.5)}%)')
+                             cur_status=f'Hashing ({cur_filename} / at {int(file_progress*100+0.5)}%)')
 
         while not self.exit_trigger.is_set():
             # TODO: integrate with inotify (watchdog package) to avoid frequent rescans when up-to-date.

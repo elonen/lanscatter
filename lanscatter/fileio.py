@@ -178,7 +178,7 @@ class FileIO:
             return csum.result() == copy_from.hash
 
 
-    async def download_chunk(self, chunk: FileChunk, url: str, http_session: ClientSession, file_size: int= -1) -> None:
+    async def download_chunk(self, chunk: FileChunk, url: str, http_session: ClientSession, file_size: int, progr_func) -> None:
         """
         Download chunk from given URL and write directly into (the middle of a) file as specified by FileChunk.
         :param chunk: Specs for chunk to get
@@ -192,10 +192,12 @@ class FileIO:
                 if resp.status != 200:  # some error
                     raise IOError(f'HTTP status {resp.status}')
                 else:
+                    total_dl = 0
                     use_lz4 = 'lz4' in str(resp.headers.get('Content-Encoding'))
                     with lz4.frame.LZ4FrameDecompressor() as lz:
                         async with self.open_and_seek(chunk.path, chunk.pos, for_write=True) as outf:
                             #csum = HashFunc()
+                            progr_timer = RateLimiter(1.0, 2.0)
 
                             async def read_http(buff_dummy):
                                 limited_n = int(await self.dl_limiter.acquire(
@@ -205,12 +207,18 @@ class FileIO:
                                 return new_buff or None
 
                             async def write_and_csum(buff):
+                                nonlocal total_dl
                                 #await asyncio.gather(outf.write(buff), csum.update_async(buff))
-                                await outf.write(lz.decompress(buff) if use_lz4 else buff)
+                                data = lz.decompress(buff) if use_lz4 else buff
+                                total_dl += len(data)
+                                if progr_timer.try_acquire(1.0):
+                                    progr_func(total_dl, file_size)
+                                await outf.write(data)
 
                             await process_multibuffer_io(
                                 producer=read_http, consumer=write_and_csum, timeout=Defaults.TIMEOUT_WHEN_NO_PROGRESS,
                                 initial_buffers=[True for i in range(5)])
+                            progr_func(total_dl, file_size)
 
                             # Checksuming here is actually waste of CPU since we'll rehash sync dir anyway when finished
                             #if csum.result() != chunk.hash:

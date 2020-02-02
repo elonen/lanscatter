@@ -379,7 +379,7 @@ async def run_master_server(base_dir: str,
         """Periodically scan sync directory for changes"""
         def progress_func_adapter(cur_filename, file_progress, total_progress):
             status_func(progress=total_progress,
-                        cur_status=f'Hashing "{cur_filename}" ({int(file_progress * 100 + 0.5)}% done)')
+                        cur_status=f'Hashing ({cur_filename} / at {int(file_progress * 100 + 0.5)}%)')
 
         fio = FileIO(Path(base_dir))
         while True:

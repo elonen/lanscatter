@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, Future, as_completed, Cancell
 from pathlib import Path, PurePosixPath
 import lz4.frame
 from .common import Defaults, process_multibuffer_io, file_read_producer
+from .ratelimiter import RateLimiter
 
 # Tools for scanning files in a directory and splitting them into hashed chunks.
 # MasterNode and PeerNode both use this for maintaining and syncing their state.
@@ -212,23 +213,30 @@ async def hash_file(fio, relpath: str, chunk_size: int, executor, progress_func:
         yield executor.submit(lambda: FileChunk(path=relpath, pos=0, size=0, hash=HashFunc().result(), cmpratio=1.0))
     else:
         def do_hash(pos, size):
-            progress_func(relpath, size, pos, files_size)
             h = HashFunc()
             with lz4.frame.LZ4FrameCompressor() as lz:
+                prog_rate = RateLimiter(1.0, 3.0)
                 compressed_size = len(lz.begin())
+                report_pos = pos
 
                 async def io_loop():
+                    nonlocal report_pos
                     async with fio.open_and_seek(relpath, pos, for_write=False) as inf:
+
                         async def hash_buff(buff: bytearray):
-                            nonlocal compressed_size
+                            nonlocal report_pos, compressed_size
                             await h.update_async(buff)
                             compressed_size += len(lz.compress(buff)) if test_compress else 0
+                            report_pos += len(buff)
+                            if prog_rate.try_acquire(1.0):
+                                progress_func(relpath, 0, report_pos, files_size)
 
                         await process_multibuffer_io(
                             producer=file_read_producer(inf, size), consumer=hash_buff,
                             initial_buffers=[bytearray(Defaults.FILE_BUFFER_SIZE) for i in range(5)])
 
                 asyncio.run(io_loop())
+                progress_func(relpath, size, report_pos, files_size)
 
             compress_ratio = 1.0 if not test_compress else min(1.0, float("%.2g" % (compressed_size / size)))
             return FileChunk(path=relpath, pos=pos, size=size, hash=h.result(), cmpratio=compress_ratio)
