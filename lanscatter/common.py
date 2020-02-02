@@ -27,7 +27,7 @@ class Defaults:
     MAX_WORKERS = 8
     TIMEOUT_WHEN_NO_PROGRESS = 8
 
-    APP_VERSION = '0.1.2'
+    APP_VERSION = '0.1.3'
     PROTOCOL_VERSION = '3.0.0'
 
 

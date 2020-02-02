@@ -80,7 +80,7 @@ Features and notable differences to Btsync/Resilio, Syncthing and Dropbox-like s
 ## Technologies
 
 Lanscatter is built on **Python 3.7** using **asyncio** (aiohttp & aiofiles),
-**wxPython** for cross-platform GUI, **Blake2b** algorithm for chunk hashing, **LZ4** for in-flight compression,
+**wxPython** for cross-platform GUI, multi-CPU chained **Blake2b** algorithm for chunk hashing, **LZ4** for in-flight compression,
 **pytest** for unit / integration tests and **pyinstaller** for packaging / freezing into exe files.
 
 It runs on Python 3.8 as well, but wxPython and pyinstaller seem to have some compatiblity issues currently
