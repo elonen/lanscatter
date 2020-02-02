@@ -1,6 +1,6 @@
 from contextlib import suppress
 import multiprocessing as mp
-import pytest, shutil, time, os, io, random, traceback, sys, threading, filecmp, json
+import pytest, shutil, time, os, io, random, traceback, sys, threading, filecmp, json, itertools
 from pathlib import Path
 from types import SimpleNamespace
 import asyncio, aiohttp
@@ -41,7 +41,7 @@ def test_dir_factory(tmp_path):
                 f.write(pattern)
                 sz += len(pattern)
             f.truncate(total_size)
-        mtime = int(time.time() * random.random())
+        mtime = float(time.time() * random.random())
         os.utime(str(p), (mtime, mtime))
 
     rnd_postfix = 0
@@ -160,25 +160,43 @@ def _assert_identical_dir(p1, p2):
     assert not cmp.right_only, f'Files not found from {p.name}: {str(cmp.right_only)}'
 
 
+def _lines_with_match(text, match_str):
+    return tuple(li for li in zip(itertools.count(0, 1), text.split('\n')) if match_str in li[1])
+
+
+def _line_idx_with(text, match_str, idx):
+    lines = _lines_with_match(text, match_str)
+    try:
+        return lines[idx][0] if lines else None
+    except IndexError:
+        return None
+
 
 
 def test_minimal_downloads(test_dir_factory):
     """Test that each chunk is downloaded only once."""
-    master = _spawn_sync_process(f'seed', True, test_dir_factory('seed'), PORT_BASE, '', ['--no-compress'])
+    master = _spawn_sync_process(f'seed', True, test_dir_factory('seed'), PORT_BASE, '', ['--no-compress', '--rescan-interval', '2'])
     peer = _spawn_sync_process(f'leecher', False, test_dir_factory('leecher', keep_empty=True), PORT_BASE+1, f'localhost:{PORT_BASE}')
 
-    _wait_seconds(4)
+    _wait_seconds(8)
     _kill_procs(master, peer)
+    master_log = master.out.getvalue()
 
     # Count hash downloads from master's log
-    master_lines = str(master.out.getvalue()).split('\n')
+    master_lines = str(master_log).split('\n')
     dl_lines = [l for l in master_lines if 'GET /blob/' in l]
     assert len(dl_lines) > 0, "No download log messages on master"
     downloaded_hashes = [l.split('/')[-1] for l in dl_lines]
     for h in downloaded_hashes:
         assert downloaded_hashes.count(h) == 1, f"Hash {h} was downloaded more than once."
 
-    assert ('Compression ratio: 0.' not in master.out.getvalue()), 'Got compression stats even with --no-compress'
+    assert 'Compression ratio: 0.' not in master_log, 'Got compression stats even with --no-compress'
+
+    master_log = master.out.getvalue()
+    assert 'Hashing' in master_log, "Master didn't hash files."
+    assert 'New file batch' in master_log, "Master didn't report new file batch."
+    assert _line_idx_with(master_log, 'New file batch', 0) >_line_idx_with(master_log, 'Hashing', -1), \
+        'Master hashed files multiple times'
 
     # Also check for basic conditions
     for p in (master, peer):

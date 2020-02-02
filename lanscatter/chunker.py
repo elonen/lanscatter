@@ -274,7 +274,7 @@ async def scan_dir(fio, chunk_size: int, old_batch: Optional[SyncBatch],
         try:
             f = old_batch.files.get(p) if old_batch else None
             s = await fio.stat(p)
-            return f is None or f.size != s.st_size or f.mtime != s.st_mtime
+            return f is None or f.size != s.st_size or f.mtime != int(s.st_mtime)
         except (FileNotFoundError, KeyError):
             return True
 
