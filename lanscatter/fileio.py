@@ -103,6 +103,7 @@ class FileIO:
                         reason='OK',
                         headers={'Content-Type': 'application/octet-stream', 'Content-Disposition': 'inline',
                                  'Content-Encoding': 'lz4' if use_lz4 else 'None'})
+                    response.enable_compression(False)  # Make sure there's no double compression
                     await response.prepare(request)
                     if use_lz4:
                         await response.write(lz.begin())
