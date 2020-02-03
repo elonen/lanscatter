@@ -1,6 +1,6 @@
 from contextlib import suppress
 import multiprocessing as mp
-import pytest, shutil, time, os, io, random, traceback, sys, threading, filecmp, json, itertools
+import pytest, shutil, time, os, io, random, traceback, sys, threading, filecmp, json, itertools, signal
 from pathlib import Path
 from types import SimpleNamespace
 import asyncio, aiohttp
@@ -22,7 +22,7 @@ TEST_DIR = './temp_test_dir'
 TEST_FILES_PER_DIR = 3
 CHUNK_SIZE = 50000
 PORT_BASE = 53000 + int(2000*random.random())
-TEST_PEER_NAMES = {0: 'peer_empty', 1: 'peer_corrupt', 2: 'peer_non_empty'}
+TEST_PEER_NAMES = {0: 'peer_empty', 1: 'peer_corrupt', 2: 'peer_non_empty', 3: 'peer_crashed'}
 
 # Make sure buffers don't cover whole chunks, for realistic testing
 common.Defaults.FILE_BUFFER_SIZE = int(CHUNK_SIZE * 0.7)
@@ -135,7 +135,7 @@ def _wait_seconds(s):
         print(f"Waiting {s-x} seconds...")
         time.sleep(1)
 
-def _kill_procs(*args):
+def _terminate_procs(*args):
     for x in args:
         print(f"Terminating '{x.name}'...")
         x.proc.terminate()
@@ -154,10 +154,10 @@ def _print_process_stdout(p):
 
 def _assert_identical_dir(p1, p2):
     cmp = filecmp.dircmp(p1.dir, p2.dir)
-    assert not cmp.diff_files, f'Differing files between {p.name} and {p2.name}: {str(cmp.diff_files)}'
-    assert not cmp.funny_files, f'"Funny" files between {p.name} and {p2.name}: {str(cmp.funny_files)}'
-    assert not cmp.left_only, f'Files found only from {p.name}: {str(cmp.left_only)}'
-    assert not cmp.right_only, f'Files not found from {p.name}: {str(cmp.right_only)}'
+    assert not cmp.diff_files, f'Differing files between {p1.name} and {p2.name}: {str(cmp.diff_files)}'
+    assert not cmp.funny_files, f'"Funny" files between {p1.name} and {p2.name}: {str(cmp.funny_files)}'
+    assert not cmp.left_only, f'Files found only from {p1.name}: {str(cmp.left_only)}'
+    assert not cmp.right_only, f'Files not found from {p1.name}: {str(cmp.right_only)}'
 
 
 def _lines_with_match(text, match_str):
@@ -179,7 +179,7 @@ def test_minimal_downloads(test_dir_factory):
     peer = _spawn_sync_process(f'leecher', False, test_dir_factory('leecher', keep_empty=True), PORT_BASE+1, f'localhost:{PORT_BASE}')
 
     _wait_seconds(8)
-    _kill_procs(master, peer)
+    _terminate_procs(master, peer)
     master_log = master.out.getvalue()
 
     # Count hash downloads from master's log
@@ -224,8 +224,14 @@ def test_swarm__corruption__bad_protocol__uptodate__errors(test_dir_factory):
             # Start server after the first two peers to test start order
             master = _spawn_sync_process(f'master', True, seed_dir, PORT_BASE, '')
 
+    # Kill one peer
+    _wait_seconds(2)
+    print(f"Killing peer '{peers[3].name}' to emulate crashed client...")
+    os.kill(peers[3].proc.pid, (signal.SIGKILL if hasattr(signal, 'SIGKILL') else signal.SIGTERM))
+    del peers[3]  # forget it -- don't perform tests etc
+
     # Alter files on one peer in the middle of a sync
-    _wait_seconds(4)
+    _wait_seconds(2)
     print(f"Corrupting some files on '{peers[1].name}'...")
     try:
         shutil.rmtree(peers[1].dir + '/dir2')                       # Delete a dir
@@ -277,9 +283,9 @@ def test_swarm__corruption__bad_protocol__uptodate__errors(test_dir_factory):
         assert False, "Request tests timed out."
 
     _wait_seconds(10)
-    _kill_procs(master, *peers)
+    _terminate_procs(master, *peers)
 
-    print(f"All nodes killed. Testing results...")
+    print(f"All nodes terminated. Testing results...")
 
     assert any([('GET /blob/' in p.out.getvalue()) for p in peers]), 'No P2P transfers happened'
 
