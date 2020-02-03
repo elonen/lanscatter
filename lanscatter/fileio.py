@@ -1,15 +1,15 @@
 from pathlib import Path, PurePosixPath
 from aiohttp import web, ClientSession
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict, Iterable
 from contextlib import suppress
-import aiofiles, os, time, asyncio, aiohttp, mmap
+import aiofiles, os, time, asyncio, aiohttp, platform, subprocess
+
 import lz4.frame
 from types import SimpleNamespace
 
 from .common import Defaults, process_multibuffer_io, file_read_producer
 from .chunker import FileChunk
 from .ratelimiter import RateLimiter
-
 
 class FileIO:
     """
@@ -73,6 +73,7 @@ class FileIO:
                 return self.f
             async def __aexit__(self, exc_type, exc, tb):
                 if for_write:
+                    pass
                     await self.f.flush()
                     await asyncio.get_running_loop().run_in_executor(None, os.fsync, self.f.fileno())
                 await self.f.close()
@@ -212,6 +213,26 @@ class FileIO:
 
                             if file_size >= 0:
                                 await outf.truncate(file_size)
+
+    def try_precreate_large_sparse_file(self, path, size: int) -> bool:
+        """
+        Attempts to create a sparse file 'path' with given size, if it doesn't exist already.
+        This is an optimization, so no guarantees are made that the file exists after the call.
+        :return: True if complete success, False otherwise
+        """
+        def shell(command):
+            res = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+            return res.returncode == 0
+
+        # On Windows, call the 'fsutil' command
+        if any(platform.win32_ver()):
+            with suppress(PermissionError, FileNotFoundError):
+                p = self.resolve_and_sanitize(str(path))
+                if not p.exists():
+                    return shell(['fsutil', 'file', 'createnew', str(p.absolute()), str(size)]) and \
+                           shell(['fsutil', 'sparse', 'setflag', str(p.absolute())]) and \
+                           shell(['fsutil', 'sparse', 'setrange', str(p.absolute()), '0', str(size)])
+        return False
 
 
     async def change_mtime(self, path, mtime):

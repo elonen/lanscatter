@@ -27,6 +27,8 @@ class Defaults:
     MAX_WORKERS = 8
     TIMEOUT_WHEN_NO_PROGRESS = 8
 
+    SPARSE_FILE_MIN_SIZE = 128 * 1024 * 1024  # Sparse file creation on Windows entails slow shell calls
+
     APP_VERSION = '0.1.3'
     PROTOCOL_VERSION = '3.0.0'
 

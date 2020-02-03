@@ -3,7 +3,6 @@ from types import SimpleNamespace
 import os, json, hashlib, asyncio, time
 import aiofiles, aiofiles.os, collections, threading
 import mmap
-from concurrent.futures import ThreadPoolExecutor, Future, as_completed, CancelledError
 from pathlib import Path, PurePosixPath
 import lz4.frame
 from .common import Defaults, process_multibuffer_io, file_read_producer

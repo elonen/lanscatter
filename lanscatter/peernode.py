@@ -1,10 +1,12 @@
 from typing import Callable, Dict, Tuple, Set, Optional
 import asyncio, aiohttp
-from aiohttp import web, WSMsgType
+from aiohttp import WSMsgType
 from pathlib import Path
 from contextlib import suppress
 import async_timeout
-import traceback, time, argparse, os, collections, json, platform
+import traceback, time, json, platform, os
+from concurrent.futures import ThreadPoolExecutor
+
 from signal import SIGINT, SIGTERM
 import concurrent.futures
 
@@ -93,6 +95,15 @@ class PeerNode:
                     await self.file_io.change_mtime(p, f.mtime)
                     self.local_batch.add(files=[f])
 
+            # Precreate large sparse files
+            with ThreadPoolExecutor(max_workers=Defaults.MAX_WORKERS) as executor:
+                files = [self.remote_batch.files[p] for p in path_diff.there_only]
+                def doit(f):
+                    if self.file_io.try_precreate_large_sparse_file(f.path, f.size):
+                        self.status_func(log_info=f"Precreated sparse file: '{f.path}' ({int(f.size/1024/1024)} MB)")
+                executor.map(doit, (f for f in files if (
+                        not f.is_dir and f.size >= max(Defaults.SPARSE_FILE_MIN_SIZE, self.remote_batch.chunk_size))))
+
             # Check each missing chunk to see if we've already got it in another local file
             for missing in chunk_diff.there_only:
                 dupe = self.local_batch.first_chunk_with(missing.hash)
@@ -122,7 +133,7 @@ class PeerNode:
                     await self.file_io.remove_file_and_paths(f.path)
                 elif here.is_dir:
                     if here.mtime != there.mtime:
-                        self.status_func(log_info=f'LOCAL: Fixing mtime for dir "{here.path}".')
+                        self.status_func(log_info=f'LOCAL: Fixing mtime for dir "{here.path}"')
                         await self.file_io.change_mtime(here.path, there.mtime)
                         here.mtime = there.mtime
                 else:
