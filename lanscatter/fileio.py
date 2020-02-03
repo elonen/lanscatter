@@ -129,11 +129,8 @@ class FileIO:
 
         except asyncio.CancelledError as e:
             # If client disconnected, predict how long upload would have taken
-            try:
-                predicted_time = (time.time() - start_t) / (1-remaining/chunk.size)
-                return response, predicted_time, None
-            except ZeroDivisionError:
-                return response, None, None
+            predicted_time = (time.time() - start_t) / (upload_size or 1) * chunk.size
+            return response, predicted_time, None
 
         except PermissionError as e:
             raise web.HTTPForbidden(reason=str(e))
