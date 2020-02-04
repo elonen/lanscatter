@@ -1,6 +1,7 @@
 from datetime import datetime
 from typing import Callable, Iterable, List
-import json, argparse, asyncio, time, aiofiles
+import json, argparse, asyncio, time
+import psutil, platform, os
 from contextlib import suppress
 
 class Defaults:
@@ -26,6 +27,7 @@ class Defaults:
 
     MAX_WORKERS = 8
     TIMEOUT_WHEN_NO_PROGRESS = 8
+    MIN_LOG_RESOUCE_USAGE_PERIOD = 30
 
     SPARSE_FILE_MIN_SIZE = 128 * 1024 * 1024  # Sparse file creation on Windows entails slow shell calls
 
@@ -34,7 +36,6 @@ class Defaults:
 
 
 def drop_process_priority():
-    import psutil, platform, os
     if "indows" in platform.system():
         psutil.Process(os.getpid()).nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
     else:
@@ -98,6 +99,18 @@ def parse_cli_args(is_master: bool):
     return parsed
 
 
+pru_time = 0  # time.time()
+def print_resource_usage(log_func):
+    global pru_time
+    if time.time() - pru_time > Defaults.MIN_LOG_RESOUCE_USAGE_PERIOD:
+        pru_time = time.time()
+        process = psutil.Process(os.getpid())
+        ram_usage_mb = int(process.memory_info().rss / 1024 / 1024 + 0.5)
+        file_handles = len(process.open_files())
+        log_func(log_debug=f'Resource usage: {ram_usage_mb} MB RAM, {file_handles} file handles')
+    pass
+
+
 def make_human_cli_status_func(log_level_debug=False, print_func=None):
     print_func = print_func or (lambda *args: print(*args, flush=True))
 
@@ -122,6 +135,8 @@ def make_human_cli_status_func(log_level_debug=False, print_func=None):
 
         if parts and (''.join(parts)).strip():
             print_func(f"{dt} {sep} " + ' | '.join(parts))
+
+        print_resource_usage(func)
 
     return func
 
