@@ -30,7 +30,7 @@ def test_zero():
     assert ratelimiter.RateLimiter(0, 2, slow_start=False).try_acquire(0) == 0
     assert ratelimiter.RateLimiter(0, 2).try_acquire(0) == 0
 
-    assert ratelimiter.RateLimiter(1, 0).try_acquire(1000) == 1000
+    assert ratelimiter.RateLimiter(1, 0).try_acquire(1000) == 1000  # period=0 = get infinite tokens immediately
 
     with pytest.raises(ValueError):
         ratelimiter.RateLimiter(0, 2).try_acquire(0.00001)

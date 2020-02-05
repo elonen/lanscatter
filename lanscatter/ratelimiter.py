@@ -17,12 +17,13 @@ class RateLimiter(object):
     def __init__(self, rate_limit: float, period: float = 1.0, burst_factor: float = 1.0, slow_start=True):
         """
         :param rate_limit: How many new permits per 'period' seconds to generate
-        :param period: Permit generation period
-        :param burst_factor: Allow bursts of max 'burst_factor' x 'rate_limit'.
+        :param period: Permit generation period; i.e. "generate max 'rate_limit' tokens during 'period' seconds."
+        :param burst_factor: During longer pauses, allow generating 'burst_factor' x 'rate_limit' tokens "in store".
         """
         assert(period >= 0)
         assert(rate_limit >= 0)
         if period == 0:
+            slow_start = False
             rate_limit = float('inf')
             period = 1
 
