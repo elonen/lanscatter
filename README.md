@@ -1,9 +1,9 @@
 # LANScatter - Efficient large file distributor for Local Area Networks
 
 [![Build Status](https://travis-ci.com/elonen/lanscatter.svg?token=spq2kVHPBJxJyRjUkyKT&branch=master)](https://travis-ci.com/elonen/lanscatter)
+[![Coverage Status](https://coveralls.io/repos/github/elonen/lanscatter/badge.svg?branch=master)](https://coveralls.io/github/elonen/lanscatter?branch=master)
 [![Platforms](https://img.shields.io/badge/platforms-Win%20%7C%20OSX%20%7C%20Linux-blue)]()
 [![Release](https://img.shields.io/github/v/release/elonen/lanscatter?include_prereleases)]()
-
 
 ## Introduction
 

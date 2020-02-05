@@ -6,4 +6,7 @@ python:
 
 install: pip install -r requirements.cli.txt
 
-script: pytest
+script: pytest --cov=lanscatter tests/
+
+after_success:
+  - coveralls

@@ -7,7 +7,7 @@ import async_timeout
 import traceback, time, json, platform, os
 from concurrent.futures import ThreadPoolExecutor
 
-from signal import SIGINT, SIGTERM
+import signal
 import concurrent.futures
 
 from .chunker import SyncBatch, scan_dir
@@ -442,12 +442,11 @@ class PeerNode:
         loop.set_exception_handler(lambda l, c: loop.default_exception_handler(c) if not self.exit_trigger.is_set() else None)
         loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=max_workers))
 
-        def sig_exit():
-            self.exit_trigger.set()
+        def sig_exit(*args):
+            raise KeyboardInterrupt()
         try:
-            if not any(platform.win32_ver()):
-                for sig in (SIGINT, SIGTERM):
-                    asyncio.get_running_loop().add_signal_handler(sig, sig_exit)
+            signal.signal(signal.SIGINT, sig_exit)
+            signal.signal(signal.SIGTERM, sig_exit)
 
             # TODO: Runaway loop detection and avoidance with ratelimiter
 

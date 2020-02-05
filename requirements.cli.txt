@@ -1,8 +1,11 @@
 aiohttp
 aiofiles
-pytest
-pytest-timeout
-packaging
 async-timeout
 psutil
 lz4
+
+pytest
+pytest-cov
+pytest-timeout
+
+packaging

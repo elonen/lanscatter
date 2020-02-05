@@ -1,11 +1,15 @@
+from pytest_cov.embed import cleanup_on_sigterm
+cleanup_on_sigterm()
+
 from contextlib import suppress
 import multiprocessing as mp
-import pytest, shutil, time, os, io, random, traceback, sys, threading, filecmp, json, itertools, signal
+import pytest, shutil, time, os, io, random, traceback, sys, threading, filecmp, json, itertools, signal, platform
 from pathlib import Path
 from types import SimpleNamespace
 import asyncio, aiohttp
 
 from lanscatter import common, masternode, peernode
+
 
 """
 Integration tests. Creates some empty and non-empty directories, runs a master and several peer nodes in
@@ -125,7 +129,7 @@ def _spawn_sync_process(name: str, is_master: bool, sync_dir: str, port: int, ma
     conn_recv, conn_send = mp.Pipe(duplex=False)
     argv = ['MASTER', sync_dir, '-d', '--port', str(port), '-c', '1', *extra_opts] if is_master else \
            ['PEER', master_addr, sync_dir, '-d', '--port', str(port), '--rescan-interval', '3', *extra_opts]
-    proc = mp.Process(target=_sync_proc, name='sync-worker', args=(conn_send, is_master, argv))
+    proc = mp.Process(target=_sync_proc, name='sync-worker_'+name, args=(conn_send, is_master, argv))
     threading.Thread(target=comm_thread, args=(conn_recv,)).start()
     proc.start()
     return SimpleNamespace(proc=proc, is_master=is_master, out=out, name=name, dir=sync_dir)
@@ -137,8 +141,28 @@ def _wait_seconds(s):
 
 def _terminate_procs(*args):
     for x in args:
-        print(f"Terminating '{x.name}'...")
-        x.proc.terminate()
+        print(f"Sending ctrl-c to '{x.name}'...")
+
+        if any(platform.win32_ver()):
+            # Windows propagates Ctrl-C to subprocesses up to parent. This is a hack to prevent it from killing the tests.
+            # (Sleep until the parent receives the KeyboardInterrupt, then ignore it)
+            with suppress(KeyboardInterrupt):
+                os.kill(x.proc.pid, signal.CTRL_C_EVENT)
+                time.sleep(1)
+        else:
+            os.kill(x.proc.pid, signal.SIGINT)
+
+    print("Waiting for clean exit...")
+    time.sleep(2)
+
+    if any(x.proc.is_alive() for x in args):
+        print("Waiting some more...")
+        time.sleep(3)
+    if any(x.proc.is_alive() for x in args):
+        for x in args:
+            if x.proc.is_alive() is None:
+                print("Process '{x.name}' still not finished. Terminating by force.")
+                x.proc.terminate()
 
 def _assert_node_basics(p):
     assert 'Exception' not in p.out.getvalue(), f'Exception(s) on {p.name}'
