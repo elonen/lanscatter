@@ -98,7 +98,7 @@ def test_dir_factory(tmp_path):
 
 # To be run in separate process:
 # run syncer and send stdout + exceptions through a pipe.
-def _sync_proc(conn, is_master, argv):
+def _sync_proc(conn, is_master, argv, use_gui):
     try:
         class PipeOut(io.RawIOBase):
             def write(self, b):
@@ -106,7 +106,11 @@ def _sync_proc(conn, is_master, argv):
         out = PipeOut()
         sys.stdout, sys.stderr = out, out
         sys.argv = argv
-        if is_master:
+        if use_gui:
+            print("Spawning gui...")
+            from lanscatter import gui
+            gui.main()
+        elif is_master:
             masternode.main()
         else:
             peernode.main()
@@ -115,8 +119,8 @@ def _sync_proc(conn, is_master, argv):
         conn.send((e, traceback.format_exc()))
 
 
-def _spawn_sync_process(name: str, is_master: bool, sync_dir: str, port: int, master_addr: str, extra_opts=()):
-    print(f"Spawning process for {'master' if is_master else 'peer'} node '{name}' at port {port}...")
+def _spawn_sync_process(name: str, is_master: bool, sync_dir: str, peer_port: int, master_port: int, extra_opts=(), gui=False):
+    print(f"Spawning process for {'master' if is_master else 'peer'} node '{name}' at port {master_port if is_master else peer_port}, gui={gui}...")
     out = io.StringIO()
     def comm_thread(conn):
         with suppress(EOFError):
@@ -127,9 +131,20 @@ def _spawn_sync_process(name: str, is_master: bool, sync_dir: str, port: int, ma
                 else:
                     out.write(str(o))
     conn_recv, conn_send = mp.Pipe(duplex=False)
-    argv = ['MASTER', sync_dir, '-d', '--port', str(port), '-c', '1', *extra_opts] if is_master else \
-           ['PEER', master_addr, sync_dir, '-d', '--port', str(port), '--rescan-interval', '3', *extra_opts]
-    proc = mp.Process(target=_sync_proc, name='sync-worker_'+name, args=(conn_send, is_master, argv))
+
+    if gui:
+        cfg_file = f'{sync_dir}/gui.conf'
+        print(f"Writing gui config file at '{cfg_file}'...")
+        with open(cfg_file, 'wb') as outf:
+            conf = {'sync_dir': sync_dir, 'local_master_port': str(master_port), 'local_peer_port': str(peer_port),
+                    'remote_address': 'localhost', 'remote_port': str(master_port), 'is_master': is_master, 'autostart': True}
+            outf.write(json.dumps(conf).encode('utf-8'))
+        argv = ['GUI_MASTER' if is_master else 'GUI_PEER', '-c', cfg_file, '--test-mode']
+    else:
+        argv = ['MASTER', sync_dir, '-d', '--port', str(master_port), '-c', '1', *extra_opts] if is_master else \
+               ['PEER', f'localhost:{master_port}', sync_dir, '-d', '--port', str(peer_port), '--rescan-interval', '3', *extra_opts]
+
+    proc = mp.Process(target=_sync_proc, name='sync-worker_'+name, args=(conn_send, is_master, argv, gui))
     threading.Thread(target=comm_thread, args=(conn_recv,)).start()
     proc.start()
     return SimpleNamespace(proc=proc, is_master=is_master, out=out, name=name, dir=sync_dir)
@@ -140,17 +155,20 @@ def _wait_seconds(s):
         time.sleep(1)
 
 def _terminate_procs(*args):
-    for x in args:
-        print(f"Sending ctrl-c to '{x.name}'...")
 
-        if any(platform.win32_ver()):
-            # Windows propagates Ctrl-C to subprocesses up to parent. This is a hack to prevent it from killing the tests.
-            # (Sleep until the parent receives the KeyboardInterrupt, then ignore it)
-            with suppress(KeyboardInterrupt):
-                os.kill(x.proc.pid, signal.CTRL_C_EVENT)
-                time.sleep(1)
-        else:
-            os.kill(x.proc.pid, signal.SIGINT)
+    if any(platform.win32_ver()):
+        # Test coverage stats don't get updated if Process is .terminate()d, so try extra hard to exit nicely.
+        # Windows propagates Ctrl-C to subprocesses up to parent. This is a hack to prevent it from killing the tests.
+        with suppress(KeyboardInterrupt):
+            for x in args:
+                if x.proc.is_alive():
+                    print(f"Sending ctrl-c to '{x.name}'...")
+                    os.kill(x.proc.pid, signal.CTRL_C_EVENT)
+            time.sleep(2)  # Sleep until the parent receives the KeyboardInterrupt, then ignore it
+    else:
+        for x in args:
+            if x.proc.is_alive():
+                os.kill(x.proc.pid, signal.SIGINT)
 
     print("Waiting for clean exit...")
     time.sleep(2)
@@ -160,7 +178,7 @@ def _terminate_procs(*args):
         time.sleep(3)
     if any(x.proc.is_alive() for x in args):
         for x in args:
-            if x.proc.is_alive() is None:
+            if x.proc.is_alive():
                 print("Process '{x.name}' still not finished. Terminating by force.")
                 x.proc.terminate()
 
@@ -199,8 +217,8 @@ def _line_idx_with(text, match_str, idx):
 
 def test_minimal_downloads(test_dir_factory):
     """Test that each chunk is downloaded only once."""
-    master = _spawn_sync_process(f'seed', True, test_dir_factory('seed'), PORT_BASE, '', ['--no-compress', '--rescan-interval', '2'])
-    peer = _spawn_sync_process(f'leecher', False, test_dir_factory('leecher', keep_empty=True), PORT_BASE+1, f'localhost:{PORT_BASE}')
+    master = _spawn_sync_process(f'master', True, test_dir_factory('master'), 0, PORT_BASE, ['--no-compress', '--rescan-interval', '2'])
+    peer = _spawn_sync_process(f'leecher', False, test_dir_factory('leecher', keep_empty=True), PORT_BASE+1, PORT_BASE,)
 
     _wait_seconds(8)
     _terminate_procs(master, peer)
@@ -230,23 +248,42 @@ def test_minimal_downloads(test_dir_factory):
         print(f'Peer {p.name} test ok')
 
 
+def test_gui(test_dir_factory):
+    """Test that each chunk is downloaded only once."""
+    import wx, wx.adv  # Test import
+
+    master_dir = test_dir_factory('master')
+    peer_dir = test_dir_factory('leecher', keep_empty=True)
+    master = _spawn_sync_process(f'master', True, master_dir, 0, PORT_BASE+100, gui=True)
+    peer = _spawn_sync_process(f'leecher', False, peer_dir, PORT_BASE+101, PORT_BASE+100, gui=True)
+
+    _wait_seconds(14)
+    for x in (master, peer):
+      x.proc.terminate()
+
+    _print_process_stdout(master)
+    _print_process_stdout(peer)
+    _assert_identical_dir(peer, master)
+
 
 def test_swarm__corruption__bad_protocol__uptodate__errors(test_dir_factory):
     """
     Integration test. Creates a small local swarm with peers having
     different initial contents, runs it for a bit and checks that all synced up ok.
     """
-    seed_dir = test_dir_factory('seed')
+    master_dir = test_dir_factory('master')
     peer_dirs = [test_dir_factory(TEST_PEER_NAMES[i], keep_empty=(i == 0)) for i in TEST_PEER_NAMES.keys()]
+
+    master_port = PORT_BASE+10
 
     master = None
     peers = []
     for i, name in TEST_PEER_NAMES.items():
-        peers.append(_spawn_sync_process(f'{name}', False, peer_dirs[i], PORT_BASE+1+i, f'localhost:{PORT_BASE}'))
+        peers.append(_spawn_sync_process(f'{name}', False, peer_dirs[i], master_port+1+i, master_port))
         time.sleep(0.1)  # stagger peer generation a bit
         if i == 1:
             # Start server after the first two peers to test start order
-            master = _spawn_sync_process(f'master', True, seed_dir, PORT_BASE, '')
+            master = _spawn_sync_process(f'master', True, master_dir, 0, master_port)
 
     # Kill one peer
     _wait_seconds(2)
@@ -279,30 +316,30 @@ def test_swarm__corruption__bad_protocol__uptodate__errors(test_dir_factory):
 
         async with aiohttp.ClientSession() as session:
             print("Request: try bad message action")
-            async with session.ws_connect(f'ws://localhost:{PORT_BASE}/join') as ws:
+            async with session.ws_connect(f'ws://localhost:{master_port}/join') as ws:
                 await ws.send_json({'action': 'BAD_COMMAND'})
                 recvd = await read_respose_msgs(ws)
                 assert not recvd or ('fatal' in recvd[-1]['action'])
 
             print("Request: try bad json")
-            async with session.ws_connect(f'ws://localhost:{PORT_BASE}/join') as ws:
+            async with session.ws_connect(f'ws://localhost:{master_port}/join') as ws:
                 await ws.send_str('INVALID_JSON')
                 recvd = await read_respose_msgs(ws)
                 assert not recvd or ('fatal' in recvd[-1]['action'])
 
             print("Request: HTTP on websocet endpoint")
-            async with session.get(f'http://localhost:{PORT_BASE}/join') as resp:
+            async with session.get(f'http://localhost:{master_port}/join') as resp:
                 assert resp.status != 200, "Websocket endpoint answered plain HTML request with 200."
 
             print("Request: request HTML status page")
-            async with session.get(f'http://localhost:{PORT_BASE}/') as resp:
+            async with session.get(f'http://localhost:{master_port}/') as resp:
                 assert resp.status == 200, "Server status page returned HTTP error: " + str(resp.status)
                 assert '<html' in (await resp.text()).lower(), "Status query didn't return HTML."
 
     try:
         print("Doing request tests")
         asyncio.new_event_loop().run_until_complete(
-            asyncio.wait_for(request_tests(), timeout=20))
+            asyncio.wait_for(request_tests(), timeout=30))
     except asyncio.TimeoutError:
         assert False, "Request tests timed out."
 
