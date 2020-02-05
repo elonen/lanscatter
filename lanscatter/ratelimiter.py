@@ -113,7 +113,7 @@ class RateLimiter(object):
 
 # --------------------------------------------
 
-def main():
+def main():  # pragma: no cover
     async def test():
         print("Printing 0-9, two times in a second")
         limiter = RateLimiter(2.0)

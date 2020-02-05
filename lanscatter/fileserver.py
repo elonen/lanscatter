@@ -70,10 +70,13 @@ class FileServer:
         # Setup HTTPS if certificate and key are provided (otherwise use plain HTTP):
         context = None
         if https_cert and https_key:
+            """
             self._status_func(log_info=f"SSL: Using {https_cert} and {https_key} for serving HTTPS.")
             context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
             context.load_default_certs()
             context.load_cert_chain(certfile=https_cert, keyfile=https_key)
+            """
+            raise NotImplementedError
         else:
             self._status_func(log_info=f"SSL cert not provided. Serving plain HTTP.")
 

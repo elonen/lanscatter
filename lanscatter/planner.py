@@ -42,7 +42,7 @@ class Node(ABC):
     @abstractmethod
     def destroy(self) -> None:
         """Remove node from the swarm"""
-        pass
+        raise NotImplementedError
 
     @abstractmethod
     def add_hashes(self, new_hashes: Iterable[ChunkId], clear_first=False) -> Iterable[ChunkId]:
@@ -81,9 +81,6 @@ class Transfer:
         self.to_node = to_node
         self.hash = chunk_hash
         self.timeout_secs = timeout
-
-    def __repr__(self):
-        return 'Transfer'+str(self.__dict__)
 
 
 class SwarmCoordinator(object):
@@ -359,5 +356,5 @@ def simulate() -> None:
     asyncio.run(runner())
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     simulate()

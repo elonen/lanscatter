@@ -51,11 +51,6 @@ class HashFunc:
         self.h.update(data)
         return self
 
-    async def update_async(self, data):
-        """Like update() but runs in a separate thread."""
-        await asyncio.get_running_loop().run_in_executor(None, lambda: self.h.update(data))
-        return self
-
     def result(self) -> HashType:
         return self.h.hexdigest()
 
@@ -96,9 +91,6 @@ class SyncBatch:
     def __repr__(self):
         """Unambigious, comparable, human readable string representation of batch contents"""
         return json.dumps(self.to_dict(), indent=2, sort_keys=True)
-
-    def __hash__(self):
-        return hash(self.__repr__())
 
     def __eq__(self, other):
         """Compare batch contents. True if folders they represent have identical contents."""
