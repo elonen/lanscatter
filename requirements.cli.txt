@@ -7,5 +7,6 @@ lz4
 pytest
 pytest-cov
 pytest-timeout
+coveralls
 
 packaging
