@@ -479,16 +479,19 @@ async def run_file_client(base_dir: str, server_url: str, status_func=None,
     await pn.run(port, server_url, concurrent_transfer_limit, max_workers)
 
 
-def main():
+async def async_main():
     args = parse_cli_args(is_master=False)
     status_func = json_status_func if args.json else make_human_cli_status_func(log_level_debug=args.debug)
-    with suppress(KeyboardInterrupt):
-        asyncio.run(run_file_client(base_dir=args.dir, server_url=f'ws://{args.server}/join', port=args.port,
-                                    rescan_interval=args.rescan_interval,
-                                    dl_limit=args.dl_limit, ul_limit=args.ul_limit, concurrent_transfer_limit=args.ct,
-                                    max_workers=args.max_workers,
-                                    status_func=status_func))
+    await run_file_client(
+        base_dir=args.dir, server_url=f'ws://{args.server}/join', port=args.port,
+        rescan_interval=args.rescan_interval,
+        dl_limit=args.dl_limit, ul_limit=args.ul_limit, concurrent_transfer_limit=args.ct,
+        max_workers=args.max_workers,
+        status_func=status_func)
 
+def main():
+    with suppress(KeyboardInterrupt):
+        asyncio.run(async_main())
 
 if __name__ == "__main__":
     main()

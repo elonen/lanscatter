@@ -409,6 +409,8 @@ async def run_master_server(base_dir: str,
             server.planner_loop(),
         ], return_when=asyncio.FIRST_COMPLETED)
 
+        status_func(log_info='Server finished.')
+
     except (KeyboardInterrupt, concurrent.futures.CancelledError):
         status_func(log_info='User exit.')
         kb_exit = True
@@ -416,16 +418,18 @@ async def run_master_server(base_dir: str,
         status_func(log_error='MasterNode error:\n' + traceback.format_exc(), popup=True)
 
 
-def main():
+async def async_main():
     args = parse_cli_args(is_master=True)
     status_func = json_status_func if args.json else make_human_cli_status_func(log_level_debug=args.debug)
-    with suppress(KeyboardInterrupt):
-        asyncio.run(run_master_server(
-            base_dir=args.dir, port=args.port, ul_limit=args.ul_limit, concurrent_uploads=args.ct,
-            dir_scan_interval=args.rescan_interval,  # https_cert=args.sslcert, https_key=args.sslkey,
-            disable_lz4=args.no_compress, max_workers=args.max_workers,
-            chunk_size=args.chunksize, status_func=status_func))
+    await run_master_server(
+        base_dir=args.dir, port=args.port, ul_limit=args.ul_limit, concurrent_uploads=args.ct,
+        dir_scan_interval=args.rescan_interval,  # https_cert=args.sslcert, https_key=args.sslkey,
+        disable_lz4=args.no_compress, max_workers=args.max_workers,
+        chunk_size=args.chunksize, status_func=status_func)
 
+def main():
+    with suppress(KeyboardInterrupt):
+        asyncio.run(async_main())
 
 if __name__ == "__main__":
     main()
