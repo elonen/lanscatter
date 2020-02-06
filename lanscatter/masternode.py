@@ -97,11 +97,15 @@ class MasterNode:
                     here = packaging.version.parse(Defaults.PROTOCOL_VERSION)
                     try:
                         there = packaging.version.parse(msg.get('protocol') or 'MISSING')
+                        if not there.release:
+                            raise packaging.version.InvalidVersion
                         if there.release[0] != here.release[0]:
                             await send_queue.put({'action': 'fatal', 'message':
                                                   f'Incompatible protocol. Server has {Defaults.PROTOCOL_VERSION}, '
                                                   f'yours is {msg.get("protocol")}'})
-                    except InvalidVersion:
+                        else:
+                            await ok({'message': 'Version accepted.'})
+                    except packaging.version.InvalidVersion:
                         return await error(f'Invalid protocol version {str(msg.get("protocol"))}.', fatal=True)
                     self.status_func(log_info=f'Client "{client_name}" uses protocol version {msg.get("protocol")}, '+
                                               f'app version {msg.get("app") or "MISSING"}')
@@ -247,7 +251,6 @@ class MasterNode:
                         if msg and msg.get('action') == 'fatal':
                             self.status_func(log_info=f'Sent fatal error to client. Kicking them out: {str(msg)}"')
                             await ws.close()
-                            break
 
             send_task = asyncio.create_task(send_loop())
 
@@ -404,8 +407,6 @@ async def run_master_server(base_dir: str,
             dir_scanner_loop(),
             server.planner_loop(),
         ], return_when=asyncio.FIRST_COMPLETED)
-
-        status_func(log_info='Server finished.')
 
     except (KeyboardInterrupt, concurrent.futures.CancelledError):
         status_func(log_info='User exit.')
