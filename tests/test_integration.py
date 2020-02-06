@@ -182,10 +182,11 @@ def _terminate_procs(*args):
                 print("Process '{x.name}' still not finished. Terminating by force.")
                 x.proc.terminate()
 
-def _assert_node_basics(p):
+def _assert_node_basics(p, check_sync_results=True):
     assert 'Exception' not in p.out.getvalue(), f'Exception(s) on {p.name}'
     assert 'egmentation fault' not in p.out.getvalue()
-    assert p.is_master or 'Up to date' in p.out.getvalue(), 'Node never reached up-to-date state.'
+    if check_sync_results:
+        assert p.is_master or 'Up to date' in p.out.getvalue(), 'Node never reached up-to-date state.'
     assert 'traceback' not in str(p.out.getvalue()).lower()
 
 def _print_process_stdout(p):
@@ -213,6 +214,26 @@ def _line_idx_with(text, match_str, idx):
     except IndexError:
         return None
 
+
+@pytest.mark.timeout(5)
+def test_peer_bad_websock(test_dir_factory):
+    peer_dir = test_dir_factory('leecher', keep_empty=True)
+    peer = _spawn_sync_process('leecher', False, peer_dir, PORT_BASE+20, PORT_BASE+20)  # connect to itself
+    peer.proc.join()
+    assert "Websock handshake" in peer.out.getvalue(), "Handshake error not in found log."
+    _print_process_stdout(peer)
+    _assert_node_basics(peer, check_sync_results=False)
+
+
+@pytest.mark.timeout(5)
+@pytest.mark.parametrize("is_master", [True, False])
+def test_bad_dir(is_master):
+    name = 'master' if is_master else 'leecher'
+    p = _spawn_sync_process(name, is_master, 'nonexisting_12345', PORT_BASE+20, PORT_BASE+20)
+    p.proc.join()
+    assert "not a directory" in p.out.getvalue(), "No directory error printed."
+    _print_process_stdout(p)
+    _assert_node_basics(p, check_sync_results=False)
 
 
 def test_minimal_downloads(test_dir_factory):
@@ -248,6 +269,8 @@ def test_minimal_downloads(test_dir_factory):
         print(f'Peer {p.name} test ok')
 
 
+@pytest.mark.gui
+@pytest.mark.slow
 def test_gui(test_dir_factory):
     """Test that each chunk is downloaded only once."""
     import wx, wx.adv  # Test import
@@ -266,6 +289,7 @@ def test_gui(test_dir_factory):
     _assert_identical_dir(peer, master)
 
 
+@pytest.mark.slow
 def test_swarm__corruption__bad_protocol__uptodate__errors(test_dir_factory):
     """
     Integration test. Creates a small local swarm with peers having
@@ -282,8 +306,8 @@ def test_swarm__corruption__bad_protocol__uptodate__errors(test_dir_factory):
         peers.append(_spawn_sync_process(f'{name}', False, peer_dirs[i], master_port+1+i, master_port))
         time.sleep(0.1)  # stagger peer generation a bit
         if i == 1:
-            # Start server after the first two peers to test start order
-            master = _spawn_sync_process(f'master', True, master_dir, 0, master_port)
+            # Start server after the first peer to test start order
+            master = _spawn_sync_process(f'master', True, master_dir, 0, master_port, ['--rescan-interval', '3'])
 
     # Kill one peer
     _wait_seconds(2)
@@ -303,6 +327,12 @@ def test_swarm__corruption__bad_protocol__uptodate__errors(test_dir_factory):
     except PermissionError as e:
         print("WARNING: File corruption during test failed because of file locking or something: " + str(e))
 
+    # Alter files on master in the middle of a sync
+    print("Creating extra file on master...")
+    with open(master.dir + '/master_extra_file.bin', 'wb') as f:  # Write an extra file
+        f.write(b'abcdefgh')
+        f.flush()
+
     # Make some non-protocol requests to the server
     async def request_tests():
 
@@ -321,6 +351,18 @@ def test_swarm__corruption__bad_protocol__uptodate__errors(test_dir_factory):
                 recvd = await read_respose_msgs(ws)
                 assert not recvd or ('fatal' in recvd[-1]['action'])
 
+            print("Request: try bad message without 'action'")
+            async with session.ws_connect(f'ws://localhost:{master_port}/join') as ws:
+                await ws.send_json({'NOT_AN_ACTION': 123})
+                recvd = await read_respose_msgs(ws)
+                assert not recvd or ('fatal' in recvd[-1]['action'])
+
+            print("Request: try bad protocol version")
+            async with session.ws_connect(f'ws://localhost:{master_port}/join') as ws:
+                await ws.send_json({'action': 'version', 'protocol': '0.0.0', 'app': '0.0.0'})
+                recvd = await read_respose_msgs(ws)
+                assert not recvd or ('fatal' in recvd[-1]['action'])
+
             print("Request: try bad json")
             async with session.ws_connect(f'ws://localhost:{master_port}/join') as ws:
                 await ws.send_str('INVALID_JSON')
@@ -335,6 +377,11 @@ def test_swarm__corruption__bad_protocol__uptodate__errors(test_dir_factory):
             async with session.get(f'http://localhost:{master_port}/') as resp:
                 assert resp.status == 200, "Server status page returned HTTP error: " + str(resp.status)
                 assert '<html' in (await resp.text()).lower(), "Status query didn't return HTML."
+
+            print("Request: HTTP on noexisting peer blob")
+            for port in (master_port, master_port+2):
+                async with session.get(f'http://localhost:{port}/blob/NONEXISTINGBLOB') as resp:
+                    assert resp.status != 200, "Fileserver returned success on non-existing blob"
 
     try:
         print("Doing request tests")
@@ -356,4 +403,6 @@ def test_swarm__corruption__bad_protocol__uptodate__errors(test_dir_factory):
         _assert_identical_dir(p, master)
         if p is master:
             assert ('Compression ratio: 0.' in p.out.getvalue()), 'No compression happened'
+        else:
+            assert 'New sync batch received' in p.out.getvalue(), 'No new sync batch update from server'
         print(f'Peer {p.name} test ok')

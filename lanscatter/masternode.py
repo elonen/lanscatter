@@ -62,10 +62,6 @@ class MasterNode:
     def start_master_server(self, base_dir: str, port: int,
                             ul_limit: float, concurrent_uploads: int,
                             https_cert: Optional[str], https_key: Optional[str]) -> Awaitable:
-
-        if not Path(base_dir).is_dir():
-            raise NotADirectoryError(f'Path "{base_dir}" is not a directory. Cannot serve from it.')
-
         async def handle_client_msg(
                 address: str, send_queue: asyncio.Queue,
                 node: Optional[planner.Node], msg) -> Optional[planner.Node]:

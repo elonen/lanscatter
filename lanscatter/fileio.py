@@ -2,7 +2,7 @@ from pathlib import Path, PurePosixPath
 from aiohttp import web, ClientSession
 from typing import Tuple, Optional, Dict, Iterable
 from contextlib import suppress
-import aiofiles, os, time, asyncio, aiohttp, platform, subprocess
+import aiofiles, os, time, asyncio, aiohttp, platform, subprocess, sys
 
 import lz4.frame
 from types import SimpleNamespace
@@ -29,7 +29,8 @@ class FileIO:
         assert(isinstance(basedir, Path))
         basedir = basedir.resolve()
         if not basedir.is_dir():
-            raise NotADirectoryError(f'Path "{basedir}" is not a directory. Cannot serve from it.')
+            print(f'Error: Path "{basedir}" is not a directory. Cannot serve from it.', file=sys.stderr)
+            sys.exit(1)
         self.basedir = basedir
         self.dl_limiter = RateLimiter(dl_rate_limit * 1024 * 1024 / 8, period=1.0, burst_factor=2.0)
         self.ul_limiter = RateLimiter(ul_rate_limit * 1024 * 1024 / 8, period=1.0, burst_factor=2.0)
