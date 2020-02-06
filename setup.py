@@ -26,7 +26,7 @@ setup(
     },
     data_files=[('bitmaps', ['icon.png', 'icon__bgr.png', 'icon__wheel.png'])],
 
-    version="0.1.3",
+    version="0.1.4",
     author="Jarno Elonen",
     author_email="elonen@iki.fi",
     description="P2P assisted large file distribution system for modern LAN environments",
