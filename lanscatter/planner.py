@@ -69,9 +69,6 @@ class Node(ABC):
         self.incoming = set([d[0] for d in downloads.keys()])
         self.n_active_uploads = n_uploads
         self.active_downloads = downloads.copy()
-        # TODO: remove this test
-        for k, v in self.active_downloads.items():
-            assert len(k) == 2 and isinstance(k[0], ChunkId) and isinstance(k[1], Node)
 
     def update_transfer_speed(self, upload_times: Iterable[float]) -> None:
         """Update upload speed average for smart scheduling.
@@ -314,6 +311,7 @@ def simulate() -> None:
     SLOWDOWN_PROBABILITY = 1/16  # every N't node will be very slow uploader
     SLOWDOWN_FACTOR = 100  # transfer time multiplier for "very slow" nodes
 
+    plan_now_trigger = None  # asyncio event to wake planner
 
 
     class SimulatedLinkMapper(LinkMapper):
@@ -343,7 +341,6 @@ def simulate() -> None:
     swarm = SwarmCoordinator(link_mapper=link_mapper)
     swarm.reset_hashes((str(i) for i in range(N_HASHES)))
 
-    plan_now_trigger = asyncio.Event()  # asyncio event to wake planner
     joins_left, next_node_num = N_NODES, 0
 
     def new_simu_node(master=False):

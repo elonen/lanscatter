@@ -164,14 +164,8 @@ class PeerNode:
             else:
                 # If we've got all hashes, local changes and scans should get us up to date. Run multiple times if needed.
                 if self.local_batch.have_all_hashes(self.remote_batch.all_hashes()):
-                    self.status_func(log_info='Have all chunks but local dir not in sync yet. Redoing local fixes.')
-                    if not self.full_rescan_trigger.is_set():
-                        if max_recursions > 1:
-                            await self.local_file_fixups(max_recursions=max_recursions-1)
-                        elif max_recursions == 0:
-                            self.status_func(log_info="Several runs of local fixups failed to sync batches. Rescanning.")
-                            self.full_rescan_trigger.set()
-
+                    self.status_func(log_info='Have all chunks but local dir not in sync yet. Rescanning.')
+                    self.full_rescan_trigger.set()
 
         except FileNotFoundError as e:
             self.status_func(log_info=f"Some files disappeared while doing local_file_fixups. Rescanning.")
@@ -369,8 +363,6 @@ class PeerNode:
                 self.next_periodical_rescan = time.time()
                 self.joined_swarm = False
 
-        self.status_func(log_info=f'Server connection loop exiting.')
-
 
     async def file_rescan_loop(self, concurrent_transfer_limit: int):
         self.status_func(log_info=f'File scanner loop starting.')
@@ -498,5 +490,5 @@ def main():
     with suppress(KeyboardInterrupt):
         asyncio.run(async_main())
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     main()

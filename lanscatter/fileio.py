@@ -269,6 +269,3 @@ class FileIO:
                 break
             with suppress(OSError):
                 d.rmdir()
-
-
-# TODO: Write unit test to confirm sanitizing works and prevents messing up files outside the sync dir

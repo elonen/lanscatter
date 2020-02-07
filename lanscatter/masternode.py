@@ -442,5 +442,5 @@ def main():
     with suppress(KeyboardInterrupt):
         asyncio.run(async_main())
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     main()
