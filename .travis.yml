@@ -1,9 +1,24 @@
+dist: bionic
+
+services:
+  - xvfb
+
 language: python
 
 python:
  - "3.7"
- - "3.8"
 
-install: pip install -r requirements.cli.txt
+cache: pip
 
-script: pytest
+before_install:
+  - sudo apt-get -y install libgtk-3-0 libnotify-dev libsdl1.2-dev  # dependencies for wxpython
+  -
+install:
+ - pip install coveralls
+ - pip install -U -f https://extras.wxpython.org/wxPython4/extras/linux/gtk3/ubuntu-18.04 wxPython
+ - pip install -r requirements.txt
+
+script: xvfb-run -a pytest --cov=lanscatter tests/
+
+after_success:
+  - coveralls

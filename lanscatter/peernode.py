@@ -1,11 +1,13 @@
 from typing import Callable, Dict, Tuple, Set, Optional
 import asyncio, aiohttp
-from aiohttp import web, WSMsgType
+from aiohttp import WSMsgType
 from pathlib import Path
 from contextlib import suppress
 import async_timeout
-import traceback, time, argparse, os, collections, json, platform
-from signal import SIGINT, SIGTERM
+import traceback, time, json, platform, os
+from concurrent.futures import ThreadPoolExecutor
+
+import signal
 import concurrent.futures
 
 from .chunker import SyncBatch, scan_dir
@@ -94,18 +96,22 @@ class PeerNode:
                     await self.file_io.change_mtime(p, f.mtime)
                     self.local_batch.add(files=[f])
 
+            # Precreate large sparse files
+            with ThreadPoolExecutor(max_workers=Defaults.MAX_WORKERS) as executor:
+                files = [self.remote_batch.files[p] for p in path_diff.there_only]
+                def doit(f):
+                    if self.file_io.try_precreate_large_sparse_file(f.path, f.size):
+                        self.status_func(log_info=f"Precreated sparse file: '{f.path}' ({int(f.size/1024/1024)} MB)")
+                executor.map(doit, (f for f in files if (
+                        not f.is_dir and f.size >= max(Defaults.SPARSE_FILE_MIN_SIZE, self.remote_batch.chunk_size))))
+
             # Check each missing chunk to see if we've already got it in another local file
             for missing in chunk_diff.there_only:
                 dupe = self.local_batch.first_chunk_with(missing.hash)
                 if dupe:
                     self.status_func(log_info=f'LOCAL: Copying {missing.hash} from "{dupe.path}"/{dupe.pos}'
                                               f' to "{missing.path}"/{missing.pos}')
-                    if await self.file_io.copy_chunk_locally(copy_from=dupe, copy_to=missing):
-                        self.local_batch.add(chunks=(missing,))
-                    else:
-                        self.status_func(log_info=f'LOCAL: Hash {missing.hash} was not in "{dupe.path}"/{dupe.pos} '
-                                                  'anymore (was probably overwritten). Forgetting it.')
-                        self.local_batch.discard(chunks=(dupe,))
+                    await self.file_io.copy_chunk_locally(copy_from=dupe, copy_to=missing)
                     self.full_rescan_trigger.set()  # changes to file contents, need to re-hash them
 
             # Filter out chunks with no useful hashes
@@ -128,19 +134,19 @@ class PeerNode:
                     await self.file_io.remove_file_and_paths(f.path)
                 elif here.is_dir:
                     if here.mtime != there.mtime:
-                        self.status_func(log_info=f'LOCAL: Fixing mtime for dir "{here.path}".')
+                        self.status_func(log_info=f'LOCAL: Fixing mtime for dir "{here.path}"')
                         await self.file_io.change_mtime(here.path, there.mtime)
                         here.mtime = there.mtime
                 else:
-                    assert(there.treehash is not None)
-                    if here.treehash == there.treehash:
+                    assert(there.chain_hash is not None)
+                    if here.chain_hash == there.chain_hash:
                         if here.size == there.size:
                             assert(here.mtime != there.mtime)
                             self.status_func(log_info=f'LOCAL: File complete, setting mtime: "{here.path}"')
                             await self.file_io.change_mtime(here.path, there.mtime)
                             here.mtime = there.mtime
                         else:
-                            self.status_func(log_error=f'LOCAL: Treehash matches but size differs. Forgetting file. Here: {str(here)}, there: {str(there)}')
+                            self.status_func(log_error=f'LOCAL: Hash matches but size differs. Forgetting file. Here: {str(here)}, there: {str(there)}')
                             self.local_batch.discard(paths=[f.path])
 
                     elif here.mtime == there.mtime:
@@ -166,8 +172,12 @@ class PeerNode:
                             self.status_func(log_info="Several runs of local fixups failed to sync batches. Rescanning.")
                             self.full_rescan_trigger.set()
 
+
         except FileNotFoundError:
             self.status_func(log_info="Some files disappeared while doing local_file_fixups. Rescanning.")
+            self.full_rescan_trigger.set()
+        except OSError as e:
+            self.status_func(log_error=f"OSError while doing local fixups: ({type(e).__name__}) '{str(e)}'. Rescanning.")
             self.full_rescan_trigger.set()
 
     async def download_task(self, chunk_hash, url, http_session, timeout, max_rate):
@@ -190,14 +200,17 @@ class PeerNode:
         try:
             self.active_downloads[chunk_hash] = (url, max_rate)
             await self.send_transfer_report()
-            self.status_func(log_info=f'Downloading from: {url} (lim: {int(max_rate*8/1024/1024+0.5)} Mbps)')
-            self.status_func(cur_status=f'Downloading chunks...',
-                             progress=len(self.local_batch.all_hashes()) / len(self.remote_batch.all_hashes()))
+
+            def progress(got, total):
+                self.status_func(cur_status=f'Downloading...',
+                                 log_info=f'From {url} (lim: {int(max_rate*8/1024/1024+0.5)} Mbps) [{int(float(got) / (total or 1) * 100 + 0.5)}%]',
+                                 progress=len(self.local_batch.all_hashes()) / (len(self.remote_batch.all_hashes()) or 1))
 
             async with async_timeout.timeout(timeout):
                 dl_task = asyncio.create_task(
-                    self.file_io.download_chunk(chunk=target, url=url, http_session=http_session, max_rate=max_rate,
-                                                file_size=self.remote_batch.files[target.path].size))
+                    self.file_io.download_chunk(chunk=target, url=url, http_session=http_session,
+                                                file_size=self.remote_batch.files[target.path].size,
+                                                max_rate=max_rate, progr_func=progress))
                 await asyncio.wait([dl_task, asyncio.create_task(self.exit_trigger.wait())],
                                    return_when=asyncio.FIRST_COMPLETED)
             if not dl_task.done():
@@ -363,7 +376,7 @@ class PeerNode:
 
         def __hash_dir_progress_func(cur_filename, file_progress, total_progress):
             self.status_func(progress=total_progress,
-                             cur_status=f'Hashing ({cur_filename} / {int(file_progress*100+0.5)}%)')
+                             cur_status=f'Hashing ({cur_filename} / at {int(file_progress*100+0.5)}%)')
 
         while not self.exit_trigger.is_set():
             # TODO: integrate with inotify (watchdog package) to avoid frequent rescans when up-to-date.
@@ -380,33 +393,43 @@ class PeerNode:
                     self.full_rescan_trigger.clear()
 
                     self.status_func(log_debug='Rescanning local files.')
-                    new_local_batch, errors = await scan_dir(
-                        str(self.file_io.basedir), chunk_size=self.remote_batch.chunk_size,
-                        old_batch=self.local_batch, progress_func=__hash_dir_progress_func, test_compress=False)
-                    for i,e in enumerate(errors):
-                        self.status_func(log_error=f'- Dir scan error #{i}: {e}')
-                    self.status_func(log_debug='Rescan finished.')
 
-                    new_local_batch.copy_chunk_compress_ratios_from(self.remote_batch)
-                    different_from_remote = self.remote_batch != new_local_batch
+                    try:
+                        def scandir_blocking():
+                            return asyncio.run(scan_dir(
+                                self.file_io, max_chunk_size=self.remote_batch.chunk_size,
+                                max_sub_chunk_size=self.remote_batch.sub_chunk_size,
+                                old_batch=self.local_batch, progress_func=__hash_dir_progress_func, test_compress=False))
+                        loop = asyncio.get_event_loop()
+                        new_local_batch, errors = await loop.run_in_executor(None, scandir_blocking)
+                        for i, e in enumerate(errors):
+                            self.status_func(log_error=f'- Dir scan error #{i}: {e}')
 
-                    if not self.joined_swarm or new_local_batch != self.local_batch or different_from_remote:
-                        self.local_batch = new_local_batch
-                        self.fileserver.batch = self.local_batch
-                        await self.local_file_fixups()
-                        if not self.joined_swarm:
-                            self.joined_swarm = True
-                            await self.server_send_queue.put({
-                                'action': 'join_swarm',
-                                'hashes': tuple(self.local_batch.all_hashes()),
-                                'dl_url': self.fileserver.base_url + '/blob/{hash}',
-                                'nick': self.fileserver.hostname,
-                                'concurrent_transfers': concurrent_transfer_limit
-                            })
-                        else:
-                            await self.server_send_queue.put({
-                                'action': 'set_hashes',
-                                'hashes': list(self.local_batch.all_hashes())})
+                        self.status_func(log_debug='Rescan finished.')
+
+                        new_local_batch.copy_chunk_compress_ratios_from(self.remote_batch)
+                        different_from_remote = self.remote_batch != new_local_batch
+
+                        if not self.joined_swarm or new_local_batch != self.local_batch or different_from_remote:
+                            self.local_batch = new_local_batch
+                            self.fileserver.batch = self.local_batch
+                            await self.local_file_fixups()
+                            if not self.joined_swarm:
+                                self.joined_swarm = True
+                                await self.server_send_queue.put({
+                                    'action': 'join_swarm',
+                                    'hashes': tuple(self.local_batch.all_hashes()),
+                                    'dl_url': self.fileserver.base_url + '/blob/{hash}',
+                                    'nick': self.fileserver.hostname,
+                                    'concurrent_transfers': concurrent_transfer_limit
+                                })
+                            else:
+                                await self.server_send_queue.put({
+                                    'action': 'set_hashes',
+                                    'hashes': list(self.local_batch.all_hashes())})
+
+                    except FileNotFoundError as e:
+                        self.status_func(log_info=f'NOTE: Dir scan failed, trying again in a bit: {e}')
 
             with suppress(asyncio.TimeoutError):
                 await asyncio.wait(
@@ -414,19 +437,19 @@ class PeerNode:
                     timeout=4, return_when=asyncio.FIRST_COMPLETED)
 
 
-    async def run(self, port: int, server_url: str, concurrent_transfer_limit: int):
+    async def run(self, port: int, server_url: str, concurrent_transfer_limit: int, max_workers: int):
         """Run all async loops."""
 
         # Mute asyncio task exceptions on KeyboardInterrupt / thread CancelledError
         loop = asyncio.get_event_loop()
         loop.set_exception_handler(lambda l, c: loop.default_exception_handler(c) if not self.exit_trigger.is_set() else None)
+        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=max_workers))
 
-        def sig_exit():
-            self.exit_trigger.set()
+        def sig_exit(*args):
+            raise KeyboardInterrupt()
         try:
-            if not any(platform.win32_ver()):
-                for sig in (SIGINT, SIGTERM):
-                    asyncio.get_running_loop().add_signal_handler(sig, sig_exit)
+            signal.signal(signal.SIGINT, sig_exit)
+            signal.signal(signal.SIGTERM, sig_exit)
 
             # TODO: Runaway loop detection and avoidance with ratelimiter
 
@@ -441,7 +464,8 @@ class PeerNode:
             self.status_func(log_info='User exit.')
             self.exit_trigger.set()
         except Exception:
-            self.status_func(log_error='PeerNode error:\n' + traceback.format_exc(), popup=True)
+            self.status_func(log_error='PeerNode exited with errors. See log for details.', popup=True)
+            self.status_func(log_error='PeerNode error in run():\n' + traceback.format_exc())
 
 # --------------------------------------------------------------------------------------------------------
 
@@ -451,21 +475,27 @@ async def run_file_client(base_dir: str, server_url: str, status_func=None,
                           rescan_interval: float = Defaults.DIR_SCAN_INTERVAL_MASTER,
                           dl_limit: float = Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC,
                           ul_limit: float = Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC,
+                          max_workers: int = Defaults.MAX_WORKERS,
                           concurrent_transfer_limit: int = Defaults.CONCURRENT_TRANSFERS_PEER):
     pn = PeerNode(basedir=base_dir, status_func=status_func, file_rescan_interval=rescan_interval,
                   dl_limit=dl_limit, ul_limit=ul_limit)
-    await pn.run(port, server_url, concurrent_transfer_limit)
+    await pn.run(port, server_url, concurrent_transfer_limit, max_workers)
 
 
-def main():
+
+async def async_main():
     args = parse_cli_args(is_master=False)
     status_func = json_status_func if args.json else make_human_cli_status_func(log_level_debug=args.debug)
-    with suppress(KeyboardInterrupt):
-        asyncio.run(run_file_client(base_dir=args.dir, server_url=f'ws://{args.server}/join', port=args.port,
-                                    rescan_interval=args.rescan_interval,
-                                    dl_limit=args.dl_limit, ul_limit=args.ul_limit, concurrent_transfer_limit=args.ct,
-                                    status_func=status_func))
+    await run_file_client(
+        base_dir=args.dir, server_url=f'ws://{args.server}/join', port=args.port,
+        rescan_interval=args.rescan_interval,
+        dl_limit=args.dl_limit, ul_limit=args.ul_limit, concurrent_transfer_limit=args.ct,
+        max_workers=args.max_workers,
+        status_func=status_func)
 
+def main():
+    with suppress(KeyboardInterrupt):
+        asyncio.run(async_main())
 
 if __name__ == "__main__":
     main()

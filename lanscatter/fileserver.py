@@ -8,7 +8,7 @@ from .chunker import SyncBatch
 class FileServer:
 
     def __init__(self, status_func: Callable, upload_finished_func=None):
-        self.batch = SyncBatch(0)
+        self.batch = SyncBatch()
         self.base_url: str = '(server not running)'
         self.hostname = socket.gethostname()
         self.upload_times = []              # List of how long each upload took (for tracking speed)
@@ -54,9 +54,10 @@ class FileServer:
                         self._status_func(log_debug=f"Compression ratio: {float('%.3g' % comp_ratio)} (for {request.path_qs})")
                     if ul_time:
                         self.upload_times.append(ul_time)
+                    return res
                 except Exception as e:
-                    raise e
-                return res
+                    self._status_func(log_error=f"Upload error on [{request.remote}] GET {request.path_qs} "
+                                                f"({type(e).__name__}) {str(e)}")
             finally:
                 self.active_uploads -= 1
                 await self._on_upload_finished()
@@ -69,10 +70,13 @@ class FileServer:
         # Setup HTTPS if certificate and key are provided (otherwise use plain HTTP):
         context = None
         if https_cert and https_key:
+            """
             self._status_func(log_info=f"SSL: Using {https_cert} and {https_key} for serving HTTPS.")
             context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
             context.load_default_certs()
             context.load_cert_chain(certfile=https_cert, keyfile=https_key)
+            """
+            raise NotImplementedError
         else:
             self._status_func(log_info=f"SSL cert not provided. Serving plain HTTP.")
 

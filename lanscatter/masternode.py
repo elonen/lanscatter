@@ -63,10 +63,6 @@ class MasterNode:
     def start_master_server(self, base_dir: str, port: int,
                             ul_limit: float, concurrent_uploads: int,
                             https_cert: Optional[str], https_key: Optional[str]) -> Awaitable:
-
-        if not Path(base_dir).is_dir():
-            raise NotADirectoryError(f'Path "{base_dir}" is not a directory. Cannot serve from it.')
-
         async def handle_client_msg(
                 address: str, send_queue: asyncio.Queue,
                 node: Optional[planner.Node], msg) -> Optional[planner.Node]:
@@ -102,11 +98,15 @@ class MasterNode:
                     here = packaging.version.parse(Defaults.PROTOCOL_VERSION)
                     try:
                         there = packaging.version.parse(msg.get('protocol') or 'MISSING')
+                        if not there.release:
+                            raise packaging.version.InvalidVersion
                         if there.release[0] != here.release[0]:
                             await send_queue.put({'action': 'fatal', 'message':
                                                   f'Incompatible protocol. Server has {Defaults.PROTOCOL_VERSION}, '
                                                   f'yours is {msg.get("protocol")}'})
-                    except InvalidVersion:
+                        else:
+                            await ok({'message': 'Version accepted.'})
+                    except packaging.version.InvalidVersion:
                         return await error(f'Invalid protocol version {str(msg.get("protocol"))}.', fatal=True)
                     self.status_func(log_info=f'Client "{client_name}" uses protocol version {msg.get("protocol")}, '+
                                               f'app version {msg.get("app") or "MISSING"}')
@@ -212,26 +212,24 @@ class MasterNode:
             """
             Show a HTML formatted status report.
             """
-            # TODO: cache this for a second or few to reduce load with multiple users
             self.status_func(log_debug=f"[{request.remote}] GET {request.path_qs}")
             if not self.status_page_cache_html or time.time() > self.status_page_cache_timestamp + 3.0:
                 colors = {1: 'black', 0.5: 'green', 0: 'lightgray'}
                 time_str = str(datetime.now().isoformat(' ', 'seconds'))
                 st = self.swarm.get_status_table()
-                th = '<th colspan="{colspan}" style="text-align: left;">{txt}</th>'
-                res = '<html ><head><meta http-equiv="refresh" content="4"></head>'\
-                      '<body style="font-family: sans-serif;">'\
-                      f"<h1>{Defaults.APP_NAME} {Defaults.APP_VERSION} – swarm status</h1><p>{time_str}</p>"
-
+                th = '<th>{txt}</th>\n'
+                res = '<html ><head><meta http-equiv="refresh" content="4"></head>\n'\
+                      '<body style="font-family: sans-serif; text-align: left;">\n'\
+                      f"<h1>{Defaults.APP_NAME} {Defaults.APP_VERSION} – swarm status</h1><p>{time_str}</p>\n"
                 if st['all_hashes']:
-                    style = 'transform: scale(0.8); white-space:nowrap; align: left;'
-                    res += f'<table style="{style}"><tr>' + th.format(txt='Node', colspan=1) + \
-                           th.format(txt='Chunks', colspan=len(st["all_hashes"])) +\
-                           th.format(txt='↓', colspan=1) + th.format(txt='↑', colspan=1) +\
-                           th.format(txt='⧖', colspan=1) + '</tr>\n'
+                    style = 'transform: scale(0.7); transform-origin: top left; white-space:nowrap; align: left;'
+                    res += f'<table style="{style}"><tr>' + th.format(txt='Node') + \
+                           th.format(txt='')*len(st["all_hashes"]) +\
+                           th.format(txt='↓') + th.format(txt='↑') +\
+                           th.format(txt='⧖') + '</tr>\n'
                     for n in st['nodes']:
-                        res += f'<tr><td>{html.escape(n["name"])}</td>'
-                        res += ''.join(['<td style="padding: 1px; background: {color}">&nbsp;</td>'.format(
+                        res += f'\n<tr><td>{html.escape(n["name"])}</td>'
+                        res += ''.join(['<td style="background: {color}">&nbsp;</td>\n'.format(
                             color=colors[c]) for c in n['hashes']])
                         transfer_avg = ('%.1f s' % n['avg_ul_time']) if n['avg_ul_time']>=0 else '–'
                         res += ''.join(f'<td>{v}</td>' for v in (int(n['dls']), int(n['uls']), transfer_avg))
@@ -249,7 +247,7 @@ class MasterNode:
 
         async def http_handler__start_websocket(request):
             self.status_func(log_info=f"[{request.remote}] HTTP GET {request.path_qs}. Upgrading to websocket.")
-            ws = web.WebSocketResponse(heartbeat=30)
+            ws = web.WebSocketResponse(heartbeat=20, autoping=True, receive_timeout=60)
             await ws.prepare(request)
 
             address = str(request.remote)
@@ -266,7 +264,6 @@ class MasterNode:
                         if msg and msg.get('action') == 'fatal':
                             self.status_func(log_info=f'Sent fatal error to client. Kicking them out: {str(msg)}"')
                             await ws.close()
-                            break
 
             send_task = asyncio.create_task(send_loop())
 
@@ -285,7 +282,16 @@ class MasterNode:
 
             try:
                 # Read messages from websocket and handle them
-                async for msg in ws:
+                while True:
+                    try:
+                        msg = await ws.__anext__()
+                    except StopAsyncIteration:
+                        break
+                    except asyncio.CancelledError:
+                        self.status_func(log_info=f'Websocket heartbeat lost on "{node.name if node else address}"')
+                        await ws.close()
+                        continue
+
                     if msg.type == WSMsgType.TEXT:
                         try:
                             if welcome_task.done():
@@ -305,9 +311,15 @@ class MasterNode:
                     elif msg.type == WSMsgType.ERROR:
                         self.status_func(log_error=f'Connection for client "{node.name if node else address}" '
                                                     'closed with err: %s' % ws.exception())
-                self.status_func(log_info=f'Connection closed from "{node.name if node else address}"')
+
+                self.status_func(log_info=f'Websocket closed from "{node.name if node else address}"')
+
+            except Exception as e:
+                self.status_func(log_info=f'Exception while reading from ws:\n"{traceback.format_exc()}"')
+                raise e
             finally:
                 if node:
+                    self.status_func(log_info=f'Destroying node "{node.name if node else address}"')
                     node.destroy()
 
             send_task.cancel()
@@ -365,11 +377,13 @@ async def run_master_server(base_dir: str,
                             ul_limit: float = Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC,
                             concurrent_uploads: int = Defaults.CONCURRENT_TRANSFERS_MASTER,
                             chunk_size=Defaults.CHUNK_SIZE, disable_lz4=False,
+                            max_workers=Defaults.MAX_WORKERS,
                             https_cert=None, https_key=None):
 
     # Mute asyncio task exceptions on KeyboardInterrupt / thread CancelledError
     kb_exit, loop = False, asyncio.get_event_loop()
     loop.set_exception_handler(lambda l, c: loop.default_exception_handler(c) if not kb_exit else None)
+    loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=max_workers))
 
     server = MasterNode(status_func=status_func, chunk_size=chunk_size)
 
@@ -377,16 +391,26 @@ async def run_master_server(base_dir: str,
         """Periodically scan sync directory for changes"""
         def progress_func_adapter(cur_filename, file_progress, total_progress):
             status_func(progress=total_progress,
-                        cur_status=f'Hashing "{cur_filename}" ({int(file_progress * 100 + 0.5)}% done)')
+                        cur_status=f'Hashing ({cur_filename} / at {int(file_progress * 100 + 0.5)}%)')
+
+        fio = FileIO(Path(base_dir))
         while True:
             # TODO: integrate with inotify (watchdog package) to avoid frequent rescans
-            new_batch, errors = await scan_dir(base_dir, chunk_size=chunk_size, old_batch=server.file_server.batch,
-                                               progress_func=progress_func_adapter, test_compress=(not disable_lz4))
-            for i, e in enumerate(errors):
-                status_func(log_error=f'- Dir scan error #{i}: {e}')
-            if new_batch != server.file_server.batch:
-                status_func(cur_status=f'New file batch. Serving as master.')
-                await server.replace_sync_batch(new_batch)
+            def scandir_blocking():
+                return asyncio.run(scan_dir(
+                    fio, max_chunk_size=chunk_size, old_batch=server.file_server.batch,
+                    max_sub_chunk_size=int(chunk_size / Defaults.HASH_TASKS_PER_CHUNK),
+                    progress_func=progress_func_adapter, test_compress=(not disable_lz4)))
+            try:
+                new_batch, errors = await loop.run_in_executor(None, scandir_blocking)
+                for i, e in enumerate(errors):
+                    status_func(log_error=f'- Dir scan error #{i}: {e}')
+                if new_batch != server.file_server.batch:
+                    status_func(cur_status=f'New file batch. Serving as master.')
+                    await server.replace_sync_batch(new_batch)
+            except FileNotFoundError as e:
+                status_func(log_info=f'NOTE: Dir scan failed as file suddenly vanished (trying again in a bit): {e}')
+
             await asyncio.sleep(dir_scan_interval)
 
     try:
@@ -405,16 +429,18 @@ async def run_master_server(base_dir: str,
         status_func(log_error='MasterNode error:\n' + traceback.format_exc(), popup=True)
 
 
-def main():
+async def async_main():
     args = parse_cli_args(is_master=True)
     status_func = json_status_func if args.json else make_human_cli_status_func(log_level_debug=args.debug)
-    with suppress(KeyboardInterrupt):
-        asyncio.run(run_master_server(
-            base_dir=args.dir, port=args.port, ul_limit=args.ul_limit, concurrent_uploads=args.ct,
-            dir_scan_interval=args.rescan_interval,  # https_cert=args.sslcert, https_key=args.sslkey,
-            disable_lz4=args.no_compress,
-            chunk_size=args.chunksize, status_func=status_func))
+    await run_master_server(
+        base_dir=args.dir, port=args.port, ul_limit=args.ul_limit, concurrent_uploads=args.ct,
+        dir_scan_interval=args.rescan_interval,  # https_cert=args.sslcert, https_key=args.sslkey,
+        disable_lz4=args.no_compress, max_workers=args.max_workers,
+        chunk_size=args.chunksize, status_func=status_func)
 
+def main():
+    with suppress(KeyboardInterrupt):
+        asyncio.run(async_main())
 
 if __name__ == "__main__":
     main()

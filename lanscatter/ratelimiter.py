@@ -17,11 +17,15 @@ class RateLimiter(object):
     def __init__(self, rate_limit: float, period: float = 1.0, burst_factor: float = 1.0, slow_start=True):
         """
         :param rate_limit: How many new permits per 'period' seconds to generate
-        :param period: Permit generation period
-        :param burst_factor: Allow bursts of max 'burst_factor' x 'rate_limit'.
+        :param period: Permit generation period; i.e. "generate max 'rate_limit' tokens during 'period' seconds."
+        :param burst_factor: During longer pauses, allow generating 'burst_factor' x 'rate_limit' tokens "in store".
         """
-        assert(period > 0)
+        assert(period >= 0)
         assert(rate_limit >= 0)
+        if period == 0:
+            slow_start = False
+            rate_limit = float('inf')
+            period = 1
 
         self.permits_per_sec = rate_limit / period
         self.period = period
@@ -45,34 +49,42 @@ class RateLimiter(object):
 
         :param n_permits: How many permits caller would like to have.
         :param n_min: Don't return until at least this many permits become available.
-        :return: Number of permits acquired. Always at most n_permits, and at least n_min.
+        :return: Number of permits acquired. Always at most n_permits, and at least n_min. (or False if wait=False)
         """
+        n_min = n_min if (n_min > 0) else n_permits
+        while True:
+            used = self.try_acquire(n_permits, n_min)
+            if used is None:
+                time_until_enough = max(0, (n_min - self.cur_permits)) / self.permits_per_sec
+                sleep_t = time_until_enough - (time.time() - self.last_refill)
+                await asyncio.sleep(sleep_t)
+            else:
+                return used
+
+
+    def try_acquire(self, n_permits: float, n_min: float = -1):
+        """Like acquire(...) but doesn't wait; instead, returns None if not enough permits currently."""
         assert(n_permits >= 0)
         n_min = n_min if n_min >= 0 else n_permits
         n_min = min(n_min, n_permits)
         if n_min > self.permit_cap:
             raise ValueError(f"n_min ({n_min}) > max burst permits ({self.permit_cap}); call would block forever")
 
-        while True:
-            # Refill permits
-            refill = (time.time() - self.last_refill) * self.permits_per_sec
-            new_permits = self.cur_permits + refill
-            if new_permits > self.cur_permits:  # avoid rounding to zero
-                self.cur_permits = new_permits
-                self.last_refill = time.time()
-            self.cur_permits = min(self.cur_permits, self.permit_cap)
+        # Refill permits
+        refill = (time.time() - self.last_refill) * self.permits_per_sec
+        new_permits = self.cur_permits + refill
+        if new_permits > self.cur_permits:  # avoid rounding to zero
+            self.cur_permits = new_permits
+            self.last_refill = time.time()
+        self.cur_permits = min(self.cur_permits, self.permit_cap)
 
-            # Block until we have enough
-            if self.cur_permits >= n_min:
-                break
-            else:
-                time_until_enough = (n_min - self.cur_permits) / self.permits_per_sec
-                await asyncio.sleep(time_until_enough)
-
-        used = max(min(n_permits, self.cur_permits), n_min)
-        self.cur_permits -= used
-        self.report_total_consumed += used
-        return used
+        if self.cur_permits >= n_min:
+            used = max(min(n_permits, self.cur_permits), n_min)
+            self.cur_permits -= used
+            self.report_total_consumed += used
+            return used
+        else:
+            return None
 
 
     def unspend(self, n_permits: float):
@@ -101,7 +113,7 @@ class RateLimiter(object):
 
 # --------------------------------------------
 
-def main():
+def main():  # pragma: no cover
     async def test():
         print("Printing 0-9, two times in a second")
         limiter = RateLimiter(2.0)

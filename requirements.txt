@@ -11,6 +11,7 @@ psutil
 lz4
 
 pytest
+pytest-cov
 pytest-timeout
 
 # win10toast; sys_platform == 'windows'

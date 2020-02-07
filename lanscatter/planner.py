@@ -44,7 +44,7 @@ class Node(ABC):
     @abstractmethod
     def destroy(self) -> None:
         """Remove node from the swarm"""
-        pass
+        raise NotImplementedError
 
     @abstractmethod
     def add_hashes(self, new_hashes: Iterable[ChunkId], clear_first=False) -> Iterable[ChunkId]:
@@ -101,9 +101,6 @@ class Transfer:
     def __hash__(self):
         return hash((self.hash, self.from_node, self.to_node))
 
-    def __repr__(self):
-        return 'Transfer'+str(self.__dict__)
-
 
 class LinkMapper:
     def links_between(self, from_node: Node, to_node: Node) -> Iterable[Hashable]:
@@ -127,7 +124,7 @@ class SwarmCoordinator(object):
         """
         self.all_hashes: Set[ChunkId] = set()
         self.hash_popularity = {}  # Approximately: how many copies of hashes there are in swarm
-        self.nodes: List[Node] = []
+        self.nodes: Set[Node] = set()
         self.all_done = False  # optimization, turns True when everyone's gat everything
         self.link_mapper = link_mapper
         self.current_rate_per_link: DefaultDict[Hashable, float] = defaultdict(float)
@@ -170,7 +167,10 @@ class SwarmCoordinator(object):
 
             def destroy(self) -> None:
                 """Remove node from the swarm"""
-                swarm.nodes = [n for n in swarm.nodes if n != self]
+                swarm.nodes.discard(self)
+                for c in self.hashes:
+                    if c in swarm.hash_popularity:
+                        swarm.hash_popularity[c] -= 1
 
             def add_hashes(self, new_hashes: Iterable[ChunkId], clear_first=False) -> Iterable[ChunkId]:
                 new_hashes = set(new_hashes)
@@ -186,7 +186,7 @@ class SwarmCoordinator(object):
                 return unknown
 
         n = _NodeImpl()
-        self.nodes.append(n)
+        self.nodes.add(n)
         self.all_done &= (len(n.hashes) == self.all_hashes)
         return n
 
@@ -466,5 +466,5 @@ def simulate() -> None:
     asyncio.run(runner())
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     simulate()

@@ -12,7 +12,7 @@ if (uname | grep -q -E '(CYGWIN|MINGW)'); then
 fi
 
 if (uname | grep -q -E 'Linux'); then
-  echo "NOTE: Linux OS detected. Skipping installing GUI packages (failing ATM)."
+  echo "NOTE: Linux OS detected. Skipping installing GUI packages (takes forever to build, use binary packages!)."
   REQ=requirements.cli.txt
 fi
 
@@ -21,6 +21,7 @@ if [ ! -e venv ]; then
 fi
 
 source $ACTIVATE || { echo "Venv activation failed."; exit 1; }
+pip install wheel 
 pip install -r $REQ
 python ./setup.py develop
 

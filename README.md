@@ -1,9 +1,9 @@
 # LANScatter - Efficient large file distributor for Local Area Networks
 
 [![Build Status](https://travis-ci.com/elonen/lanscatter.svg?token=spq2kVHPBJxJyRjUkyKT&branch=master)](https://travis-ci.com/elonen/lanscatter)
+[![Coverage Status](https://coveralls.io/repos/github/elonen/lanscatter/badge.svg?branch=master)](https://coveralls.io/github/elonen/lanscatter?branch=master)
 [![Platforms](https://img.shields.io/badge/platforms-Win%20%7C%20OSX%20%7C%20Linux-blue)]()
 [![Release](https://img.shields.io/github/v/release/elonen/lanscatter?include_prereleases)]()
-
 
 ## Introduction
 
@@ -80,7 +80,7 @@ Features and notable differences to Btsync/Resilio, Syncthing and Dropbox-like s
 ## Technologies
 
 Lanscatter is built on **Python 3.7** using **asyncio** (aiohttp & aiofiles),
-**wxPython** for cross-platform GUI, **Blake2b** algorithm for chunk hashing, **LZ4** for in-flight compression,
+**wxPython** for cross-platform GUI, multi-CPU chained **Blake2b** algorithm for chunk hashing, **LZ4** for in-flight compression,
 **pytest** for unit / integration tests and **pyinstaller** for packaging / freezing into exe files.
 
 It runs on Python 3.8 as well, but wxPython and pyinstaller seem to have some compatiblity issues currently

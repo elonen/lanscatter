@@ -3,7 +3,7 @@ import wx.adv
 
 import appdirs
 
-import sys, os, io, threading, traceback, json, platform
+import sys, os, io, threading, traceback, json, platform, time, argparse, asyncio
 import PIL.Image, PIL.ImageOps, PIL.ImageColor
 from contextlib import suppress
 import multiprocessing
@@ -24,32 +24,41 @@ SETTINGS_DEFAULTS = {
     'download_bandwidth': common.Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC,
     'upload_bandwidth': common.Defaults.BANDWIDTH_LIMIT_MBITS_PER_SEC,
     'rescan_interval': common.Defaults.DIR_SCAN_INTERVAL_PEER,
-    'chunk_size_mb': common.Defaults.CHUNK_SIZE/1024/1024,
+    'chunk_size_mb': int(common.Defaults.CHUNK_SIZE/1024/1024+0.5),
 
     'is_master': False,
     'autostart': False
 }
 
-def get_config_path(filename, create=False):
+TEST_MODE = False
+FORCED_CONFIG_FILE = ''
+
+def get_config_path(create=False):
+    if FORCED_CONFIG_FILE:
+        return FORCED_CONFIG_FILE
+
     base = Path(appdirs.user_config_dir(common.Defaults.APP_NAME))
     if create and not base.exists():
         base.mkdir(exist_ok=True, parents=True)
-    return str(base / filename)
+    return str(base / 'gui.cfg')
 
 # To be run in separate process:
 # run syncer and send stdout + exceptions through a pipe.
-def sync_proc(conn, is_master, argv):
+def sync_proc(conn, is_master, argv, timeout):
     try:
+        if timeout:
+            print(f"sync_proc() timeout={str(timeout)}")
         class PipeOut(io.RawIOBase):
             def write(self, b):
                 conn.send(b)
         out = PipeOut()
         sys.stdout, sys.stderr = out, out
         sys.argv = argv
-        if is_master:
-            masternode.main()
-        else:
-            peernode.main()
+        with suppress(asyncio.TimeoutError):
+            task = (masternode if is_master else peernode).async_main()
+            asyncio.run(asyncio.wait_for(task, timeout=timeout))
+        if timeout:
+            print(f"sync_proc() done")
         conn.send((None, None))
     except Exception as e:
         conn.send((e, traceback.format_exc()))
@@ -261,6 +270,9 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
         self.log_win = None
         self.log_formatter = common.make_human_cli_status_func(print_func=lambda txt: self.write_log(txt + '\n'))
 
+        self.min_popup_interval = 2.0
+        self.last_popup_time = 0.0
+
         self.latest_progress_change = datetime.utcnow() - timedelta(seconds=60)
 
         def resource_path(relative_path):
@@ -279,7 +291,7 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
         # Read config file or use defaults
         self.settings = SETTINGS_DEFAULTS.copy()
         try:
-            with open(get_config_path('gui.cfg'), 'r') as f:
+            with open(get_config_path(), 'r') as f:
                 new_settings = json.loads(f.read())
                 for key, default in SETTINGS_DEFAULTS.items():
                     self.settings[key] = new_settings.get(key, default)
@@ -298,6 +310,14 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
 
         with suppress(AttributeError):  # Implemented (and needed) only on Windows
             wx.adv.NotificationMessage.UseTaskBarIcon(self)
+
+        if TEST_MODE:
+            # wx.PostEvent(menu, wx.PyCommandEvent(wx.EVT_MENU.typeId, quitm.GetId()))
+            wx.CallLater(1000, self.CreatePopupMenu)
+            wx.CallLater(3000, self.on_menu_settings, None)
+            wx.CallLater(6000, self.on_show_log, None)
+            wx.CallLater(10000, self.on_menu_quit, None)
+
 
     # Make progress animation icons by rotating given bitmap 360 degrees
     def make_animated_icon(self, bgr, wheel):
@@ -360,6 +380,7 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
 
     # Adds a string to log viewer window
     def write_log(self, txt):
+        global TEST_MODE
         self.log_text.write(txt)
         if self.log_win:
             self.log_win.write(txt)
@@ -372,7 +393,7 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
             self.settings = ex.get_settings()
             # Save config file
             try:
-                path = get_config_path('gui.cfg', create=True)
+                path = get_config_path(create=True)
                 with open(path, 'w') as f:
                     f.write(json.dumps(self.settings, indent=4))
                     print(f"Saved config as: {path}")
@@ -422,11 +443,9 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
     # Quit menu item selected
     def on_menu_quit(self, event):
         if self.syncer:
-            self.syncer.terminate()
-        self.RemoveIcon()
-        wx.CallAfter(self.Destroy)
-        self.frame.Close()
-        self.frame = None
+            self.syncer.terminate()  # TODO: exit process nicely (for proper coverage testing)
+        wx.CallAfter(self.RemoveIcon)
+        wx.CallAfter(exit)
 
     # Receive JSON log line from syncer (master or peer node) process
     def on_syncer_message(self, msg):
@@ -446,16 +465,22 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
 
             if msg.get('popup'):
                 txt = ((msg.get('log_error') or '') + '\n' + (msg.get('log_info') or '')).strip()
-                wx.adv.NotificationMessage(common.Defaults.APP_NAME, txt).Show(timeout=5)
+                if time.time() > self.last_popup_time + self.min_popup_interval:
+                    self.last_popup_time = time.time()
+                    wx.adv.NotificationMessage(common.Defaults.APP_NAME, txt).Show(timeout=5)
 
             if msg.get('cur_status'):
                 self.cur_status_text = msg.get('cur_status')
                 if self.menu:
                     with suppress(RuntimeError):
-                        self.menu.SetLabel(self.MENUID_STATUS_TEXT, self.cur_progress_text + self.cur_status_text)
+                        if self.menu:
+                            self.menu.SetLabel(self.MENUID_STATUS_TEXT, self.cur_progress_text + self.cur_status_text)
         except json.decoder.JSONDecodeError:
             print("Print from sync_proc: " + str(msg))
-            wx.adv.NotificationMessage("Output from sync_proc", str(msg)).Show(timeout=5)
+            self.write_log(str(msg) + '\n')
+            if time.time() > self.last_popup_time + self.min_popup_interval:
+                self.last_popup_time = time.time()
+                wx.adv.NotificationMessage("Unexpected output (see log)", str(msg)).Show(timeout=5)
 
     def on_syncer_exit(self, ex, tb):
         self.write_log('\n------- syncer process exited -------\n\n')
@@ -466,7 +491,8 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
             self.write_log('--------------------------------------\n\n')
         self.cur_progress_text, self.cur_status_text = '', '(not running)'
         with suppress(RuntimeError):
-            self.menu.SetLabel(self.MENUID_STATUS_TEXT, self.cur_status_text)
+            if self.menu:
+                self.menu.SetLabel(self.MENUID_STATUS_TEXT, self.cur_status_text)
 
         self.syncer = None
         self.SetIcon(self.icon_inactive)
@@ -491,6 +517,8 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
                         buff += str(o)
                         while '\n' in buff:
                             msg, buff = buff.split('\n', 1)
+                            if TEST_MODE:
+                                print(str(msg).strip('\n'))
                             if self.frame:
                                 wx.CallAfter(self.on_syncer_message, msg)
             if self.frame:  # might be destroyed at this point
@@ -506,13 +534,26 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
         argv.extend(['--ul-rate', str(ul_rate), '--rescan-interval', str(rescan_interval)])
         cmdline = ' '.join(argv)
         self.write_log(f'\n------- Spawning "{cmdline}" -------\n\n')
-        syncer = multiprocessing.Process(target=sync_proc, args=(conn_send, is_master, argv))
+        syncer = multiprocessing.Process(target=sync_proc, args=(conn_send, is_master, argv, (9.0 if TEST_MODE else None)))
         threading.Thread(target=comm_thread, args=(conn_recv,)).start()
         syncer.start()
         return syncer
 
 
+def parse_args():
+    global FORCED_CONFIG_FILE, TEST_MODE
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-c', '--config', dest='config_file', type=str, default='',
+                        help='Config file. If not provided, use default OS path.')
+    parser.add_argument('-t', '--test-mode', dest='test_mode', action='store_true', default=False,
+                        help="Run unit test actions.")
+    parsed = parser.parse_args()
+    TEST_MODE = parsed.test_mode
+    FORCED_CONFIG_FILE = parsed.config_file
+
+
 def main():
+    parse_args()
     multiprocessing.freeze_support()  # Windows-only hack to allow multiprocessing to work on Pyinstaller
     app = wx.App()
     frame = wx.Frame(None)
