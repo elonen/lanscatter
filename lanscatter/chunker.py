@@ -99,13 +99,11 @@ class SyncBatch:
     def sanity_checks(self) -> None:
         """Assert that contents are valid"""
         dupe_count = collections.Counter([(c.path, c.pos) for c in self.chunks])
-        illegal_dupes = [chunk for (chunk, cnt) in dupe_count.items() if cnt != 1]
-        assert not illegal_dupes
+        illegal_dupes = [f'"{chunk[0]}" @{chunk[1]} x{cnt}' for (chunk, cnt) in dupe_count.items() if cnt != 1]
+        assert not illegal_dupes, illegal_dupes
         for f in self.files.values():
             assert isinstance(f.path, str)
             assert '\\' not in f.path, f"Non-posix path: {f.path}"  # Windows version must also use '/' as a separator
-        for f in self.files.values():
-            assert f.is_dir == f.path.endswith('/')
         for c in self.chunks:
             assert c.path in self.files
 
@@ -353,7 +351,7 @@ async def scan_dir(fio, max_chunk_size: int, max_sub_chunk_size: int, old_batch:
     dirs = set(dirs) | set((str(PurePosixPath(Path(p).parent)) for p in fnames)) - set('.')
     for d in dirs:
         try:
-            res_files.append(FileAttribs(path=d+'/', size=-1, chain_hash=None,
+            res_files.append(FileAttribs(path=d, size=-1, chain_hash=None,
                                          mtime=int((await fio.stat(d)).st_mtime)))
         except (OSError, IOError) as e:
             errors.append(f'[{d}/]: ' + str(e))

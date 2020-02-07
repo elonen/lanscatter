@@ -78,14 +78,13 @@ class PeerNode:
 
         self.local_batch.sanity_checks()
         chunk_diff = self.local_batch.chunk_diff(self.remote_batch)
-
-        # Print status report
         path_diff = self.local_batch.file_tree_diff(self.remote_batch)
 
         self.status_func(log_info=f'LOCAL: Difference stats: '
-                                  f'{len(chunk_diff.there_only)} missing chunks, '
-                                  f'{len(path_diff.with_different_attribs) + len(path_diff.there_only)} altered / '
-                                  f'{len(path_diff.here_only)} dangling files.')
+                                  f'{len(chunk_diff.there_only)} missing chunks. '
+                                  f'Files: {len(path_diff.there_only)} missing / '
+                                  f'{len(path_diff.with_different_attribs)} different / '
+                                  f'{len(path_diff.here_only)} dangling.')
 
         try:
             # Create missing directories
@@ -132,6 +131,7 @@ class PeerNode:
                 if here.is_dir != there.is_dir:
                     self.status_func(log_info=f'LOCAL: "{f.path}" is dir here and file there (or vice versa). Deleting.')
                     await self.file_io.remove_file_and_paths(f.path)
+                    self.local_batch.discard(paths=[f.path])
                 elif here.is_dir:
                     if here.mtime != there.mtime:
                         self.status_func(log_info=f'LOCAL: Fixing mtime for dir "{here.path}"')
@@ -141,7 +141,7 @@ class PeerNode:
                     assert(there.chain_hash is not None)
                     if here.chain_hash == there.chain_hash:
                         if here.size == there.size:
-                            assert(here.mtime != there.mtime)
+                            assert here.mtime != there.mtime
                             self.status_func(log_info=f'LOCAL: File complete, setting mtime: "{here.path}"')
                             await self.file_io.change_mtime(here.path, there.mtime)
                             here.mtime = there.mtime
@@ -173,8 +173,9 @@ class PeerNode:
                             self.full_rescan_trigger.set()
 
 
-        except FileNotFoundError:
-            self.status_func(log_info="Some files disappeared while doing local_file_fixups. Rescanning.")
+        except FileNotFoundError as e:
+            self.status_func(log_info=f"Some files disappeared while doing local_file_fixups. Rescanning.")
+            self.status_func(log_debug=f" - associated FileNotFoundError: {str(e)}")
             self.full_rescan_trigger.set()
         except OSError as e:
             self.status_func(log_error=f"OSError while doing local fixups: ({type(e).__name__}) '{str(e)}'. Rescanning.")

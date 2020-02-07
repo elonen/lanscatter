@@ -34,19 +34,20 @@ common.Defaults.DOWNLOAD_BUFFER_MAX = int(CHUNK_SIZE * 0.3)
 common.Defaults.NETWORK_BUFFER_MIN = int(CHUNK_SIZE * 0.1)
 
 
+def _create_file(p: Path, total_size: int, pattern=None):
+    pattern = bytearray(random.getrandbits(8) for _ in range(50)) if pattern is None else pattern
+    sz = 0
+    with p.open('wb') as f:
+        while sz < total_size:
+            f.write(pattern)
+            sz += len(pattern)
+        f.truncate(total_size)
+    mtime = float(time.time() * random.random())
+    os.utime(str(p), (mtime, mtime))
+
+
 @pytest.fixture()
 def test_dir_factory(tmp_path):
-
-    def create_file(p: Path, total_size: int, pattern=None):
-        pattern = bytearray(random.getrandbits(8) for _ in range(50)) if pattern is None else pattern
-        sz = 0
-        with p.open('wb') as f:
-            while sz < total_size:
-                f.write(pattern)
-                sz += len(pattern)
-            f.truncate(total_size)
-        mtime = float(time.time() * random.random())
-        os.utime(str(p), (mtime, mtime))
 
     rnd_postfix = 0
     def rnd_name(prefix: str, postfix: str = ''):
@@ -63,30 +64,30 @@ def test_dir_factory(tmp_path):
             (base / rnd_name('empty_dir')).mkdir(parents=True, exist_ok=True)
             p = base / rnd_name('empty_dir') / 'a'
             (p / 'b' / 'c').mkdir(parents=True, exist_ok=True)
-            create_file(p / rnd_name('file', '.bin'), CHUNK_SIZE)
+            _create_file(p / rnd_name('file', '.bin'), CHUNK_SIZE)
 
             # Create some dirs with content
             for d in ('.', 'dir1', rnd_name('dir_'), 'dir2/dir2_nested'):
                 p = base / d
                 p.mkdir(parents=True, exist_ok=True)
-                create_file(p / 'empty', 0)
-                create_file(p / 'another_empty', 0)
-                create_file(p / '1chunk.bin', CHUNK_SIZE)
-                create_file(p / '1chunk_plus.bin', CHUNK_SIZE+2)
-                create_file(p / '3chunks.bin', CHUNK_SIZE * 3)
-                create_file(p / 'fbuf_size.bin', common.Defaults.FILE_BUFFER_SIZE)
-                create_file(p / 'fbuf_size_almost.bin', common.Defaults.FILE_BUFFER_SIZE - 1)
-                create_file(p / 'fbuf_size_plus.bin', common.Defaults.FILE_BUFFER_SIZE + 1)
-                create_file(p / 'dlbuf_size.bin', common.Defaults.DOWNLOAD_BUFFER_MAX)
-                create_file(p / 'dlbuf_size_almost.bin', common.Defaults.DOWNLOAD_BUFFER_MAX - 1)
-                create_file(p / 'dlbuf_size_plus.bin', common.Defaults.DOWNLOAD_BUFFER_MAX + 2)
-                create_file(p / 'many_chunks.bin', int(CHUNK_SIZE * 5.5))
-                create_file(p / 'to_be_corrupted.bin', int(CHUNK_SIZE * 5.5))
-                create_file(p / 'zeroes.bin', int(CHUNK_SIZE * 3.1), pattern=b'\0' * CHUNK_SIZE)
-                create_file(p / 'zeroes_to_corrupt.bin', int(CHUNK_SIZE * 3.1), pattern=b'\0' * CHUNK_SIZE)
-                create_file(p / 'less_zeroes.bin', int(CHUNK_SIZE * 1.1), pattern=b'\0' * CHUNK_SIZE)
+                _create_file(p / 'empty', 0)
+                _create_file(p / 'another_empty', 0)
+                _create_file(p / '1chunk.bin', CHUNK_SIZE)
+                _create_file(p / '1chunk_plus.bin', CHUNK_SIZE + 2)
+                _create_file(p / '3chunks.bin', CHUNK_SIZE * 3)
+                _create_file(p / 'fbuf_size.bin', common.Defaults.FILE_BUFFER_SIZE)
+                _create_file(p / 'fbuf_size_almost.bin', common.Defaults.FILE_BUFFER_SIZE - 1)
+                _create_file(p / 'fbuf_size_plus.bin', common.Defaults.FILE_BUFFER_SIZE + 1)
+                _create_file(p / 'dlbuf_size.bin', common.Defaults.DOWNLOAD_BUFFER_MAX)
+                _create_file(p / 'dlbuf_size_almost.bin', common.Defaults.DOWNLOAD_BUFFER_MAX - 1)
+                _create_file(p / 'dlbuf_size_plus.bin', common.Defaults.DOWNLOAD_BUFFER_MAX + 2)
+                _create_file(p / 'many_chunks.bin', int(CHUNK_SIZE * 5.5))
+                _create_file(p / 'to_be_corrupted.bin', int(CHUNK_SIZE * 5.5))
+                _create_file(p / 'zeroes.bin', int(CHUNK_SIZE * 3.1), pattern=b'\0' * CHUNK_SIZE)
+                _create_file(p / 'zeroes_to_corrupt.bin', int(CHUNK_SIZE * 3.1), pattern=b'\0' * CHUNK_SIZE)
+                _create_file(p / 'less_zeroes.bin', int(CHUNK_SIZE * 1.1), pattern=b'\0' * CHUNK_SIZE)
                 for x in range(5):
-                    create_file(p / rnd_name('rnd_file', '.bin'), int(random.random() * CHUNK_SIZE * 7))
+                    _create_file(p / rnd_name('rnd_file', '.bin'), int(random.random() * CHUNK_SIZE * 7))
         return str(base.resolve())
 
     def _factory(node_name: str, keep_empty=False):
@@ -405,6 +406,13 @@ def test_swarm__corruption__bad_protocol__uptodate__errors(test_dir_factory):
             # Start server after the first peer to test start order
             master = _spawn_sync_process(f'master', True, master_dir, 0, master_port, ['--rescan-interval', '3'])
 
+    # Test a path that's an existing dir on master and a file on peer + vice versa
+    _create_file(Path(master.dir)/'file_on_master', 123)
+    os.mkdir(Path(peers[2].dir)/'file_on_master')
+
+    os.mkdir(Path(master.dir)/'dir_on_master')
+    _create_file(Path(peers[2].dir)/'dir_on_master', 123)
+
     # Kill one peer
     _wait_seconds(2)
     print(f"Killing peer '{peers[3].name}' to emulate crashed client...")
@@ -425,9 +433,7 @@ def test_swarm__corruption__bad_protocol__uptodate__errors(test_dir_factory):
 
     # Alter files on master in the middle of a sync
     print("Creating extra file on master...")
-    with open(master.dir + '/master_extra_file.bin', 'wb') as f:  # Write an extra file
-        f.write(b'abcdefgh')
-        f.flush()
+    _create_file(Path(master.dir)/'master_extra', 123)
 
     # Make bad protocol calls while serving the swarm
     try:
