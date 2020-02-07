@@ -32,7 +32,7 @@ class Defaults:
     SPARSE_FILE_MIN_SIZE = 128 * 1024 * 1024  # Sparse file creation on Windows entails slow shell calls
 
     APP_VERSION = '0.1.4'
-    PROTOCOL_VERSION = '3.0.0'
+    PROTOCOL_VERSION = '4.0.0'
 
 
 def drop_process_priority():
