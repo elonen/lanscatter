@@ -6,7 +6,7 @@ import multiprocessing as mp
 import pytest, shutil, time, os, io, random, traceback, sys, threading, filecmp, json, itertools, signal, platform
 from pathlib import Path
 from types import SimpleNamespace
-import asyncio, aiohttp
+import asyncio, aiohttp, re
 
 from lanscatter import common, masternode, peernode
 
@@ -99,14 +99,24 @@ def test_dir_factory(tmp_path):
 
 # To be run in separate process:
 # run syncer and send stdout + exceptions through a pipe.
-def _sync_proc(conn, is_master, argv, use_gui):
+def _sync_proc_func(conn_in, conn_out, is_master, argv, use_gui):
     try:
         class PipeOut(io.RawIOBase):
             def write(self, b):
-                conn.send(b)
-        out = PipeOut()
-        sys.stdout, sys.stderr = out, out
+                conn_out.send(b)
+        sys.stdout = PipeOut()
+        sys.stderr = sys.stdout
         sys.argv = argv
+
+        if is_master:
+            def msg_inject():
+                while conn_in:
+                    msg = conn_in.recv()
+                    if msg:
+                        print(f"Injecting message to peer 0: '{str(msg)}'")
+                        masternode.DEBUG_INJECT_MSG_TO_PEER(0, msg)
+            threading.Thread(target=msg_inject, daemon=True).start()
+
         if use_gui:
             print("Spawning gui...")
             from lanscatter import gui
@@ -115,23 +125,23 @@ def _sync_proc(conn, is_master, argv, use_gui):
             masternode.main()
         else:
             peernode.main()
-        conn.send((None, None))
+        conn_in.send((None, None))
+
     except Exception as e:
-        conn.send((e, traceback.format_exc()))
+        conn_out.send((e, traceback.format_exc()))
 
 
 def _spawn_sync_process(name: str, is_master: bool, sync_dir: str, peer_port: int, master_port: int, extra_opts=(), gui=False):
     print(f"Spawning process for {'master' if is_master else 'peer'} node '{name}' at port {master_port if is_master else peer_port}, gui={gui}...")
     out = io.StringIO()
-    def comm_thread(conn):
+    def comm_thread(conn_in):
         with suppress(EOFError):
-            while conn:
-                o = conn.recv()
+            while conn_in:
+                o = conn_in.recv()
                 if isinstance(o, tuple):
                     pass  # process exit
                 else:
                     out.write(str(o))
-    conn_recv, conn_send = mp.Pipe(duplex=False)
 
     if gui:
         cfg_file = f'{sync_dir}/gui.conf'
@@ -145,10 +155,12 @@ def _spawn_sync_process(name: str, is_master: bool, sync_dir: str, peer_port: in
         argv = ['MASTER', sync_dir, '-d', '--port', str(master_port), '-c', '1', *extra_opts] if is_master else \
                ['PEER', f'localhost:{master_port}', sync_dir, '-d', '--port', str(peer_port), '--rescan-interval', '3', *extra_opts]
 
-    proc = mp.Process(target=_sync_proc, name='sync-worker_'+name, args=(conn_send, is_master, argv, gui))
-    threading.Thread(target=comm_thread, args=(conn_recv,)).start()
+    to_proc, from_proc = mp.Pipe(duplex=False), mp.Pipe(duplex=False)
+    proc = mp.Process(target=_sync_proc_func, name='sync-worker_' + name, args=(to_proc[0], from_proc[1], is_master, argv, gui))
+    threading.Thread(target=comm_thread, args=(from_proc[0],)).start()
     proc.start()
-    return SimpleNamespace(proc=proc, is_master=is_master, out=out, name=name, dir=sync_dir)
+    return SimpleNamespace(proc=proc, is_master=is_master, out=out, name=name, dir=sync_dir,
+                           inject_peer_msg=lambda m: to_proc[1].send(m))
 
 def _wait_seconds(s):
     for x in range(s):
@@ -180,7 +192,7 @@ def _terminate_procs(*args):
     if any(x.proc.is_alive() for x in args):
         for x in args:
             if x.proc.is_alive():
-                print("Process '{x.name}' still not finished. Terminating by force.")
+                print(f"Process '{x.name}' still not finished. Terminating by force.")
                 x.proc.terminate()
 
 def _assert_node_basics(p, check_sync_results=True):
@@ -292,7 +304,7 @@ async def _bad_request_tests(master_port):
                 [{'action': 'error', 'ABABA': 'TEST_ERROR'}, (lambda m: True), '(always ok, test exceptions only)'],
                 [{'action': 'report_transfers'},
                  (lambda m: 'error' in m.pop(0)['action']), 'Report_transfer with missing args succeeded'],
-                [{'action': 'report_transfers', 'dls':0, 'uls':0, 'incoming':[], 'ul_times':[]},
+                [{'action': 'report_transfers', 'dls': [], 'ul_count':0, 'ul_times': []},
                  (lambda m: 'error' in m.pop(0)['action']), 'Proper report_transfer without join succeeded'],
                 [{'action': 'join_swarm', 'hashes': ['abba123']},
                  (lambda m: 'error' in m.pop(0)['action']), 'Join with missing dl_url succeeded'],
@@ -305,9 +317,15 @@ async def _bad_request_tests(master_port):
                 [{'action': 'version', 'protocol': common.Defaults.PROTOCOL_VERSION, 'app': common.Defaults.APP_VERSION},
                  (lambda m: 'ok' in m.pop(0)['action']), 'Proper version announcement failed'],
                 [{'action': 'join_swarm', 'hashes': ['abba123'], 'dl_url': 'http://localhost:12345/{hash}'},
-                 (lambda m: 'ok' in m.pop(0)['action']), 'Join with proper parms failed'],
+                 (lambda m: ('ok' in m.pop(0)['action']) and ('new_batch' in m.pop(0)['action'])), 'Join with proper parms failed'],
+                [{'action': 'report_transfers', 'dls': [], 'ul_count': 0, 'ul_times': []},
+                 (lambda m: 'ok' in m.pop(0)['action']), 'Empty report_transfer failed'],
+                [{'action': 'report_transfers', 'dls': [{'BAD_DL_REPORT': 123}], 'ul_count': 0, 'ul_times': []},
+                 (lambda m: 'error' in m.pop(0)['action']), "Report_transfer with malformed dls didn't fail."],
                 [{'action': 'set_hashes', 'hashes': ['abba123']},
-                 (lambda m: any([('unknown_hashes' in x) for x in m])), 'No unknown hashes msg received']
+                 (lambda m: any([('unknown_hashes' in x) for x in m])), 'No unknown hashes msg received'],
+                [{'action': 'join_swarm', 'hashes': ['abba123'], 'dl_url': 'http://localhost:12345/{hash}'},
+                 (lambda m: 'ok' in m.pop(0)['action']), 'Rejoin failed'],
             ]
             for (msg, test, desc) in msg_pairs:
                 print(" - sending: " + str(msg))
@@ -316,7 +334,12 @@ async def _bad_request_tests(master_port):
         assert recvd.pop(0)['action'] == 'initial_batch'
         for (msg, test, desc) in msg_pairs:
             print(f' * Testing against: "{desc}"')
-            assert test(recvd), desc
+            try:
+                recvd_copy = recvd.copy()
+                assert test(recvd), desc
+            except Exception as e:
+                print(f'Test "{desc}" failed. Messages from master: ' + str(recvd_copy))
+                raise e
 
 
 def test_bad_protocol(test_dir_factory):
@@ -340,7 +363,7 @@ def test_minimal_downloads(test_dir_factory):
     master = _spawn_sync_process(f'master', True, test_dir_factory('master'), 0, PORT_BASE, ['--no-compress', '--rescan-interval', '2'])
     peer = _spawn_sync_process(f'leecher', False, test_dir_factory('leecher', keep_empty=True), PORT_BASE+1, PORT_BASE,)
 
-    _wait_seconds(8)
+    _wait_seconds(12)
     _terminate_procs(master, peer)
     master_log = master.out.getvalue()
 
@@ -378,7 +401,6 @@ def test_gui(test_dir_factory):
     peer_dir = test_dir_factory('leecher', keep_empty=True)
     master = _spawn_sync_process(f'master', True, master_dir, 0, PORT_BASE+100, gui=True)
     peer = _spawn_sync_process(f'leecher', False, peer_dir, PORT_BASE+101, PORT_BASE+100, gui=True)
-
     _wait_seconds(14)
     for x in (master, peer):
       x.proc.terminate()
@@ -416,10 +438,18 @@ def test_swarm__corruption__bad_protocol__uptodate__errors(test_dir_factory):
     _create_file(Path(peers[2].dir)/'dir_on_master', 123)
 
     # Kill one peer
-    _wait_seconds(2)
+    _wait_seconds(4)
     print(f"Killing peer '{peers[3].name}' to emulate crashed client...")
     os.kill(peers[3].proc.pid, (signal.SIGKILL if hasattr(signal, 'SIGKILL') else signal.SIGTERM))
     del peers[3]  # forget it -- don't perform tests etc
+
+    # Send some extra messages to peer
+    master.inject_peer_msg({'action': 'rehash', 'message': 'test_injected_rehash_message'})
+    master.inject_peer_msg({'action': 'error', 'message': 'test_injected_error_message'})
+    master.inject_peer_msg({'action': 'download', 'message': 'test_injected_bad_download_command'})
+    master.inject_peer_msg({'action': 'download', 'hash': 'TEST_INJECTED_BAD_HASH',
+                            'url': 'http://localhost:123/abba', 'timeout': 2, 'max_rate': 1000})
+    master.inject_peer_msg({'action': 'INVALID_TEST_ACTION'})
 
     # Alter files on one peer in the middle of a sync
     _wait_seconds(2)
@@ -444,19 +474,25 @@ def test_swarm__corruption__bad_protocol__uptodate__errors(test_dir_factory):
     except Exception as e:
         raise e
 
-    _wait_seconds(10)
+    _wait_seconds(14)
+    master.inject_peer_msg({'action': 'fatal', 'message': 'test_injected_fatal_error'})
+    _wait_seconds(1)
     _terminate_procs(master, *peers)
 
     print(f"All nodes terminated. Testing results...")
-
-    assert any([('GET /blob/' in p.out.getvalue()) for p in peers]), 'No P2P transfers happened'
-
     for p in (master, *peers):
         _print_process_stdout(p)
         _assert_node_basics(p)
         _assert_identical_dir(p, master)
         if p is master:
             assert ('Compression ratio: 0.' in p.out.getvalue()), 'No compression happened'
-        else:
-            assert 'New sync batch received' in p.out.getvalue(), 'No new sync batch update from server'
-        print(f'Peer {p.name} test ok')
+        print(f'Basic peer test OK on {p.name}')
+
+    # Check strings that should be in at least one peer log
+    for rule, desc in [
+            ('GET /blob/', "No P2P transfers happened"),
+            ('INFO.*Server requested.*injected_rehash', "Rehash command didn't work"),
+            ('ERROR.*injected_error', "Error message didn't work"),
+            ('FATAL.*injected_fatal', "'Fatal' message didn't work"),
+            ('New sync batch received', "No new sync batch update from server")]:
+        assert any([re.match(f'.*{rule}', p.out.getvalue(), flags=re.DOTALL) for p in peers]), desc

@@ -295,15 +295,15 @@ def simulate() -> None:
     Simulate file swarm, controlled by SwarmCoordinator.
     Prints a block diagram to stdout until all blocks are done.
     """
-    N_HASHES = 72
-    N_NODES = 38
+    N_HASHES = 50
+    N_NODES = 28
     SEEDER_UL_SLOTS = 4
     NODE_UL_SLOT = 3
-    TRANSFER_TIME_MIN, TRANSFER_TIME_MAX = 0.2, 0.3  # Limits for randomizing one hash transfer time
+    TRANSFER_TIME_MIN, TRANSFER_TIME_MAX = 0.1, 0.15  # Limits for randomizing one hash transfer time
     SPEED_VARIABILITY_PER_NODE = 1.1  # "normal speed" nodes will take 1-N x average speed
 
     # For simulating network errors and slowdowns
-    ERROR_PROBABILITY = 1/100  # Probability of individual transfer failing
+    ERROR_PROBABILITY = 1/50  # Probability of individual transfer failing
 
     DROPOUT_PROBABILITY = 1/(N_HASHES * N_NODES)*8  # Probability of node dropping out of swarm completely
     JOIN_PROBABILITY = 10/N_HASHES*3

@@ -2,7 +2,7 @@ from aiohttp import web, WSMsgType
 from pathlib import Path
 from typing import Callable, Optional, Awaitable, Dict
 from json.decoder import JSONDecodeError
-import asyncio, traceback, html, time
+import asyncio, traceback, html, time, threading
 import concurrent.futures
 import packaging.version
 from types import SimpleNamespace
@@ -24,6 +24,14 @@ class PeerSession(HashableBase):
 
     def name(self):
         return self.node.name if self.node else self.address
+
+
+# For integration testing / debugging: threadsafe way send test messages to peers (to impersonate master)
+_DEBUG_PEER_INJECTOR_CALLBACKS: Dict[int, Callable] = {}
+_DEBUG_PIC_LOCK = threading.RLock()
+def DEBUG_INJECT_MSG_TO_PEER(peer_idx, msg):
+    with _DEBUG_PIC_LOCK:
+        tuple(_DEBUG_PEER_INJECTOR_CALLBACKS.values())[peer_idx](msg)
 
 
 # Server that plans p2p distribution of sync directory files to connected clients,
@@ -259,6 +267,10 @@ class MasterNode:
             await ws.prepare(request)
             peer = PeerSession(node=None, version=None, sendq=asyncio.Queue(), address=str(request.remote))
 
+            with _DEBUG_PIC_LOCK:
+                loop = asyncio.get_running_loop()
+                _DEBUG_PEER_INJECTOR_CALLBACKS[id(peer)] = lambda m: loop.call_soon_threadsafe(peer.sendq.put_nowait, m)
+
             # Read send_queue and pass them to websocket
             async def send_loop():
                 while not ws.closed:
@@ -321,6 +333,8 @@ class MasterNode:
                 self.status_func(log_info=f'Exception while reading from ws:\n"{traceback.format_exc()}"')
                 raise e
             finally:
+                with _DEBUG_PIC_LOCK:
+                    _DEBUG_PEER_INJECTOR_CALLBACKS.pop(id(peer), None)
                 if peer.node:
                     self.status_func(log_info=f'Destroying node "{peer.name()}"')
                     peer.node.destroy()

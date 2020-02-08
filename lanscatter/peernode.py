@@ -190,7 +190,9 @@ class PeerNode:
         max_rate = max_rate or float('inf')
         target = self.remote_batch.first_chunk_with(chunk_hash)
         if not target:
-            raise IOError(f'Bad download command from master, or old filelist? Chunk {chunk_hash} is unknown.')
+            self.status_func(log_error=f'Bad download command from master, or old filelist? Chunk {chunk_hash} is unknown.')
+            return
+
         dl_task = None
         try:
             self.active_downloads[chunk_hash] = (url, max_rate)
@@ -325,10 +327,6 @@ class PeerNode:
 
                         asyncio.create_task(send_loop())
 
-                        await self.server_send_queue.put({'action': 'version',
-                                                          'protocol': Defaults.PROTOCOL_VERSION,
-                                                          'app': Defaults.APP_VERSION})
-
                         # Read messages from websocket and handle them
                         async for msg in ws:
                             try:
@@ -409,6 +407,9 @@ class PeerNode:
                             await self.local_file_fixups()
                             if not self.joined_swarm:
                                 self.joined_swarm = True
+                                await self.server_send_queue.put({'action': 'version',
+                                                                  'protocol': Defaults.PROTOCOL_VERSION,
+                                                                  'app': Defaults.APP_VERSION})
                                 await self.server_send_queue.put({
                                     'action': 'join_swarm',
                                     'hashes': tuple(self.local_batch.all_hashes()),

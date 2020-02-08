@@ -44,7 +44,7 @@ def get_config_path(create=False):
 
 # To be run in separate process:
 # run syncer and send stdout + exceptions through a pipe.
-def sync_proc(conn, is_master, argv, timeout):
+def sync_proc(conn, is_master, argv, timeout):  # pragma: no cover  (tested anyway, false multiprocessing positive)
     try:
         if timeout:
             print(f"sync_proc() timeout={str(timeout)}")
@@ -199,6 +199,11 @@ class SettingsDlg(wx.Dialog):
             getattr(self, key).SetValue(self.settings.get(key, default))
         self.on_radio_button(None)  # Update widget enable/disable
 
+        if TEST_MODE:
+            wx.CallLater(200, self.get_settings)
+            wx.CallLater(300, self.on_radio_button, None)
+            wx.CallLater(400, self.on_pick_dir, None)
+
 
     def on_pick_dir(self, e):
         dlg = wx.DirDialog(self, "Choose a sync dir", defaultPath=self.sync_dir.GetValue(), style=wx.DD_DIR_MUST_EXIST)
@@ -314,8 +319,8 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
         if TEST_MODE:
             # wx.PostEvent(menu, wx.PyCommandEvent(wx.EVT_MENU.typeId, quitm.GetId()))
             wx.CallLater(1000, self.CreatePopupMenu)
-            wx.CallLater(3000, self.on_menu_settings, None)
             wx.CallLater(6000, self.on_show_log, None)
+            wx.CallLater(3000, self.on_menu_settings, None)
             wx.CallLater(10000, self.on_menu_quit, None)
 
 
@@ -562,5 +567,5 @@ def main():
     app.MainLoop()
 
 
-if __name__ == '__main__':
+if __name__ == '__main__':  # pragma: no cover
     main()
