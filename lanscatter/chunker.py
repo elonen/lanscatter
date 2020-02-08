@@ -5,24 +5,12 @@ import aiofiles, aiofiles.os, collections, threading
 import mmap
 from pathlib import Path, PurePosixPath
 import lz4.frame
-from .common import Defaults, process_multibuffer_io, file_read_producer
-from .ratelimiter import RateLimiter
+from .common import Defaults, process_multibuffer_io, HashableBase
 
 # Tools for scanning files in a directory and splitting them into hashed chunks.
 # MasterNode and PeerNode both use this for maintaining and syncing their state.
 
 HashType = str
-
-class HashableBase:
-    def __init__(self, **kwargs):
-        self.__dict__.update({k: kwargs[k] for k in sorted(kwargs)})
-    def __repr__(self):
-        return self.__class__.__name__ + str({k: self.__dict__[k] for k in sorted(self.__dict__)})
-    def __hash__(self):
-        return hash(self.__repr__())
-    def __eq__(self, other):
-        return self.__dict__ == other.__dict__
-
 
 class FileChunk(HashableBase):
     path: str           # path + filename

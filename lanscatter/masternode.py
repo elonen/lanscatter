@@ -13,7 +13,17 @@ from . import planner
 from .fileio import FileIO
 from .fileserver import FileServer
 from .chunker import scan_dir
-from .common import make_human_cli_status_func, json_status_func, Defaults, parse_cli_args
+from .common import make_human_cli_status_func, json_status_func, Defaults, parse_cli_args, HashableBase
+
+
+class PeerSession(HashableBase):
+    address: str
+    sendq: asyncio.Queue
+    node: planner.Node
+    version: str
+
+    def name(self):
+        return self.node.name if self.node else self.address
 
 
 # Server that plans p2p distribution of sync directory files to connected clients,
@@ -63,28 +73,23 @@ class MasterNode:
     def start_master_server(self, base_dir: str, port: int,
                             ul_limit: float, concurrent_uploads: int,
                             https_cert: Optional[str], https_key: Optional[str]) -> Awaitable:
-        async def handle_client_msg(
-                address: str, send_queue: asyncio.Queue,
-                node: Optional[planner.Node], msg) -> Optional[planner.Node]:
+        async def handle_client_msg(peer: PeerSession, msg) -> None:
             """
             Handle received messages from clients.
 
-            :param address: IP address of originating client
-            :param send_queue: Asyncio Queue for outgoing messages
-            :param node: planner.Node object, or None if not yet joined a swarm
+            :param peer: Peer session
             :param msg: Message from client in a dict
-            :return: New Node handle if messages caused a swarm join, otherwise None
             """
-            client_name = (node.name if node else address)
-            self.status_func(log_debug=f'[{address}] Msg from {client_name}: {str(msg)}')
+            client_name = (peer.node.name if peer.node else peer.address)
+            self.status_func(log_debug=f'[{peer.address}] Msg from {client_name}: {str(msg)}')
 
             async def error(txt, fatal=False):
                 self.status_func(log_error=('FATAL - ' if fatal else '') +
-                                           f'[{address}] Sending error to {client_name}: {txt}')
-                await send_queue.put({'action': 'fatal' if fatal else 'error', 'orig_msg': msg, 'message': txt})
+                                           f'[{peer.address}] Sending error to {client_name}: {txt}')
+                await peer.sendq.put({'action': 'fatal' if fatal else 'error', 'orig_msg': msg, 'message': txt})
 
             async def ok(txt):
-                await send_queue.put({'action': 'ok', 'message': txt})
+                await peer.sendq.put({'action': 'ok', 'message': txt})
 
             try:
                 action = msg.get('action')
@@ -101,11 +106,12 @@ class MasterNode:
                         if not there.release:
                             raise packaging.version.InvalidVersion
                         if there.release[0] != here.release[0]:
-                            await send_queue.put({'action': 'fatal', 'message':
+                            await peer.sendq.put({'action': 'fatal', 'message':
                                                   f'Incompatible protocol. Server has {Defaults.PROTOCOL_VERSION}, '
                                                   f'yours is {msg.get("protocol")}'})
                         else:
                             await ok({'message': 'Version accepted.'})
+                            peer.version = there
                     except packaging.version.InvalidVersion:
                         return await error(f'Invalid protocol version {str(msg.get("protocol"))}.', fatal=True)
                     self.status_func(log_info=f'Client "{client_name}" uses protocol version {msg.get("protocol")}, '+
@@ -127,23 +133,25 @@ class MasterNode:
                     if '{hash}' not in dl_url:
                         return await error("'dl_url' must contain placeholder '{hash}'.")
 
-                    if node:  # rejoin = destroy old and create new
-                        node.destroy()
-                        self.status_func(log_info=f'[{address}] Rejoining "{client_name}".')
+                    if not peer.version:
+                        return await error("Protocol error: must check version before joining")
 
-                    node = self.swarm.node_join(initial_hashes, dl_slots, dl_slots)
-                    node.name = msg.get('nick') or self.file_server.hostname
-                    node.client = SimpleNamespace(
+                    if peer.node:  # rejoin = destroy old and create new
+                        peer.node.destroy()
+                        self.status_func(log_info=f'[{peer.address}] Rejoining "{client_name}".')
+
+                    peer.node = self.swarm.node_join(initial_hashes, dl_slots, dl_slots)
+                    peer.node.name = msg.get('nick') or self.file_server.hostname
+                    peer.node.client = SimpleNamespace(
                         dl_url=dl_url,
-                        send_queue=send_queue)
+                        send_queue=peer.sendq)
 
-                    self.status_func(log_info=f'[{address}] Client "{client_name}" joined swarm as "{node.name}".'
-                                              f' URL: {node.client.dl_url}')
+                    self.status_func(log_info=f'[{peer.address}] Client "{client_name}" joined swarm as "{peer.node.name}".'
+                                              f' URL: {peer.node.client.dl_url}')
                     await ok('Joined swarm.')
-                    await send_queue.put(self.__make_batch_msg())
+                    await peer.sendq.put(self.__make_batch_msg())
 
                     self.replan_trigger.set()
-                    return node
 
                 # ---------------------------------------------------
                 # Client's got (new) chunks
@@ -151,17 +159,17 @@ class MasterNode:
                 elif action == 'set_hashes' or action == 'add_hashes':
                     if not isinstance(msg.get('hashes'), list):
                         return await error("Must have list in arg 'hashes'")
-                    if not node:
+                    if not peer.node:
                         return await error("Join the swarm first.")
 
-                    unknown_hashes = node.add_hashes(msg.get('hashes'), clear_first=(action == 'set_hashes'))
+                    unknown_hashes = peer.node.add_hashes(msg.get('hashes'), clear_first=(action == 'set_hashes'))
 
                     self.replan_trigger.set()
                     await ok('Hashes updated')
 
                     if unknown_hashes:
                         self.status_func(log_info=f'Client "{client_name}" had unknown hashes: {str(unknown_hashes)}')
-                        await send_queue.put({
+                        await peer.sendq.put({
                             'action': 'rehash',
                             'message': 'You reported hashes not belonging to the swarm. You need to rehash files.',
                             'unknown_hashes': tuple(unknown_hashes)})
@@ -175,7 +183,7 @@ class MasterNode:
 
                     if None in (dls, ul_count, upload_times):
                         return await error(f"Missing args.")
-                    if not node:
+                    if not peer.node:
                         return await error("Join the swarm first.")
 
                     cur_downloads = {}
@@ -190,10 +198,10 @@ class MasterNode:
                     if len(cur_downloads) != len(dls):
                         self.status_func(log_error=f'PROTOCOL ERROR? Could not find from_nodes for all download URLS.')
 
-                    node.set_active_transfers(downloads=cur_downloads, n_uploads=ul_count)
-                    node.update_transfer_speed(upload_times)
+                    peer.node.set_active_transfers(downloads=cur_downloads, n_uploads=ul_count)
+                    peer.node.update_transfer_speed(upload_times)
 
-                    if ul_count < node.max_concurrent_uls or len(dls) < node.max_concurrent_dls:
+                    if ul_count < peer.node.max_concurrent_uls or len(dls) < peer.node.max_concurrent_dls:
                         self.replan_trigger.set()
 
                     await ok('Transfer status updated')
@@ -249,16 +257,13 @@ class MasterNode:
             self.status_func(log_info=f"[{request.remote}] HTTP GET {request.path_qs}. Upgrading to websocket.")
             ws = web.WebSocketResponse(heartbeat=20, autoping=True, receive_timeout=60)
             await ws.prepare(request)
-
-            address = str(request.remote)
-            send_queue = asyncio.Queue()
-            node = None
+            peer = PeerSession(node=None, version=None, sendq=asyncio.Queue(), address=str(request.remote))
 
             # Read send_queue and pass them to websocket
             async def send_loop():
                 while not ws.closed:
                     with suppress(asyncio.TimeoutError):
-                        msg = await asyncio.wait_for(send_queue.get(), timeout=1)
+                        msg = await asyncio.wait_for(peer.sendq.get(), timeout=1)
                         if msg and not ws.closed:
                             await ws.send_json(msg, compress=9)
                         if msg and msg.get('action') == 'fatal':
@@ -269,14 +274,14 @@ class MasterNode:
 
             async def welcome():
                 while not self.file_server.batch:
-                    await send_queue.put({'action': 'ok', 'message': "Hold on. Master is doing initial file scan."})
+                    await peer.sendq.put({'action': 'ok', 'message': "Hold on. Master is doing initial file scan."})
                     with suppress(asyncio.TimeoutError):
                         await asyncio.wait_for(self.replan_trigger.wait(), timeout=5)
 
                 welcome = self.__make_batch_msg()
                 welcome['action'] = 'initial_batch'
                 welcome['message'] = 'Welcome. Hash your files against this and join_swarm when ready to sync.'
-                await send_queue.put(welcome)
+                await peer.sendq.put(welcome)
 
             welcome_task = asyncio.create_task(welcome())
 
@@ -288,39 +293,37 @@ class MasterNode:
                     except StopAsyncIteration:
                         break
                     except asyncio.CancelledError:
-                        self.status_func(log_info=f'Websocket heartbeat lost on "{node.name if node else address}"')
+                        self.status_func(log_info=f'Websocket heartbeat lost on "{peer.name()}"')
                         await ws.close()
                         continue
 
                     if msg.type == WSMsgType.TEXT:
                         try:
                             if welcome_task.done():
-                                new_node = await handle_client_msg(address, send_queue, node, msg.json())
-                                if new_node:
-                                    node = new_node
+                                await handle_client_msg(peer, msg.json())
                             else:
-                                await send_queue.put(
+                                await peer.sendq.put(
                                     {'action': 'ok', 'message': "Hold on. Master is still doing initial file scan."})
                         except JSONDecodeError:
-                            await send_queue.put({'action': 'fatal', 'message': 'Protocol error. Bad JSON. Goodbye.'})
+                            await peer.sendq.put({'action': 'fatal', 'message': 'Protocol error. Bad JSON. Goodbye.'})
                         except Exception as e:
                             self.status_func(log_error=f'Error ("{str(e)}") handling client msg: {msg.data}'
                                               'traceback: ' + traceback.format_exc())
-                            await send_queue.put({'action': 'error', 'orig_msg': msg.data,
+                            await peer.sendq.put({'action': 'error', 'orig_msg': msg.data,
                                                   'message': 'Exception: ' + str(e)})
                     elif msg.type == WSMsgType.ERROR:
-                        self.status_func(log_error=f'Connection for client "{node.name if node else address}" '
+                        self.status_func(log_error=f'Connection for client "{peer.name()}" '
                                                     'closed with err: %s' % ws.exception())
 
-                self.status_func(log_info=f'Websocket closed from "{node.name if node else address}"')
+                self.status_func(log_info=f'Websocket closed from "{peer.name()}"')
 
             except Exception as e:
                 self.status_func(log_info=f'Exception while reading from ws:\n"{traceback.format_exc()}"')
                 raise e
             finally:
-                if node:
-                    self.status_func(log_info=f'Destroying node "{node.name if node else address}"')
-                    node.destroy()
+                if peer.node:
+                    self.status_func(log_info=f'Destroying node "{peer.name()}"')
+                    peer.node.destroy()
 
             send_task.cancel()
             return ws

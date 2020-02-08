@@ -154,6 +154,17 @@ def json_status_func(progress: float = None, cur_status: str = None,
         }))
 
 
+class HashableBase:
+    def __init__(self, **kwargs):
+        self.__dict__.update({k: kwargs[k] for k in sorted(kwargs)})
+    def __repr__(self):
+        return self.__class__.__name__ + str({k: self.__dict__[k] for k in sorted(self.__dict__)})
+    def __hash__(self):
+        return hash(self.__repr__())
+    def __eq__(self, other):
+        return self.__dict__ == other.__dict__
+
+
 async def process_multibuffer_io(producer: Callable, consumer: Callable, initial_buffers: Iterable,
                                  timeout=float('inf'), parallel_consumers=False):
     """
