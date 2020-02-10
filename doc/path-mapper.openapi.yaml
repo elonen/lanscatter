@@ -1,0 +1,62 @@
+openapi: 3.0.1
+info:
+  title: Lanscatter path mapper API
+  description: "API that Lanscatter's planner queries from an external server when scheduling a file transfer between _nodes_ (peers and/or master). It's used for finding _transport path_, a chain of abstract _links_ (typically switch/router interfaces) that leads from uploader to downloader node in a network. Lanscatter doesn't care what exactly the path links represent, just that each of them has a maximum total bandwidth that Lanscatter avoids overloading when scheduling simultaneous file transfer between different nodes. Note that this presentation ignores the intermediate nodes (e.g. switches) and only considers the links between them."
+  license:
+    name: Apache 2.0
+    url: http://www.apache.org/licenses/LICENSE-2.0.html
+  version: 1.0.0
+paths:
+  /path/find:
+    get:
+      summary: Find path from node to another
+      description: Transport path (IP/ethernet route) is returned as an ordered list of Links. Paths may be asymmetric, i.e. path from A to B may return different links than B to A.
+      operationId: pathFind
+      parameters:
+      - name: from
+        in: query
+        description: Source node's IP address
+        required: true
+        schema:
+          type: string
+      - name: to
+        in: query
+        description: Target node's IP address
+        required: true
+        schema:
+          type: string
+      responses:
+        200:
+          description: Path found between given node addresses. Max_rate and desc are updated for previously seen ids.
+          content:
+            application/json:
+              schema:
+                type: array
+                uniqueItems: true
+                items:
+                  $ref: "#/components/schemas/Link"
+
+
+        404:
+          description: Path not found error => assume infinite bandwidth.
+          content:
+            text/plain:
+              example: "Path not found. Unknown address '192.168.0.155'."
+components:
+  schemas:
+    Link:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+          description: Arbitrary unique ID for the link
+          example: "472bb49e-0571-40dd-923d-bffab68d42e4"
+        max_rate:
+          type: number
+          description: Link's maximum bandwidth (in megabits per second). If not given, assume infinite.
+          example: 1000.0
+        desc:
+          type: string
+          description: Optional human-readable description for the link
+          example: "EdogawaPC <-> Switch101_port_12"
